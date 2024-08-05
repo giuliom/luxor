@@ -1,4 +1,5 @@
-use axum::{response::Html, routing::get, Router};
+use axum::{extract::Query, response::Html, routing::get, Router};
+use serde::Deserialize;
 
 #[tokio::main]
 async fn main() {
@@ -13,6 +14,12 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn handler() -> Html<&'static str> {
-    Html("<h1>Hello, World!</h1>")
+#[derive(Deserialize)]
+struct Parameters {
+    name: String,
+}
+
+async fn handler(Query(args): Query<Parameters>) -> Html<String> {
+    let name = args.name;
+    Html(format!("<h1>Hello, {name}!</h1>"))
 }
