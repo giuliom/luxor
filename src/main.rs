@@ -1,25 +1,46 @@
-use axum::{extract::Query, response::Html, routing::get, Router};
-use serde::Deserialize;
+use axum::{
+    http::{header, HeaderValue},
+    response::{Html, IntoResponse},
+    routing::get,
+    Router,
+};
+use std::{env, error::Error};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error>> {
     // build our application with a route
-    let app = Router::new().route("/", get(handler));
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/styles.css", get(styles))
+        .route("/script.js", get(script));
 
     // run it
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
-    println!("listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let address = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&address).await?;
+    println!("listening on {}", listener.local_addr()?);
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 
-#[derive(Deserialize)]
-struct Parameters {
-    name: String,
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../public/index.html"))
 }
 
-async fn handler(Query(args): Query<Parameters>) -> Html<String> {
-    let name = args.name;
-    Html(format!("<h1>Hello, {name}!</h1>"))
+async fn styles() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("text/css"))],
+        include_str!("../public/styles.css"),
+    )
+}
+
+async fn script() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/javascript"),
+        )],
+        include_str!("../public/script.js"),
+    )
 }

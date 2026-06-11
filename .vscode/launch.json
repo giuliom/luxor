@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug luxor",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--bin", "luxor"],
+        "filter": {
+          "name": "luxor",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1",
+        "PORT": "3001"
+      },
+      "serverReadyAction": {
+        "pattern": "listening on (127\\.0\\.0\\.1:[0-9]+)",
+        "uriFormat": "http://%s/",
+        "action": "openExternally"
+      },
+      "sourceLanguages": ["rust"]
+    }
+  ]
+}
