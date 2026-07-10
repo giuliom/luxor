@@ -1,19 +1,27 @@
 use crate::{error::AppError, models::UserRecord};
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Transaction};
 use std::time::Duration;
 use uuid::Uuid;
 
+const DATABASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn connect(database_url: &SecretString) -> anyhow::Result<PgPool> {
     PgPoolOptions::new()
         .max_connections(10)
         .min_connections(1)
-        .acquire_timeout(Duration::from_secs(5))
+        // PostgreSQL containers can accept TCP connections before they are
+        // ready to authenticate. Keep retrying during that short startup
+        // window instead of failing the application immediately.
+        .acquire_timeout(DATABASE_CONNECT_TIMEOUT)
         .idle_timeout(Duration::from_secs(600))
         .connect(database_url.expose_secret())
         .await
-        .map_err(Into::into)
+        .context(
+            "could not connect to PostgreSQL; verify that it is running and that DATABASE_URL is reachable",
+        )
 }
 
 pub fn connect_lazy(database_url: &str) -> Result<PgPool, sqlx::Error> {

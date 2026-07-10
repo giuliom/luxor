@@ -1,0 +1,15 @@
+target
+.git
+.github
+.vscode
+.env
+.env.*
+docs
+tests
+*.log
+.DS_Store
+Dockerfile
+compose.yaml
+railway.json
+README.md
+LICENSE

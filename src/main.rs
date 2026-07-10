@@ -1,18 +1,45 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use luxor::{
     cache::RedisCache, config::Config, db, observability, queue::RedisQueue, server,
     state::AppState,
 };
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use std::{sync::Arc, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+
+    if let Some(command) = std::env::args().nth(1) {
+        return match command.as_str() {
+            "migrate" => migrate().await,
+            other => bail!("unknown command {other:?}; supported commands: migrate"),
+        };
+    }
+
+    serve().await
+}
+
+/// Applies the embedded migrations and exits. Deployment platforms run this as
+/// a release step (for example Railway's pre-deploy command) so that
+/// production never migrates during application startup.
+async fn migrate() -> Result<()> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map(SecretString::from)
+        .context("DATABASE_URL must be set to run migrations")?;
+    let db = db::connect(&database_url).await?;
+    db::migrate(&db).await.context("migration failed")?;
+    println!("database migrations applied");
+    Ok(())
+}
+
+async fn serve() -> Result<()> {
     let config = Arc::new(Config::from_env().context("invalid application configuration")?);
     let telemetry = observability::init(&config).context("failed to initialize observability")?;
 
-    let db = db::connect(&config.database_url).await?;
+    let db = db::connect(&config.database_url)
+        .await
+        .context("database startup failed")?;
     if config.auto_migrate {
         db::migrate(&db).await?;
     }

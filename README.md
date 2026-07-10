@@ -20,7 +20,7 @@ cargo sqlx migrate run
 cargo run
 ```
 
-Open <http://localhost:3000>. Development startup also applies checked-in migrations when `AUTO_MIGRATE=true`. Production should set it to `false` and run `cargo sqlx migrate run` (or the equivalent release artifact command) as a separate, controlled deployment step.
+Open <http://localhost:3000>. By default the application connects to a local PostgreSQL instance at `localhost:5432` (and Redis at `localhost:6379`); the Compose file provides both, but any locally running PostgreSQL works — point `DATABASE_URL` at it in `.env`. Development startup also applies checked-in migrations when `AUTO_MIGRATE=true`. Production should set it to `false` and run `luxor migrate` (or `cargo sqlx migrate run`) as a separate, controlled deployment step.
 
 Compose reads `POSTGRES_PORT` and `REDIS_PORT` for its host mappings. If either default port is occupied, change that value and the corresponding URL in `.env` before starting the services.
 
@@ -60,7 +60,7 @@ Refresh tokens are SHA-256 hashed in PostgreSQL and rotate on every use. Reusing
 | Variable | Required/default | Notes |
 | --- | --- | --- |
 | `APP_ENV` | `development` | `development`, `test`, or `production`; production switches logs to JSON |
-| `APP_HOST`, `APP_PORT` | `127.0.0.1`, `3000` | Listener address |
+| `APP_HOST`, `APP_PORT` | `127.0.0.1`, `3000` | Listener address; production defaults to `0.0.0.0`, and a platform-injected `PORT` overrides `APP_PORT` |
 | `DATABASE_URL` | Local default outside production | PostgreSQL URL; required in production |
 | `REDIS_URL` | Local default outside production | `redis://` or `rediss://`; required in production |
 | `JWT_SECRET` | Unsafe local default outside production | Required in production; unique and at least 32 characters |
@@ -79,7 +79,7 @@ Do not commit real secrets or put them in image layers. Inject them at runtime t
 
 ## Database migrations
 
-Migrations live in `migrations/` and are embedded for optional development startup.
+Migrations live in `migrations/` and are embedded into the binary, both for optional development startup and for `luxor migrate`, which applies them once and exits — the release-step command used by deployments (no `sqlx-cli` required at runtime).
 
 ```sh
 # Create a paired up/down migration while developing
@@ -142,6 +142,26 @@ cargo test --all-targets --all-features
 
 The scoped RustSec exception is for RSA timing advisory `RUSTSEC-2023-0071`, which enters `Cargo.lock` through SQLx macros' optional MySQL support. CI first fails if `rsa` ever appears in the active dependency graph; the exception is valid only while PostgreSQL remains the sole compiled SQLx driver.
 
+## Deploying to Railway
+
+The repository ships with a multi-stage `Dockerfile` and a `railway.json` that configure the build, the `/api/health` health check, and a pre-deploy `luxor migrate` step, so migrations run as an explicit release step while `AUTO_MIGRATE` stays disabled in production.
+
+1. Create a Railway project and add **PostgreSQL** and **Redis** database services.
+2. Add a service from this GitHub repository. Railway detects the `Dockerfile` and `railway.json` automatically.
+3. On the app service, set these variables:
+
+   | Variable | Value |
+   | --- | --- |
+   | `APP_ENV` | `production` (also baked into the image as a safety default) |
+   | `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` |
+   | `REDIS_URL` | `${{Redis.REDIS_URL}}` |
+   | `JWT_SECRET` | A unique random string of at least 32 characters |
+   | `CORS_ORIGINS` | Your public URL, e.g. `https://<service>.up.railway.app` |
+
+4. Deploy. Railway injects `PORT` and the server binds `0.0.0.0:$PORT`; the pre-deploy command applies migrations before traffic shifts, and the health check gates the rollout on `/api/health`.
+
+The reference `DATABASE_URL`/`REDIS_URL` values above use Railway's private networking. The frontend console is served same-origin by the app itself, so no separate frontend deployment is needed.
+
 ## Production checklist
 
 - Supply production-only database, Redis, JWT, and optional telemetry secrets through a managed store.
@@ -152,4 +172,4 @@ The scoped RustSec exception is for RSA timing advisory `RUSTSEC-2023-0071`, whi
 - Set resource limits, health probes, alerting, retention, and sampling for logs/traces/errors.
 - Plan JWT-secret rotation, refresh-session cleanup, database restore tests, and queue dead-letter handling.
 
-This repository intentionally contains no deployment, container-publishing, provider-specific OAuth, email-provider, or worker workflow.
+Beyond the Railway configuration above, this repository intentionally contains no container-publishing, provider-specific OAuth, email-provider, or worker workflow.

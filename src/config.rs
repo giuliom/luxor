@@ -92,11 +92,16 @@ impl Config {
             .parse::<Environment>()?;
         let production = environment.is_production();
 
-        let app_host = get(&values, "APP_HOST").unwrap_or("127.0.0.1").to_owned();
+        // Deployed containers sit behind a platform proxy and must accept
+        // traffic on all interfaces; local development stays loopback-only.
+        let default_host = if production { "0.0.0.0" } else { "127.0.0.1" };
+        let app_host = get(&values, "APP_HOST").unwrap_or(default_host).to_owned();
         let app_ip = app_host
             .parse::<IpAddr>()
             .map_err(|error| ConfigError::Invalid("APP_HOST", error.to_string()))?;
-        let app_port = parse(&values, "APP_PORT", 3000_u16)?;
+        // Platforms such as Railway and Heroku inject PORT and route traffic
+        // to it, so it must win over the locally documented APP_PORT.
+        let app_port = parse(&values, "PORT", parse(&values, "APP_PORT", 3000_u16)?)?;
         if app_port == 0 {
             return Err(ConfigError::Validation(
                 "APP_PORT must be greater than zero".into(),
@@ -344,6 +349,35 @@ mod tests {
         assert_eq!(config.environment, Environment::Development);
         assert!(config.auto_migrate);
         assert!(!config.refresh_cookie_secure);
+    }
+
+    #[test]
+    fn injected_platform_port_wins_over_app_port() {
+        let values = HashMap::from([
+            ("APP_PORT".into(), "3000".into()),
+            ("PORT".into(), "8080".into()),
+        ]);
+        let config = Config::from_map(values).unwrap();
+        assert_eq!(config.app_port, 8080);
+        assert_eq!(config.bind_address().port(), 8080);
+    }
+
+    #[test]
+    fn production_binds_all_interfaces_by_default() {
+        let values = HashMap::from([
+            ("APP_ENV".into(), "production".into()),
+            ("DATABASE_URL".into(), DEV_DATABASE_URL.into()),
+            ("REDIS_URL".into(), DEV_REDIS_URL.into()),
+            (
+                "JWT_SECRET".into(),
+                "production-test-secret-at-least-32-characters".into(),
+            ),
+        ]);
+        let config = Config::from_map(values).unwrap();
+        assert_eq!(config.app_host, "0.0.0.0");
+
+        let development = Config::from_map(HashMap::new()).unwrap();
+        assert_eq!(development.app_host, "127.0.0.1");
     }
 
     #[test]

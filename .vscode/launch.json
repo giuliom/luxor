@@ -24,6 +24,51 @@
         "action": "openExternally"
       },
       "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "Tests: unit (lib)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["test", "--no-run", "--lib", "--all-features"],
+        "filter": {
+          "name": "luxor",
+          "kind": "lib"
+        }
+      },
+      "args": ["--nocapture"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      },
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "Tests: integration (infrastructure)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["test", "--no-run", "--test", "infrastructure", "--all-features"],
+        "filter": {
+          "name": "infrastructure",
+          "kind": "test"
+        }
+      },
+      "args": ["--nocapture"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1",
+        "DATABASE_URL": "postgres://luxor:luxor@localhost:5432/luxor",
+        "REDIS_URL": "redis://127.0.0.1:6379/"
+      },
+      "sourceLanguages": ["rust"]
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Run all tests",
+      "configurations": ["Tests: unit (lib)", "Tests: integration (infrastructure)"],
+      "stopAll": true
     }
   ]
 }
