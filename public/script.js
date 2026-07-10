@@ -2,15 +2,44 @@ let accessToken = null;
 
 const message = document.querySelector("#message");
 const identity = document.querySelector("#identity");
+const identityPill = document.querySelector("#identity-pill");
 const authDot = document.querySelector("#auth-dot");
+const authBadge = document.querySelector("#auth-badge");
+const authForm = document.querySelector("#auth-form");
+const sessionPanel = document.querySelector("#session-panel");
+const sessionEmail = document.querySelector("#session-email");
+const sessionAvatar = document.querySelector("#session-avatar");
+const sessionMeta = document.querySelector("#session-meta");
 
 function show(label, data) {
   message.textContent = `${label}\n${typeof data === "string" ? data : JSON.stringify(data, null, 2)}`;
 }
 
 function setIdentity(user) {
-  identity.textContent = user ? user.email : "Signed out";
-  authDot.classList.toggle("online", Boolean(user));
+  const signedIn = Boolean(user);
+
+  identity.textContent = signedIn ? `Signed in as ${user.email}` : "Signed out";
+  authDot.classList.remove("checking");
+  authDot.classList.toggle("online", signedIn);
+  identityPill.classList.toggle("online", signedIn);
+
+  authBadge.textContent = signedIn ? "Signed in" : "Signed out";
+  authBadge.classList.toggle("ok", signedIn);
+
+  authForm.hidden = signedIn;
+  sessionPanel.hidden = !signedIn;
+  if (signedIn) {
+    sessionEmail.textContent = user.email;
+    sessionAvatar.textContent = user.email.charAt(0).toUpperCase();
+    sessionMeta.textContent = user.created_at
+      ? `Account created ${new Date(user.created_at).toLocaleString()}`
+      : "";
+  }
+
+  for (const badge of document.querySelectorAll(".badge.protected")) {
+    badge.textContent = signedIn ? "Unlocked" : "Log in required";
+    badge.classList.toggle("unlocked", signedIn);
+  }
 }
 
 async function parseResponse(response) {
@@ -130,5 +159,10 @@ document.querySelector("#job-form").addEventListener("submit", (event) => {
 
 // A surviving HTTP-only refresh cookie may restore the session after a reload.
 refreshAccessToken().then((restored) => {
-  if (restored) show("Session", "Restored from the refresh cookie.");
+  show(
+    "Session",
+    restored
+      ? "Restored from the refresh cookie."
+      : "No active session. Log in or register to use the protected endpoints.",
+  );
 });

@@ -14,9 +14,9 @@
           <h1>Luxor backend console</h1>
           <p class="intro">A small same-origin client for exercising the reference API. Access tokens live only in this page’s memory.</p>
         </div>
-        <div class="identity" aria-live="polite">
-          <span id="auth-dot" class="dot"></span>
-          <span id="identity">Signed out</span>
+        <div id="identity-pill" class="identity" aria-live="polite">
+          <span id="auth-dot" class="dot checking"></span>
+          <span id="identity">Checking session…</span>
         </div>
       </header>
 
@@ -34,8 +34,11 @@
         </article>
 
         <article class="card">
-          <div class="card-heading"><div><span class="number">02</span><h2>Authentication</h2></div></div>
-          <form id="auth-form">
+          <div class="card-heading">
+            <div><span class="number">02</span><h2>Authentication</h2></div>
+            <span id="auth-badge" class="badge">Checking…</span>
+          </div>
+          <form id="auth-form" hidden>
             <label>Email<input id="email" type="email" autocomplete="email" value="demo@example.com" required></label>
             <label>Password<input id="password" type="password" autocomplete="current-password" minlength="12" value="change-this-password" required></label>
             <div class="actions">
@@ -43,9 +46,19 @@
               <button id="register-button" class="secondary" type="button">Register</button>
             </div>
           </form>
-          <div class="actions lower">
-            <button id="profile-button" class="quiet" type="button">Fetch profile</button>
-            <button id="logout-button" class="quiet danger" type="button">Log out</button>
+          <div id="session-panel" class="session-panel" hidden>
+            <div class="session-identity">
+              <span id="session-avatar" class="avatar" aria-hidden="true">?</span>
+              <div>
+                <p class="session-label">Signed in as</p>
+                <p id="session-email" class="session-email">—</p>
+              </div>
+            </div>
+            <p id="session-meta" class="session-meta"></p>
+            <div class="actions">
+              <button id="profile-button" class="secondary" type="button">Fetch profile</button>
+              <button id="logout-button" class="quiet danger" type="button">Log out</button>
+            </div>
           </div>
         </article>
 
