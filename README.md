@@ -20,7 +20,7 @@ cargo sqlx migrate run
 cargo run
 ```
 
-Open <http://localhost:3000>. By default the application connects to a local PostgreSQL instance at `localhost:5432` (and Redis at `localhost:6379`); the Compose file provides both, but any locally running PostgreSQL works — point `DATABASE_URL` at it in `.env`. Development startup also applies checked-in migrations when `AUTO_MIGRATE=true`. Production should set it to `false` and run `luxor migrate` (or `cargo sqlx migrate run`) as a separate, controlled deployment step.
+Open <http://localhost:8080>. By default the application connects to a local PostgreSQL instance at `localhost:5432` (and Redis at `localhost:6379`); the Compose file provides both, but any locally running PostgreSQL works — point `DATABASE_URL` at it in `.env`. Development startup also applies checked-in migrations when `AUTO_MIGRATE=true`. Production should set it to `false` and run `luxor migrate` (or `cargo sqlx migrate run`) as a separate, controlled deployment step.
 
 Compose reads `POSTGRES_PORT` and `REDIS_PORT` for its host mappings. If either default port is occupied, change that value and the corresponding URL in `.env` before starting the services.
 
@@ -60,14 +60,14 @@ Refresh tokens are SHA-256 hashed in PostgreSQL and rotate on every use. Reusing
 | Variable | Required/default | Notes |
 | --- | --- | --- |
 | `APP_ENV` | `development` | `development`, `test`, or `production`; production switches logs to JSON |
-| `APP_HOST`, `APP_PORT` | `127.0.0.1`, `3000` | Listener address; production defaults to `0.0.0.0`, and a platform-injected `PORT` overrides `APP_PORT` |
+| `APP_HOST`, `APP_PORT` | `127.0.0.1`, `8080` | Listener address; production defaults to `0.0.0.0`, and a platform-injected `PORT` overrides `APP_PORT` |
 | `DATABASE_URL` | Local default outside production | PostgreSQL URL; required in production |
 | `REDIS_URL` | Local default outside production | `redis://` or `rediss://`; required in production |
 | `JWT_SECRET` | Unsafe local default outside production | Required in production; unique and at least 32 characters |
 | `ACCESS_TOKEN_TTL_SECONDS` | `900` | JWT lifetime |
 | `REFRESH_TOKEN_TTL_SECONDS` | `2592000` | Must exceed the access lifetime |
 | `REFRESH_COOKIE_SECURE` | true only in production | Keep true behind production HTTPS |
-| `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated exact origins; credentials are enabled |
+| `CORS_ORIGINS` | `http://localhost:8080` | Comma-separated exact origins; credentials are enabled |
 | `BODY_LIMIT_BYTES` | `1048576` | JSON body limit |
 | `AUTO_MIGRATE` | true outside production | Must normally be false in production |
 | `CACHE_NAMESPACE`, `QUEUE_KEY` | `luxor:cache`, `luxor:queue:jobs` | Redis namespacing |

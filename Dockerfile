@@ -21,5 +21,5 @@ COPY --from=builder /app/target/release/luxor /usr/local/bin/luxor
 ENV APP_ENV=production
 
 USER nobody
-EXPOSE 3000
+EXPOSE 8080
 CMD ["luxor"]

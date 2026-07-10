@@ -101,7 +101,7 @@ impl Config {
             .map_err(|error| ConfigError::Invalid("APP_HOST", error.to_string()))?;
         // Platforms such as Railway and Heroku inject PORT and route traffic
         // to it, so it must win over the locally documented APP_PORT.
-        let app_port = parse(&values, "PORT", parse(&values, "APP_PORT", 3000_u16)?)?;
+        let app_port = parse(&values, "PORT", parse(&values, "APP_PORT", 8080_u16)?)?;
         if app_port == 0 {
             return Err(ConfigError::Validation(
                 "APP_PORT must be greater than zero".into(),
@@ -141,7 +141,7 @@ impl Config {
 
         let oauth = parse_oauth(&values)?;
         let cors_origins = get(&values, "CORS_ORIGINS")
-            .unwrap_or("http://localhost:3000")
+            .unwrap_or("http://localhost:8080")
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -347,6 +347,8 @@ mod tests {
     fn development_defaults_are_valid() {
         let config = Config::from_map(HashMap::new()).unwrap();
         assert_eq!(config.environment, Environment::Development);
+        assert_eq!(config.app_port, 8080);
+        assert_eq!(config.cors_origins, vec!["http://localhost:8080"]);
         assert!(config.auto_migrate);
         assert!(!config.refresh_cookie_secure);
     }

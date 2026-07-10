@@ -16,10 +16,10 @@
       "cwd": "${workspaceFolder}",
       "env": {
         "RUST_BACKTRACE": "1",
-        "PORT": "3001"
+        "PORT": "8080"
       },
       "serverReadyAction": {
-        "pattern": "listening on (127\\.0\\.0\\.1:[0-9]+)",
+        "pattern": "server listening address=(127\\.0\\.0\\.1:[0-9]+)",
         "uriFormat": "http://%s/",
         "action": "openExternally"
       },
