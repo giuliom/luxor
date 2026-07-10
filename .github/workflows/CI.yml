@@ -1,23 +1,80 @@
-name: Build & Tests
+name: Quality & Tests
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  APP_ENV: test
+  DATABASE_URL: postgres://luxor:luxor@localhost:5432/luxor_test
+  REDIS_URL: redis://127.0.0.1:6379/
+  JWT_SECRET: ci-only-secret-with-at-least-32-characters
+  AUTO_MIGRATE: "false"
+  REFRESH_COOKIE_SECURE: "false"
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-
+  quality:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: luxor_test
+          POSTGRES_USER: luxor
+          POSTGRES_PASSWORD: luxor
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U luxor -d luxor_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable, 2026-07-10
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Build
+        run: cargo build --all-targets --all-features
+      - name: Install RustSec audit tool
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit dependencies
+        shell: bash
+        run: |
+          # RUSTSEC-2023-0071 is locked by SQLx macros' optional MySQL support.
+          # It is safe to ignore only while RSA remains absent from the active graph.
+          if cargo tree -i rsa 2>/dev/null | grep -q '^rsa '; then
+            echo "::error::rsa became active; remove the audit exception and remediate it"
+            exit 1
+          fi
+          cargo audit --ignore RUSTSEC-2023-0071
+      - name: Install SQLx CLI
+        run: cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,postgres --locked
+      - name: Run migrations
+        run: cargo sqlx migrate run
+      - name: Test
+        run: cargo test --all-targets --all-features

@@ -3,17 +3,78 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Hello Luxor</title>
+    <title>Luxor backend console</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
     <main class="page-shell">
-      <section class="hello-card" aria-labelledby="page-title">
-        <p class="eyebrow">Luxor frontend</p>
-        <h1 id="page-title">Hello, world!</h1>
-        <p class="intro">Ask the Rust server what time it is and show the response here.</p>
-        <button id="hello-button" type="button">Ask the time</button>
-        <p id="message" class="message" aria-live="polite"></p>
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Rust · Axum · PostgreSQL · Redis</p>
+          <h1>Luxor backend console</h1>
+          <p class="intro">A small same-origin client for exercising the reference API. Access tokens live only in this page’s memory.</p>
+        </div>
+        <div class="identity" aria-live="polite">
+          <span id="auth-dot" class="dot"></span>
+          <span id="identity">Signed out</span>
+        </div>
+      </header>
+
+      <section class="grid">
+        <article class="card wide">
+          <div class="card-heading">
+            <div><span class="number">01</span><h2>Service</h2></div>
+            <span id="health-badge" class="badge">Unchecked</span>
+          </div>
+          <p>Check the public health and clock endpoints.</p>
+          <div class="actions">
+            <button id="health-button" type="button">Check health</button>
+            <button id="time-button" class="secondary" type="button">Server time</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-heading"><div><span class="number">02</span><h2>Authentication</h2></div></div>
+          <form id="auth-form">
+            <label>Email<input id="email" type="email" autocomplete="email" value="demo@example.com" required></label>
+            <label>Password<input id="password" type="password" autocomplete="current-password" minlength="12" value="change-this-password" required></label>
+            <div class="actions">
+              <button id="login-button" type="submit">Log in</button>
+              <button id="register-button" class="secondary" type="button">Register</button>
+            </div>
+          </form>
+          <div class="actions lower">
+            <button id="profile-button" class="quiet" type="button">Fetch profile</button>
+            <button id="logout-button" class="quiet danger" type="button">Log out</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-heading"><div><span class="number">03</span><h2>Cache</h2></div><span class="badge protected">Protected</span></div>
+          <form id="cache-form">
+            <label>JSON value<input id="cache-value" value='{"theme":"sand"}' required></label>
+            <label>TTL in seconds<input id="cache-ttl" type="number" min="1" max="86400" value="300" required></label>
+            <div class="actions">
+              <button type="submit">Cache value</button>
+              <button id="cache-get-button" class="secondary" type="button">Read</button>
+              <button id="cache-delete-button" class="quiet" type="button">Clear</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="card wide">
+          <div class="card-heading"><div><span class="number">04</span><h2>Queue</h2></div><span class="badge protected">Protected</span></div>
+          <p>Enqueue an audit event using the documented Redis list message contract.</p>
+          <form id="job-form" class="inline-form">
+            <label>Action<input id="job-action" value="demo_button_clicked" maxlength="200" required></label>
+            <button type="submit">Enqueue event</button>
+          </form>
+        </article>
+      </section>
+
+      <section class="activity" aria-labelledby="activity-title">
+        <div><p class="eyebrow">Latest response</p><h2 id="activity-title">Activity</h2></div>
+        <pre id="message" aria-live="polite">Ready.</pre>
       </section>
     </main>
     <script src="/script.js"></script>

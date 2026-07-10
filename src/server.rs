@@ -1,27 +1,148 @@
-use axum::{
-    extract::Query,
-    http::{header, HeaderValue},
-    response::{Html, IntoResponse},
-    routing::get,
-    Json, Router,
+use crate::{
+    error::AppError,
+    handlers::{auth, basic, cache, jobs},
+    state::AppState,
 };
-use chrono::{SecondsFormat, Utc};
-use serde::{Deserialize, Serialize};
-use std::env;
+use axum::{
+    body::Body,
+    extract::{DefaultBodyLimit, State},
+    http::{
+        header::{self, HeaderName},
+        HeaderMap, HeaderValue, Method, Request,
+    },
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
+    Router,
+};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    trace::TraceLayer,
+};
+use tracing::Level;
 
-pub fn app() -> Router {
+#[derive(Clone)]
+struct SecurityHeaders {
+    hsts: bool,
+}
+
+pub fn app(state: AppState) -> Router {
+    let request_id_header = HeaderName::from_static("x-request-id");
+    let cors = cors_layer(&state);
+    let body_limit = state.config.body_limit_bytes;
+    let security_headers = SecurityHeaders {
+        hsts: state.config.environment.is_production(),
+    };
+
+    let api = Router::new()
+        .route("/health", get(basic::health))
+        .route("/hello", get(basic::hello))
+        .route("/time", get(basic::time))
+        .route("/auth/register", post(auth::register))
+        .route("/auth/login", post(auth::login))
+        .route("/auth/refresh", post(auth::refresh))
+        .route("/auth/logout", post(auth::logout))
+        .route("/me", get(auth::me))
+        .route(
+            "/cache/demo",
+            get(cache::get_demo)
+                .put(cache::put_demo)
+                .delete(cache::delete_demo),
+        )
+        .route("/jobs", post(jobs::enqueue))
+        .fallback(api_not_found)
+        .method_not_allowed_fallback(api_method_not_allowed);
+
     Router::new()
         .route("/", get(index))
         .route("/styles.css", get(styles))
         .route("/script.js", get(script))
-        .route("/api/health", get(health))
-        .route("/api/hello", get(hello))
-        .route("/api/time", get(time))
+        .nest("/api", api)
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(cors)
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
+                let request_id = request
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("unknown");
+                tracing::span!(
+                    Level::INFO,
+                    "http_request",
+                    method = %request.method(),
+                    uri = %request.uri(),
+                    request_id = %request_id,
+                )
+            }),
+        )
+        .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
+        .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
+        .layer(middleware::from_fn_with_state(
+            security_headers,
+            apply_security_headers,
+        ))
 }
 
-pub fn bind_address_from_env() -> String {
-    let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
-    format!("127.0.0.1:{port}")
+async fn apply_security_headers(
+    State(settings): State<SecurityHeaders>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let is_api = request.uri().path().starts_with("/api/");
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+
+    insert_header(
+        headers,
+        "content-security-policy",
+        "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'",
+    );
+    insert_header(headers, "x-content-type-options", "nosniff");
+    insert_header(headers, "x-frame-options", "DENY");
+    insert_header(
+        headers,
+        "referrer-policy",
+        "strict-origin-when-cross-origin",
+    );
+    insert_header(
+        headers,
+        "permissions-policy",
+        "camera=(), geolocation=(), microphone=()",
+    );
+    if is_api {
+        insert_header(headers, "cache-control", "no-store, max-age=0");
+        insert_header(headers, "pragma", "no-cache");
+    }
+    if settings.hsts {
+        insert_header(headers, "strict-transport-security", "max-age=31536000");
+    }
+
+    response
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &'static str) {
+    headers.insert(
+        HeaderName::from_static(name),
+        HeaderValue::from_static(value),
+    );
+}
+
+fn cors_layer(state: &AppState) -> CorsLayer {
+    let origins = state
+        .config
+        .cors_origins
+        .iter()
+        .filter_map(|origin| origin.parse::<HeaderValue>().ok())
+        .collect::<Vec<_>>();
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_credentials(true)
 }
 
 async fn index() -> Html<&'static str> {
@@ -39,83 +160,61 @@ async fn script() -> impl IntoResponse {
     (
         [(
             header::CONTENT_TYPE,
-            HeaderValue::from_static("text/javascript"),
+            HeaderValue::from_static("text/javascript; charset=utf-8"),
         )],
         include_str!("../public/script.js"),
     )
 }
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        service: "luxor",
-    })
+async fn api_not_found() -> AppError {
+    AppError::NotFound("route")
 }
 
-async fn hello(Query(params): Query<HelloParams>) -> Json<HelloResponse> {
-    let name = params
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("world");
-
-    Json(HelloResponse {
-        message: format!("Hello, {name}!"),
-    })
-}
-
-async fn time() -> Json<TimeResponse> {
-    Json(TimeResponse {
-        server_time: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-    })
-}
-
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    service: &'static str,
-}
-
-#[derive(Deserialize)]
-struct HelloParams {
-    name: Option<String>,
-}
-
-#[derive(Serialize)]
-struct HelloResponse {
-    message: String,
-}
-
-#[derive(Serialize)]
-struct TimeResponse {
-    server_time: String,
+async fn api_method_not_allowed() -> AppError {
+    AppError::MethodNotAllowed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{cache::MemoryCache, config::Config, db, queue::MemoryQueue, state::AppState};
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
     };
+    use std::{collections::HashMap, sync::Arc};
     use tower::ServiceExt;
+
+    fn test_app() -> Router {
+        test_app_with_config(Config::from_map(HashMap::new()).unwrap())
+    }
+
+    fn test_app_with_config(config: Config) -> Router {
+        let config = Arc::new(config);
+        let pool = db::connect_lazy("postgres://luxor:luxor@localhost/luxor").unwrap();
+        app(AppState::new(
+            config,
+            pool,
+            Arc::new(MemoryCache::default()),
+            Arc::new(MemoryQueue::default()),
+        ))
+    }
 
     #[tokio::test]
     async fn serves_index_html() {
-        let response = app()
+        let response = test_app()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_header_starts_with(&response, header::CONTENT_TYPE.as_str(), "text/html");
-        assert!(body_text(response).await.contains("Hello, world!"));
+        assert!(body_text(response).await.contains("Luxor backend console"));
     }
 
     #[tokio::test]
-    async fn returns_health_json() {
-        let response = app()
+    async fn returns_health_json_with_a_request_id() {
+        let response = test_app()
             .oneshot(
                 Request::builder()
                     .uri("/api/health")
@@ -126,60 +225,114 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().contains_key("x-request-id"));
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store, max-age=0"
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
+        assert!(response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'none'"));
         assert_header_starts_with(&response, header::CONTENT_TYPE.as_str(), "application/json");
-        assert_eq!(body_text(response).await, r#"{"status":"ok","service":"luxor"}"#);
+        assert_eq!(
+            body_text(response).await,
+            r#"{"status":"ok","service":"luxor"}"#
+        );
     }
 
     #[tokio::test]
-    async fn returns_named_hello_json() {
-        let response = app()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/hello?name=Ada")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+    async fn enables_hsts_only_in_production() {
+        let development = test_app()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
+        assert!(!development
+            .headers()
+            .contains_key("strict-transport-security"));
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, r#"{"message":"Hello, Ada!"}"#);
-    }
-
-    #[tokio::test]
-    async fn defaults_hello_name() {
-        let response = app()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/hello")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+        let production_config = Config::from_map(HashMap::from([
+            ("APP_ENV".into(), "production".into()),
+            (
+                "DATABASE_URL".into(),
+                "postgres://luxor:luxor@localhost/luxor".into(),
+            ),
+            ("REDIS_URL".into(), "redis://localhost:6379/".into()),
+            (
+                "JWT_SECRET".into(),
+                "production-test-secret-at-least-32-characters".into(),
+            ),
+        ]))
+        .unwrap();
+        let production = test_app_with_config(production_config)
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_text(response).await, r#"{"message":"Hello, world!"}"#);
+        assert_eq!(
+            production
+                .headers()
+                .get("strict-transport-security")
+                .unwrap(),
+            "max-age=31536000"
+        );
     }
 
     #[tokio::test]
-    async fn returns_server_time_json() {
-        let response = app()
+    async fn preserves_or_assigns_the_request_id() {
+        let response = test_app()
             .oneshot(
                 Request::builder()
                     .uri("/api/time")
+                    .header("x-request-id", "test-correlation-id")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(
+            response.headers().get("x-request-id").unwrap(),
+            "test-correlation-id"
+        );
+    }
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_header_starts_with(&response, header::CONTENT_TYPE.as_str(), "application/json");
+    #[tokio::test]
+    async fn rejects_protected_routes_without_a_bearer_token() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(body_text(response)
+            .await
+            .contains(r#""code":"unauthorized""#));
+    }
 
-        let body = body_text(response).await;
-        assert!(body.starts_with(r#"{"server_time":""#));
-        assert!(body.ends_with(r#"Z"}"#));
+    #[tokio::test]
+    async fn returns_named_and_default_hello_json() {
+        for (uri, expected) in [
+            ("/api/hello?name=Ada", r#"{"message":"Hello, Ada!"}"#),
+            ("/api/hello", r#"{"message":"Hello, world!"}"#),
+        ] {
+            let response = test_app()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_text(response).await, expected);
+        }
     }
 
     async fn body_text(response: axum::response::Response) -> String {
@@ -197,10 +350,6 @@ mod tests {
             .get(header_name)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-
-        assert!(
-            value.starts_with(expected_prefix),
-            "expected {header_name} to start with {expected_prefix}, got {value}"
-        );
+        assert!(value.starts_with(expected_prefix));
     }
 }
