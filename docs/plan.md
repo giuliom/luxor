@@ -15,17 +15,17 @@ Transform the compact Axum demo into a runnable reference backend: centralized c
 10. Upgrade quality CI and documentation. Update `.github/workflows/CI.yml` to run `cargo fmt --check`, `cargo clippy -- -D warnings`, build, unit tests, and integration tests against GitHub Actions PostgreSQL and Redis services. Run SQLx migrations before database tests and configure only test-safe workflow environment values. Rewrite `README.md` with prerequisites (Rust, Docker Compose, `sqlx-cli`), setup commands, migration create/run/revert workflow, local services, route/auth flow, test commands, environment variables, observability/Sentry setup, OAuth provider integration steps, queue-worker contract, and a production secrets/deployment checklist. Do not add a deployment or image-publishing workflow.
 
 **Relevant files**
-- `/Users/giuliom/development/luxor/Cargo.toml` - Add pinned dependencies and feature flags for SQLx/PostgreSQL, Redis async client, JWT/password hashing, OAuth abstractions, tracing/OTel/Sentry, tower-http, config, error handling, and test helpers.
-- `/Users/giuliom/development/luxor/src/main.rs` - Replace direct `server::app()` launch with configuration, observability, state, router construction, and graceful shutdown sequencing.
-- `/Users/giuliom/development/luxor/src/lib.rs` - Export the new feature modules.
-- `/Users/giuliom/development/luxor/src/server.rs` - Refactor the existing `app`, static handlers, and health/time/hello route pattern into composition/root routing; preserve existing behavior where it remains relevant.
-- `/Users/giuliom/development/luxor/public/index.html` - Evolve current time-button demo into a compact API/auth test surface.
-- `/Users/giuliom/development/luxor/public/script.js` - Replace the single time fetch with same-origin auth and demo API client behavior.
-- `/Users/giuliom/development/luxor/public/styles.css` - Adjust existing styles only as needed for the expanded demo controls and responsive error/status states.
-- `/Users/giuliom/development/luxor/.github/workflows/CI.yml` - Extend current build/test workflow with formatting, linting, migrations, and Postgres/Redis test services.
-- `/Users/giuliom/development/luxor/README.md` - Replace the stale WebAssembly description with full template installation and operational documentation.
-- `/Users/giuliom/development/luxor/.gitignore` - Ignore local environment files and runtime artifacts while preserving `.env.example`.
-- New: `/Users/giuliom/development/luxor/.env.example`, `/Users/giuliom/development/luxor/compose.yaml`, `/Users/giuliom/development/luxor/migrations/`, new module directories under `/Users/giuliom/development/luxor/src/`, and `/Users/giuliom/development/luxor/tests/`.
+- `Cargo.toml` - Add pinned dependencies and feature flags for SQLx/PostgreSQL, Redis async client, JWT/password hashing, OAuth abstractions, tracing/OTel/Sentry, tower-http, config, error handling, and test helpers.
+- `src/main.rs` - Replace direct `server::app()` launch with configuration, observability, state, router construction, and graceful shutdown sequencing.
+- `src/lib.rs` - Export the new feature modules.
+- `src/server.rs` - Refactor the existing `app`, static handlers, and health/time/hello route pattern into composition/root routing; preserve existing behavior where it remains relevant.
+- `public/index.html` - Evolve current time-button demo into a compact API/auth test surface.
+- `public/script.js` - Replace the single time fetch with same-origin auth and demo API client behavior.
+- `public/styles.css` - Adjust existing styles only as needed for the expanded demo controls and responsive error/status states.
+- `.github/workflows/CI.yml` - Extend current build/test workflow with formatting, linting, migrations, and Postgres/Redis test services.
+- `README.md` - Replace the stale WebAssembly description with full template installation and operational documentation.
+- `.gitignore` - Ignore local environment files and runtime artifacts while preserving `.env.example`.
+- New: `.env.example`, `compose.yaml`, `migrations/`, new module directories under `src/`, and `tests/`.
 
 **Verification**
 1. Start local PostgreSQL and Redis with `docker compose up -d`; copy/configure `.env`; run SQLx migrations and start the server.
