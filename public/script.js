@@ -264,6 +264,7 @@ function formatDuration(ms) {
 }
 
 let wasmExports = null;
+const WASM_BENCHMARK_ITERATIONS = 10;
 
 async function loadWasmDemo() {
   if (wasmExports) return wasmExports;
@@ -317,29 +318,36 @@ document.querySelector("#wasm-form").addEventListener("submit", (event) => {
       throw new Error(`WebAssembly and JavaScript disagree during warmup: ${wasmWarmupCount} vs ${jsWarmupCount}`);
     }
 
-    const wasmStart = performance.now();
-    const wasmCount = exports.count_primes(limit) >>> 0;
-    const wasmMs = performance.now() - wasmStart;
+    let wasmTotalMs = 0;
+    let jsTotalMs = 0;
+    for (let iteration = 0; iteration < WASM_BENCHMARK_ITERATIONS; iteration += 1) {
+      const wasmStart = performance.now();
+      const wasmCount = exports.count_primes(limit) >>> 0;
+      wasmTotalMs += performance.now() - wasmStart;
 
-    const jsStart = performance.now();
-    const jsCount = countPrimesJs(limit);
-    const jsMs = performance.now() - jsStart;
+      const jsStart = performance.now();
+      const jsCount = countPrimesJs(limit);
+      jsTotalMs += performance.now() - jsStart;
 
-    if (wasmCount !== jsCount) {
-      throw new Error(`WebAssembly and JavaScript disagree: ${wasmCount} vs ${jsCount}`);
+      if (wasmCount !== jsCount) {
+        throw new Error(`WebAssembly and JavaScript disagree on iteration ${iteration + 1}: ${wasmCount} vs ${jsCount}`);
+      }
     }
+    const wasmMs = wasmTotalMs / WASM_BENCHMARK_ITERATIONS;
+    const jsMs = jsTotalMs / WASM_BENCHMARK_ITERATIONS;
 
-    document.querySelector("#wasm-count").textContent = wasmCount.toLocaleString();
+    document.querySelector("#wasm-count").textContent = wasmWarmupCount.toLocaleString();
     document.querySelector("#wasm-time").textContent = `${wasmMs.toFixed(1)} ms`;
     document.querySelector("#wasm-js-time").textContent = `${jsMs.toFixed(1)} ms`;
     document.querySelector("#wasm-result").hidden = false;
 
     return {
       sieve_limit: limit,
-      primes_found: wasmCount,
+      primes_found: wasmWarmupCount,
+      iterations: WASM_BENCHMARK_ITERATIONS,
       wasm_ms: Number(wasmMs.toFixed(2)),
       js_ms: Number(jsMs.toFixed(2)),
-      note: "Identical byte-array sieves after one untimed warmup; both counts must match. Timings vary by device.",
+      note: "10-run averages after one untimed warmup; identical byte-array sieves must return matching counts. Timings vary by device.",
     };
   });
 });

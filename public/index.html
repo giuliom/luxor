@@ -112,15 +112,15 @@
             <div><span class="number">06</span><h2>WebAssembly</h2></div>
             <span id="wasm-badge" class="badge">Not loaded</span>
           </div>
-          <p>Stream-compile a Rust module with WebAssembly.instantiateStreaming, then count primes with the same sieve in WebAssembly and in JavaScript and compare the timings.</p>
+          <p>Stream-compile a Rust module with WebAssembly.instantiateStreaming, then count primes with the same sieve in WebAssembly and in JavaScript and compare their 10-run average timings.</p>
           <form id="wasm-form" class="inline-form">
             <label>Sieve limit<input id="wasm-limit" type="number" min="2" max="10000000" step="1" value="1000000" required></label>
             <button type="submit">Run benchmark</button>
           </form>
           <dl id="wasm-result" class="telemetry-result" hidden>
             <div><dt>Primes found</dt><dd id="wasm-count">—</dd></div>
-            <div><dt>WebAssembly</dt><dd id="wasm-time">—</dd></div>
-            <div><dt>JavaScript</dt><dd id="wasm-js-time">—</dd></div>
+            <div><dt>WebAssembly avg.</dt><dd id="wasm-time">—</dd></div>
+            <div><dt>JavaScript avg.</dt><dd id="wasm-js-time">—</dd></div>
           </dl>
         </article>
         </section>

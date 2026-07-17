@@ -116,7 +116,7 @@ The queue is enqueue-only. Producers `LPUSH` a version-stable JSON `JobEnvelope`
 
 ## WebAssembly demo
 
-The console's WebAssembly card benchmarks a prime sieve compiled from Rust ([`wasm/`](wasm/)) against the identical sieve in JavaScript, cross-checking that both counts agree. The module is plain `wasm32-unknown-unknown` output with a C-ABI export — no bindings generator or JS glue — and the page loads it with standard `WebAssembly.instantiateStreaming`, which requires the `application/wasm` content type the `/demo.wasm` route serves. The site's Content-Security-Policy allows this with the CSP3 `'wasm-unsafe-eval'` keyword, which permits WebAssembly compilation while continuing to forbid JavaScript `eval`.
+The console's WebAssembly card benchmarks a prime sieve compiled from Rust ([`wasm/`](wasm/)) against the identical sieve in JavaScript, cross-checking that both counts agree. After one untimed warmup, each displayed timing is the average of 10 measured iterations. The module is plain `wasm32-unknown-unknown` output with a C-ABI export — no bindings generator or JS glue — and the page loads it with standard `WebAssembly.instantiateStreaming`, which requires the `application/wasm` content type the `/demo.wasm` route serves. The site's Content-Security-Policy allows this with the CSP3 `'wasm-unsafe-eval'` keyword, which permits WebAssembly compilation while continuing to forbid JavaScript `eval`.
 
 The built module is checked in at `public/demo.wasm` and embedded into the server binary like the other static assets, so backend builds, CI, and the Docker image need no WebAssembly toolchain. The `wasm/` crate is deliberately outside the backend build; after changing it, verify and rebuild the committed module:
 
