@@ -12,7 +12,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 strip = true
 panic = "abort"

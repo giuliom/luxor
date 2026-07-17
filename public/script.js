@@ -309,6 +309,14 @@ document.querySelector("#wasm-form").addEventListener("submit", (event) => {
     badge.textContent = "Instantiated";
     badge.classList.add("ok");
 
+    // Run both implementations once outside the timed section so the
+    // benchmark does not include first-call JIT/tiering effects.
+    const wasmWarmupCount = exports.count_primes(limit) >>> 0;
+    const jsWarmupCount = countPrimesJs(limit);
+    if (wasmWarmupCount !== jsWarmupCount) {
+      throw new Error(`WebAssembly and JavaScript disagree during warmup: ${wasmWarmupCount} vs ${jsWarmupCount}`);
+    }
+
     const wasmStart = performance.now();
     const wasmCount = exports.count_primes(limit) >>> 0;
     const wasmMs = performance.now() - wasmStart;
@@ -331,7 +339,7 @@ document.querySelector("#wasm-form").addEventListener("submit", (event) => {
       primes_found: wasmCount,
       wasm_ms: Number(wasmMs.toFixed(2)),
       js_ms: Number(jsMs.toFixed(2)),
-      note: "Identical sieves; both counts must match. Timings vary by device and JIT warmup.",
+      note: "Identical byte-array sieves after one untimed warmup; both counts must match. Timings vary by device.",
     };
   });
 });

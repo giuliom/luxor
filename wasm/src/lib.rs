@@ -14,10 +14,10 @@ pub extern "C" fn count_primes(limit: u32) -> u32 {
     if limit < 2 {
         return 0;
     }
-    let mut composite = vec![false; limit + 1];
+    let mut composite = vec![0u8; limit + 1];
     let mut count = 0u32;
     for n in 2..=limit {
-        if composite[n] {
+        if composite[n] != 0 {
             continue;
         }
         count += 1;
@@ -25,7 +25,7 @@ pub extern "C" fn count_primes(limit: u32) -> u32 {
         if let Some(start) = n.checked_mul(n) {
             let mut multiple = start;
             while multiple <= limit {
-                composite[multiple] = true;
+                composite[multiple] = 1;
                 multiple += n;
             }
         }
