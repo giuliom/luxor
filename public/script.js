@@ -10,9 +10,18 @@ const sessionPanel = document.querySelector("#session-panel");
 const sessionEmail = document.querySelector("#session-email");
 const sessionAvatar = document.querySelector("#session-avatar");
 const sessionMeta = document.querySelector("#session-meta");
+const activity = document.querySelector(".activity");
+
+function syncActivityHeight() {
+  document.documentElement.style.setProperty("--activity-height", `${activity.offsetHeight}px`);
+}
+
+new ResizeObserver(syncActivityHeight).observe(activity);
+syncActivityHeight();
 
 function show(label, data) {
   message.textContent = `${label}\n${typeof data === "string" ? data : JSON.stringify(data, null, 2)}`;
+  message.scrollTop = 0;
 }
 
 function setIdentity(user) {
