@@ -6,6 +6,7 @@ use luxor::{
     cache::{Cache, MemoryCache, RedisCache},
     config::Config,
     db,
+    observability::TraceStore,
     queue::{Job, MemoryQueue, Queue, RedisQueue},
     server,
     state::AppState,
@@ -44,6 +45,7 @@ async fn migrations_and_authentication_flow_work_against_postgres() {
         pool.clone(),
         Arc::new(MemoryCache::default()),
         Arc::new(MemoryQueue::default()),
+        TraceStore::default(),
     ));
     let email = format!("integration-{}@example.com", Uuid::new_v4());
     let credentials = json!({"email": email, "password": "integration-password"});

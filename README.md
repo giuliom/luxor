@@ -53,6 +53,7 @@ Every response carries `x-request-id`; an incoming value is preserved, otherwise
 | `GET` | `/api/hello?name=Ada` | No | Lightweight query demo |
 | `GET` | `/api/time` | No | UTC server clock |
 | `GET` | `/api/telemetry/demo` | No | Emit nested spans and return trace correlation IDs |
+| `GET` | `/api/telemetry/traces/{trace_id}` | No | Return the in-process captured spans for one trace |
 | `POST` | `/api/auth/register` | No | Create a password user and session |
 | `POST` | `/api/auth/login` | No | Verify credentials and create a session |
 | `POST` | `/api/auth/refresh` | Refresh cookie | Rotate the refresh token and issue access JWT |
@@ -125,9 +126,11 @@ OAuth is intentionally an extension boundary, not a half-configured provider flo
 
 ## Observability
 
-Development and test logs are compact; production logs are JSON. HTTP spans include OpenTelemetry server-span metadata, method, path, response status, and request ID. Incoming W3C `traceparent`, `tracestate`, and `baggage` headers are extracted so Luxor traces continue an upstream distributed trace. When an OTLP endpoint is present, spans are exported over OTLP/gRPC using the Tokio batch processor and flushed during graceful shutdown. Sentry initializes only when a DSN is present, and server-side errors are captured without exposing internal messages to clients.
+Development and test logs are compact; production logs are JSON. HTTP spans include OpenTelemetry server-span metadata, method, path, response status, and request ID. Incoming W3C `traceparent`, `tracestate`, and `baggage` headers are extracted so Luxor traces continue an upstream distributed trace. Sentry initializes only when a DSN is present, and server-side errors are captured without exposing internal messages to clients.
 
-The Compose observability profile runs a local, in-memory Jaeger collector and UI. It is a development demo, not a production storage setup:
+The tracer is always on: finished spans are kept in a bounded in-process store (the most recent 512, span names and timings only — attribute values are not retained) that the browser console consumes through `GET /api/telemetry/traces/{trace_id}`. Open <http://localhost:8080> and choose **Generate trace** in the OpenTelemetry card: the demo trace — the HTTP server span, the instrumented handler span, and two concurrent child spans — renders as a span waterfall directly on the page, with no collector required.
+
+When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the same spans are additionally exported over OTLP/gRPC using the Tokio batch processor and flushed during graceful shutdown. The Compose observability profile runs a local, in-memory Jaeger collector and UI to receive them (a development demo, not a production storage setup):
 
 ```sh
 docker compose --profile observability up -d
@@ -136,7 +139,7 @@ OTEL_SERVICE_NAME=luxor \
 cargo run
 ```
 
-Open <http://localhost:8080>, choose **Generate trace** in the OpenTelemetry card, and then open <http://localhost:16686>. The API response shows the `service.name`, request ID, trace ID, span ID, and sampling decision; the trace may take a few seconds to appear because export is batched. In Jaeger, select the `luxor` service or paste the trace ID into its trace lookup. The demo trace contains the HTTP server span, the instrumented handler span, and two concurrent child spans.
+In Jaeger at <http://localhost:16686>, select the `luxor` service or paste the trace ID shown in the console into its trace lookup; batched export may take a few seconds.
 
 For production, send OTLP to an OpenTelemetry Collector or managed backend, use a deliberate sampling policy, and configure durable retention outside this repository. The local Jaeger profile keeps traces only in memory.
 

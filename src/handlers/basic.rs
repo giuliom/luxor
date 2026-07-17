@@ -1,5 +1,9 @@
-use crate::state::AppState;
-use axum::{extract::Query, extract::State, http::HeaderMap, Json};
+use crate::{error::AppError, observability::StoredSpan, state::AppState};
+use axum::{
+    extract::{Path, Query, State},
+    http::HeaderMap,
+    Json,
+};
 use chrono::{SecondsFormat, Utc};
 use opentelemetry::trace::TraceContextExt;
 use serde::{Deserialize, Serialize};
@@ -80,7 +84,7 @@ pub async fn time() -> Json<TimeResponse> {
 
 #[derive(Serialize)]
 pub struct TelemetryDemoResponse {
-    enabled: bool,
+    otlp_enabled: bool,
     service_name: String,
     request_id: Option<String>,
     trace_id: Option<String>,
@@ -117,7 +121,7 @@ pub async fn telemetry_demo(
 
     let (trace_id, span_id, sampled) = current_trace_context();
     Json(TelemetryDemoResponse {
-        enabled: state.config.otlp_endpoint.is_some(),
+        otlp_enabled: state.config.otlp_endpoint.is_some(),
         service_name: state.config.otel_service_name.clone(),
         request_id: headers
             .get("x-request-id")
@@ -127,6 +131,31 @@ pub async fn telemetry_demo(
         span_id,
         sampled,
     })
+}
+
+#[derive(Serialize)]
+pub struct TraceResponse {
+    trace_id: String,
+    spans: Vec<StoredSpan>,
+}
+
+/// Serves the spans captured in-process for one trace, so the browser console
+/// can render a waterfall without an external collector.
+pub async fn trace(
+    State(state): State<AppState>,
+    Path(trace_id): Path<String>,
+) -> Result<Json<TraceResponse>, AppError> {
+    let trace_id = trace_id.to_ascii_lowercase();
+    if trace_id.len() != 32 || !trace_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AppError::BadRequest(
+            "trace id must be 32 hexadecimal characters".into(),
+        ));
+    }
+    let spans = state.trace_store.trace(&trace_id);
+    if spans.is_empty() {
+        return Err(AppError::NotFound("trace"));
+    }
+    Ok(Json(TraceResponse { trace_id, spans }))
 }
 
 fn current_trace_context() -> (Option<String>, Option<String>, Option<bool>) {

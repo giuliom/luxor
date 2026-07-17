@@ -167,21 +167,92 @@ document.querySelector("#job-form").addEventListener("submit", (event) => {
 document.querySelector("#telemetry-button").addEventListener("click", () => run("OpenTelemetry trace", async () => {
   const data = await api("/api/telemetry/demo");
   const badge = document.querySelector("#telemetry-badge");
-  badge.textContent = data.enabled ? "Exporting" : "Exporter off";
-  badge.classList.toggle("ok", data.enabled);
 
   document.querySelector("#telemetry-service").textContent = data.service_name;
   document.querySelector("#telemetry-request-id").textContent = data.request_id || "Unavailable";
-  document.querySelector("#telemetry-trace-id").textContent = data.trace_id || "Enable OTLP export to create one";
+  document.querySelector("#telemetry-trace-id").textContent = data.trace_id || "Unavailable";
   document.querySelector("#telemetry-result").hidden = false;
+
+  if (!data.trace_id) {
+    badge.textContent = "No trace";
+    badge.classList.remove("ok");
+    return data;
+  }
+
+  const trace = await fetchTrace(data.trace_id);
+  renderWaterfall(trace.spans);
+  badge.textContent = `${trace.spans.length} spans`;
+  badge.classList.add("ok");
 
   return {
     ...data,
-    hint: data.enabled
-      ? "The batch exporter may take a few seconds before this trace appears in Jaeger."
-      : "Set OTEL_EXPORTER_OTLP_ENDPOINT and restart Luxor to export traces.",
+    span_count: trace.spans.length,
+    hint: data.otlp_enabled
+      ? "Spans are captured in-process for the waterfall below and batch-exported to the configured OTLP endpoint."
+      : "Spans are captured in-process. Set OTEL_EXPORTER_OTLP_ENDPOINT to also export them over OTLP.",
   };
 }));
+
+// The root HTTP span finishes only as the demo response is sent, so the first
+// lookup can race it into the store; retry briefly before giving up.
+async function fetchTrace(traceId, attempt = 0) {
+  try {
+    return await api(`/api/telemetry/traces/${traceId}`, {}, false);
+  } catch (error) {
+    if (attempt >= 4) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    return fetchTrace(traceId, attempt + 1);
+  }
+}
+
+function renderWaterfall(spans) {
+  const container = document.querySelector("#trace-waterfall");
+  container.replaceChildren();
+  container.hidden = spans.length === 0;
+  if (!spans.length) return;
+
+  const start = Math.min(...spans.map((span) => span.start_unix_ms));
+  const end = Math.max(...spans.map((span) => span.start_unix_ms + span.duration_ms));
+  const total = Math.max(end - start, 0.001);
+
+  const byId = new Map(spans.map((span) => [span.span_id, span]));
+  const depthOf = (span, seen = new Set()) => {
+    const parent = span.parent_span_id && byId.get(span.parent_span_id);
+    if (!parent || seen.has(span.span_id)) return 0;
+    return depthOf(parent, seen.add(span.span_id)) + 1;
+  };
+
+  for (const span of spans) {
+    const label = document.createElement("span");
+    label.className = "trace-label";
+    label.style.paddingLeft = `${depthOf(span) * 0.9}rem`;
+    label.textContent = span.name;
+    label.title = `${span.name} · ${span.kind}`;
+
+    const bar = document.createElement("span");
+    bar.className = span.status === "error" ? "trace-bar error" : "trace-bar";
+    bar.style.left = `${((span.start_unix_ms - start) / total) * 100}%`;
+    bar.style.width = `${Math.max((span.duration_ms / total) * 100, 0.8)}%`;
+    const track = document.createElement("span");
+    track.className = "trace-track";
+    track.append(bar);
+
+    const duration = document.createElement("span");
+    duration.className = "trace-duration";
+    duration.textContent = formatDuration(span.duration_ms);
+
+    const row = document.createElement("div");
+    row.className = "trace-row";
+    row.append(label, track, duration);
+    container.append(row);
+  }
+}
+
+function formatDuration(ms) {
+  if (ms >= 1000) return `${(ms / 1000).toFixed(2)} s`;
+  if (ms >= 1) return `${ms.toFixed(1)} ms`;
+  return `${(ms * 1000).toFixed(0)} µs`;
+}
 
 async function initialize() {
   try {

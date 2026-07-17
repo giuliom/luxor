@@ -43,6 +43,7 @@ pub fn app(state: AppState) -> Router {
         .route("/hello", get(basic::hello))
         .route("/time", get(basic::time))
         .route("/telemetry/demo", get(basic::telemetry_demo))
+        .route("/telemetry/traces/{trace_id}", get(basic::trace))
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/auth/refresh", post(auth::refresh))
@@ -229,7 +230,14 @@ async fn api_method_not_allowed() -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cache::MemoryCache, config::Config, db, queue::MemoryQueue, state::AppState};
+    use crate::{
+        cache::MemoryCache,
+        config::Config,
+        db,
+        observability::{StoredSpan, TraceStore},
+        queue::MemoryQueue,
+        state::AppState,
+    };
     use axum::{
         body::{to_bytes, Body},
         http::{Request, StatusCode},
@@ -248,6 +256,10 @@ mod tests {
     }
 
     fn test_app_with_config(config: Config) -> Router {
+        test_app_with_trace_store(config, TraceStore::default())
+    }
+
+    fn test_app_with_trace_store(config: Config, trace_store: TraceStore) -> Router {
         let config = Arc::new(config);
         let pool = db::connect_lazy("postgres://luxor:luxor@localhost/luxor").unwrap();
         app(AppState::new(
@@ -255,6 +267,7 @@ mod tests {
             pool,
             Arc::new(MemoryCache::default()),
             Arc::new(MemoryQueue::default()),
+            trace_store,
         ))
     }
 
@@ -425,10 +438,66 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_text(response).await;
-        assert!(body.contains(r#""enabled":false"#));
+        assert!(body.contains(r#""otlp_enabled":false"#));
         assert!(body.contains(r#""service_name":"luxor""#));
         assert!(body.contains(r#""request_id":""#));
         assert!(body.contains(r#""trace_id":null"#));
+    }
+
+    #[tokio::test]
+    async fn trace_endpoint_validates_ids_and_serves_stored_spans() {
+        let trace_id = "0af7651916cd43dd8448eb211c80319c";
+        let trace_store = TraceStore::default();
+        trace_store.record(StoredSpan {
+            trace_id: trace_id.to_owned(),
+            span_id: "b7ad6b7169203331".to_owned(),
+            parent_span_id: None,
+            name: "GET /api/telemetry/demo".to_owned(),
+            kind: "server",
+            status: "unset",
+            start_unix_ms: 1_700_000_000_000.0,
+            duration_ms: 32.5,
+        });
+        let app = test_app_with_trace_store(Config::from_map(HashMap::new()).unwrap(), trace_store);
+
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/telemetry/traces/not-a-trace-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/telemetry/traces/ffffffffffffffffffffffffffffffff")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let found = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/telemetry/traces/{trace_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.status(), StatusCode::OK);
+        let body = body_text(found).await;
+        assert!(body.contains(r#""trace_id":"0af7651916cd43dd8448eb211c80319c""#));
+        assert!(body.contains(r#""name":"GET /api/telemetry/demo""#));
+        assert!(body.contains(r#""kind":"server""#));
     }
 
     #[tokio::test]

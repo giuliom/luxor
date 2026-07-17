@@ -169,7 +169,7 @@ input {
 input:focus { border-color: #91583e; box-shadow: 0 0 0 3px rgba(145, 88, 62, 0.12); }
 .actions { display: flex; flex-wrap: wrap; gap: 0.55rem; }
 
-button, .button-link {
+button {
   min-height: 2.65rem;
   padding: 0 1rem;
   border: 1px solid #25322a;
@@ -181,19 +181,26 @@ button, .button-link {
   transition: transform 120ms ease, background 120ms ease;
 }
 
-button:hover, .button-link:hover { transform: translateY(-1px); background: #37483d; }
+button:hover { transform: translateY(-1px); background: #37483d; }
 button:disabled, input:disabled { cursor: not-allowed; opacity: 0.55; }
 button:disabled:hover { transform: none; background: #25322a; }
 button.secondary:disabled:hover { background: transparent; }
-button.secondary, .button-link.secondary { border-color: #aaa294; background: transparent; color: #30342e; }
+button.secondary { border-color: #aaa294; background: transparent; color: #30342e; }
 button.quiet { border-color: transparent; background: #e2ddd2; color: #444841; }
 button.danger { color: #933a29; }
 
-.button-link { display: inline-flex; align-items: center; text-decoration: none; }
 .telemetry-result { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.7rem; margin: 1.2rem 0 0; }
 .telemetry-result div { min-width: 0; padding: 0.8rem; border: 1px solid #d0c9bb; border-radius: 0.45rem; background: rgba(255, 255, 255, 0.35); }
 .telemetry-result dt { color: #7d786f; font-size: 0.64rem; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
 .telemetry-result dd { margin: 0.35rem 0 0; overflow-wrap: anywhere; font: 650 0.76rem/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+.trace-waterfall { display: grid; gap: 0.4rem; margin-top: 1.1rem; }
+.trace-row { display: grid; grid-template-columns: minmax(9rem, 15rem) 1fr 4.2rem; align-items: center; gap: 0.65rem; }
+.trace-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #4c4a44; font-size: 0.76rem; font-weight: 650; }
+.trace-track { position: relative; height: 0.9rem; border: 1px solid #d0c9bb; border-radius: 0.3rem; background: rgba(255, 255, 255, 0.45); overflow: hidden; }
+.trace-bar { position: absolute; top: 0; bottom: 0; border-radius: 0.25rem; background: #3f7d53; min-width: 2px; }
+.trace-bar.error { background: #933a29; }
+.trace-duration { color: #6d6b65; font: 650 0.72rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
 
 .inline-form { grid-template-columns: minmax(12rem, 1fr) auto; align-items: end; }
 .activity { display: grid; grid-template-columns: 10rem 1fr; gap: 2rem; margin-top: 1rem; background: #273129; color: #f2eee3; border-color: #273129; }
@@ -206,4 +213,5 @@ button.danger { color: #933a29; }
   .grid { grid-template-columns: 1fr; }
   .card.wide { grid-column: auto; }
   .inline-form, .activity, .telemetry-result { grid-template-columns: 1fr; }
+  .trace-row { grid-template-columns: minmax(6rem, 8rem) 1fr 3.6rem; }
 }

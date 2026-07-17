@@ -14,7 +14,7 @@
       },
       "args": [],
       "cwd": "${workspaceFolder}",
-      "terminal": "console",
+      "terminal": "integrated",
       "env": {
         "APP_ENV": "development",
         "APP_HOST": "127.0.0.1",
@@ -45,7 +45,7 @@
       "args": [],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "luxor: start infrastructure",
-      "terminal": "console",
+      "terminal": "integrated",
       "env": {
         "APP_ENV": "development",
         "APP_HOST": "127.0.0.1",

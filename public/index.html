@@ -94,16 +94,16 @@
             <div><span class="number">05</span><h2>OpenTelemetry</h2></div>
             <span id="telemetry-badge" class="badge">Not checked</span>
           </div>
-          <p>Generate an HTTP trace with two concurrent child spans, then correlate its request and W3C trace identifiers in your collector.</p>
+          <p>Generate an HTTP trace with two concurrent child spans, then inspect the captured span waterfall without leaving the page.</p>
           <div class="actions">
             <button id="telemetry-button" type="button">Generate trace</button>
-            <a class="button-link secondary" href="http://localhost:16686" target="_blank" rel="noreferrer">Open local Jaeger</a>
           </div>
           <dl id="telemetry-result" class="telemetry-result" hidden>
             <div><dt>Service</dt><dd id="telemetry-service">—</dd></div>
             <div><dt>Request ID</dt><dd id="telemetry-request-id">—</dd></div>
             <div><dt>Trace ID</dt><dd id="telemetry-trace-id">—</dd></div>
           </dl>
+          <div id="trace-waterfall" class="trace-waterfall" role="img" aria-label="Trace span waterfall" hidden></div>
         </article>
       </section>
 

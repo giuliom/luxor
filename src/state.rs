@@ -1,4 +1,6 @@
-use crate::{auth::JwtService, cache::Cache, config::Config, queue::Queue};
+use crate::{
+    auth::JwtService, cache::Cache, config::Config, observability::TraceStore, queue::Queue,
+};
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -9,6 +11,7 @@ pub struct AppState {
     pub cache: Arc<dyn Cache>,
     pub queue: Arc<dyn Queue>,
     pub jwt: JwtService,
+    pub trace_store: TraceStore,
 }
 
 impl AppState {
@@ -17,6 +20,7 @@ impl AppState {
         db: PgPool,
         cache: Arc<dyn Cache>,
         queue: Arc<dyn Queue>,
+        trace_store: TraceStore,
     ) -> Self {
         let jwt = JwtService::from_config(&config);
         Self {
@@ -25,6 +29,7 @@ impl AppState {
             cache,
             queue,
             jwt,
+            trace_store,
         }
     }
 }

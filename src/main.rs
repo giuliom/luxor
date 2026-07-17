@@ -41,7 +41,8 @@ async fn migrate() -> Result<()> {
 
 async fn serve() -> Result<()> {
     let config = Arc::new(Config::from_env().context("invalid application configuration")?);
-    let telemetry = observability::init(&config).context("failed to initialize observability")?;
+    let (telemetry, trace_store) =
+        observability::init(&config).context("failed to initialize observability")?;
 
     let (db, dev_postgres) = match &config.database_url {
         Some(database_url) => {
@@ -91,7 +92,7 @@ async fn serve() -> Result<()> {
             )
         }
     };
-    let state = AppState::new(config.clone(), db, cache, queue);
+    let state = AppState::new(config.clone(), db, cache, queue, trace_store);
     let app = server::app(state);
 
     let listener = tokio::net::TcpListener::bind(config.bind_address())
