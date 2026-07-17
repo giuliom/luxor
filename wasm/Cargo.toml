@@ -1,0 +1,21 @@
+# Standalone crate (the empty [workspace] table keeps it out of the backend
+# build) compiled ahead of time to public/demo.wasm; see the README's
+# WebAssembly demo section for the build commands.
+[package]
+name = "luxor-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# rlib enables host-target `cargo test`; cdylib produces the .wasm module.
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+
+[workspace]

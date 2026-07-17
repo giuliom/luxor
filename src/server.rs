@@ -64,6 +64,7 @@ pub fn app(state: AppState) -> Router {
         .route("/favicon.svg", get(favicon))
         .route("/styles.css", get(styles))
         .route("/script.js", get(script))
+        .route("/demo.wasm", get(wasm_demo))
         .nest("/api", api)
         .with_state(state)
         .layer(DefaultBodyLimit::max(body_limit))
@@ -135,7 +136,9 @@ async fn apply_security_headers(
     insert_header(
         headers,
         "content-security-policy",
-        "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'",
+        // 'wasm-unsafe-eval' (CSP3) permits WebAssembly compilation while
+        // still forbidding JavaScript eval.
+        "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'",
     );
     insert_header(headers, "x-content-type-options", "nosniff");
     insert_header(headers, "x-frame-options", "DENY");
@@ -216,6 +219,18 @@ async fn script() -> impl IntoResponse {
             HeaderValue::from_static("text/javascript; charset=utf-8"),
         )],
         include_str!("../public/script.js"),
+    )
+}
+
+// The application/wasm content type is required for
+// WebAssembly.instantiateStreaming.
+async fn wasm_demo() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/wasm"),
+        )],
+        include_bytes!("../public/demo.wasm").as_slice(),
     )
 }
 
@@ -423,6 +438,37 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(body_text(response).await, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn serves_the_wasm_demo_module_for_streaming_compilation() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/demo.wasm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        // WebAssembly.instantiateStreaming requires this exact content type.
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/wasm"
+        );
+        // The page compiles the module under the site CSP, which must allow
+        // WebAssembly compilation without allowing JavaScript eval.
+        assert!(response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("script-src 'self' 'wasm-unsafe-eval'"));
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(bytes.starts_with(b"\0asm"));
     }
 
     #[tokio::test]

@@ -44,6 +44,13 @@ async fn serve() -> Result<()> {
     let (telemetry, trace_store) =
         observability::init(&config).context("failed to initialize observability")?;
 
+    // Bind before any infrastructure starts so that a second instance fails
+    // fast on the port conflict instead of first spinning up (or attaching
+    // to) the embedded development database.
+    let listener = tokio::net::TcpListener::bind(config.bind_address())
+        .await
+        .with_context(|| format!("failed to bind {}", config.bind_address()))?;
+
     let (db, dev_postgres) = match &config.database_url {
         Some(database_url) => {
             let db = db::connect(database_url)
@@ -95,9 +102,6 @@ async fn serve() -> Result<()> {
     let state = AppState::new(config.clone(), db, cache, queue, trace_store);
     let app = server::app(state);
 
-    let listener = tokio::net::TcpListener::bind(config.bind_address())
-        .await
-        .with_context(|| format!("failed to bind {}", config.bind_address()))?;
     let address = listener.local_addr()?;
     tracing::info!(%address, "server listening");
     if config.open_browser {

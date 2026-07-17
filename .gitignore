@@ -6,3 +6,5 @@
 .DS_Store
 # Embedded development PostgreSQL data
 .luxor/
+# WebAssembly demo crate build output (the built module is checked in at public/demo.wasm)
+wasm/target/

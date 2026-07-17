@@ -254,6 +254,79 @@ function formatDuration(ms) {
   return `${(ms * 1000).toFixed(0)} µs`;
 }
 
+let wasmExports = null;
+
+async function loadWasmDemo() {
+  if (wasmExports) return wasmExports;
+  const source = fetch("/demo.wasm");
+  // Streaming compilation is the standard path; the ArrayBuffer fallback
+  // covers engines without instantiateStreaming.
+  const { instance } = "instantiateStreaming" in WebAssembly
+    ? await WebAssembly.instantiateStreaming(source)
+    : await WebAssembly.instantiate(await (await source).arrayBuffer());
+  wasmExports = instance.exports;
+  return wasmExports;
+}
+
+// Mirrors count_primes in wasm/src/lib.rs; the demo cross-checks the counts.
+function countPrimesJs(limit) {
+  if (limit < 2) return 0;
+  const composite = new Uint8Array(limit + 1);
+  let count = 0;
+  for (let n = 2; n <= limit; n += 1) {
+    if (composite[n]) continue;
+    count += 1;
+    for (let multiple = n * n; multiple <= limit; multiple += n) {
+      composite[multiple] = 1;
+    }
+  }
+  return count;
+}
+
+document.querySelector("#wasm-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  run("WebAssembly benchmark", async () => {
+    const badge = document.querySelector("#wasm-badge");
+    const limit = Math.min(Math.max(Math.trunc(Number(document.querySelector("#wasm-limit").value) || 0), 2), 10_000_000);
+
+    let exports;
+    try {
+      exports = await loadWasmDemo();
+    } catch (error) {
+      badge.textContent = "Unavailable";
+      badge.classList.remove("ok");
+      throw error;
+    }
+    badge.textContent = "Instantiated";
+    badge.classList.add("ok");
+
+    const wasmStart = performance.now();
+    const wasmCount = exports.count_primes(limit) >>> 0;
+    const wasmMs = performance.now() - wasmStart;
+
+    const jsStart = performance.now();
+    const jsCount = countPrimesJs(limit);
+    const jsMs = performance.now() - jsStart;
+
+    if (wasmCount !== jsCount) {
+      throw new Error(`WebAssembly and JavaScript disagree: ${wasmCount} vs ${jsCount}`);
+    }
+
+    document.querySelector("#wasm-count").textContent = wasmCount.toLocaleString();
+    document.querySelector("#wasm-time").textContent = `${wasmMs.toFixed(1)} ms`;
+    document.querySelector("#wasm-js-time").textContent = `${jsMs.toFixed(1)} ms`;
+    document.querySelector("#wasm-result").hidden = false;
+
+    return {
+      sieve_limit: limit,
+      primes_found: wasmCount,
+      wasm_ms: Number(wasmMs.toFixed(2)),
+      js_ms: Number(jsMs.toFixed(2)),
+      note: "Identical sieves; both counts must match. Timings vary by device and JIT warmup.",
+    };
+  });
+});
+
 async function initialize() {
   try {
     const runtime = await api("/api/runtime", {}, false);

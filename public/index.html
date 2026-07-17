@@ -11,7 +11,7 @@
     <main class="page-shell">
       <header class="hero">
         <div>
-          <p class="eyebrow">Rust · Axum · PostgreSQL · Redis · OpenTelemetry</p>
+          <p class="eyebrow">Rust · Axum · PostgreSQL · Redis · OpenTelemetry · WebAssembly</p>
           <h1>Luxor backend console</h1>
           <p class="intro">A small same-origin client for exercising the reference API. Access tokens live only in this page’s memory.</p>
         </div>
@@ -104,6 +104,23 @@
             <div><dt>Trace ID</dt><dd id="telemetry-trace-id">—</dd></div>
           </dl>
           <div id="trace-waterfall" class="trace-waterfall" role="img" aria-label="Trace span waterfall" hidden></div>
+        </article>
+
+        <article class="card wide">
+          <div class="card-heading">
+            <div><span class="number">06</span><h2>WebAssembly</h2></div>
+            <span id="wasm-badge" class="badge">Not loaded</span>
+          </div>
+          <p>Stream-compile a Rust module with WebAssembly.instantiateStreaming, then count primes with the same sieve in WebAssembly and in JavaScript and compare the timings.</p>
+          <form id="wasm-form" class="inline-form">
+            <label>Sieve limit<input id="wasm-limit" type="number" min="2" max="10000000" step="1" value="1000000" required></label>
+            <button type="submit">Run benchmark</button>
+          </form>
+          <dl id="wasm-result" class="telemetry-result" hidden>
+            <div><dt>Primes found</dt><dd id="wasm-count">—</dd></div>
+            <div><dt>WebAssembly</dt><dd id="wasm-time">—</dd></div>
+            <div><dt>JavaScript</dt><dd id="wasm-js-time">—</dd></div>
+          </dl>
         </article>
       </section>
 

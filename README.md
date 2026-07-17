@@ -2,7 +2,7 @@
 
 [![Build & Tests](https://github.com/giuliom/luxor/actions/workflows/CI.yml/badge.svg)](https://github.com/giuliom/luxor/actions/workflows/CI.yml)
 
-Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, JWT access tokens with rotating refresh sessions, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
+Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, JWT access tokens with rotating refresh sessions, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console with in-page trace and Rust-to-WebAssembly demos. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
 
 ## Quick start
 
@@ -113,6 +113,19 @@ The checked-in migrations create normalized unique users, hashed refresh session
 Cache keys are validated, namespaced, JSON encoded, and always written with a positive TTL. A missing or expired key is a normal cache miss. Cache failures are surfaced as server errors rather than changing authoritative PostgreSQL data.
 
 The queue is enqueue-only. Producers `LPUSH` a version-stable JSON `JobEnvelope` to `QUEUE_KEY`; a separate future worker should use blocking `BRPOP`, which preserves FIFO order. The envelope contains an ID, explicit kind, tagged payload, enqueue time, `attempt`, and `max_attempts`. The worker owns acknowledgement semantics, retry backoff, idempotency, and dead-letter movement. `SendEmail` is only a provider-neutral job contract—this repository deliberately sends no email.
+
+## WebAssembly demo
+
+The console's WebAssembly card benchmarks a prime sieve compiled from Rust ([`wasm/`](wasm/)) against the identical sieve in JavaScript, cross-checking that both counts agree. The module is plain `wasm32-unknown-unknown` output with a C-ABI export — no bindings generator or JS glue — and the page loads it with standard `WebAssembly.instantiateStreaming`, which requires the `application/wasm` content type the `/demo.wasm` route serves. The site's Content-Security-Policy allows this with the CSP3 `'wasm-unsafe-eval'` keyword, which permits WebAssembly compilation while continuing to forbid JavaScript `eval`.
+
+The built module is checked in at `public/demo.wasm` and embedded into the server binary like the other static assets, so backend builds, CI, and the Docker image need no WebAssembly toolchain. The `wasm/` crate is deliberately outside the backend build; after changing it, verify and rebuild the committed module:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo test --manifest-path wasm/Cargo.toml
+cargo build --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown --release
+cp wasm/target/wasm32-unknown-unknown/release/luxor_wasm.wasm public/demo.wasm
+```
 
 ## Adding an OAuth provider
 
