@@ -28,6 +28,13 @@ services:
       timeout: 3s
       retries: 10
 
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.19.0
+    profiles: ["observability"]
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"
+      - "${OTEL_GRPC_PORT:-4317}:4317"
+
 volumes:
   luxor-postgres:
   luxor-redis:

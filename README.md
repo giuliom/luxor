@@ -26,6 +26,12 @@ Compose reads `POSTGRES_PORT` and `REDIS_PORT` for its host mappings. If either 
 
 To stop local infrastructure, use `docker compose down`. Add `--volumes` only when you intentionally want to delete local database and Redis data.
 
+### Debugging in VS Code
+
+With the CodeLLDB extension installed, choose **Debug luxor** and press F5. This default configuration needs no Docker: it starts Luxor with an ephemeral in-memory cache and queue, while persistent authentication is disabled. The service, OpenTelemetry, cache, and queue browser demos remain available, and all in-memory data is cleared when the process stops.
+
+Choose **Debug luxor (PostgreSQL + Redis)** when you need the complete authentication and persistence flow. Its pre-launch task requires Docker Desktop, starts PostgreSQL and Redis, and waits for both health checks before launching Luxor. Both configurations set `APP_OPEN_BROWSER=true`, so Luxor opens <http://127.0.0.1:8080/> in the system-default browser immediately after binding its listener. An external browser is intentional because Luxor's security headers prevent the frontend from being embedded in VS Code's Simple Browser.
+
 ## HTTP API
 
 All application endpoints are under `/api` and JSON errors use this shape:
@@ -39,8 +45,10 @@ Every response carries `x-request-id`; an incoming value is preserved, otherwise
 | Method | Route | Authentication | Purpose |
 | --- | --- | --- | --- |
 | `GET` | `/api/health` | No | Liveness response |
+| `GET` | `/api/runtime` | No | Report full-stack or standalone backend capabilities |
 | `GET` | `/api/hello?name=Ada` | No | Lightweight query demo |
 | `GET` | `/api/time` | No | UTC server clock |
+| `GET` | `/api/telemetry/demo` | No | Emit nested spans and return trace correlation IDs |
 | `POST` | `/api/auth/register` | No | Create a password user and session |
 | `POST` | `/api/auth/login` | No | Verify credentials and create a session |
 | `POST` | `/api/auth/refresh` | Refresh cookie | Rotate the refresh token and issue access JWT |
@@ -70,9 +78,12 @@ Refresh tokens are SHA-256 hashed in PostgreSQL and rotate on every use. Reusing
 | `CORS_ORIGINS` | `http://localhost:8080` | Comma-separated exact origins; credentials are enabled |
 | `BODY_LIMIT_BYTES` | `1048576` | JSON body limit |
 | `AUTO_MIGRATE` | true outside production | Must normally be false in production |
+| `APP_STANDALONE` | `false` | Development-only in-memory mode; disables persistent authentication and avoids PostgreSQL/Redis connections |
+| `APP_OPEN_BROWSER` | `false` | Development-only opt-in that opens the frontend in the system-default browser after startup |
 | `CACHE_NAMESPACE`, `QUEUE_KEY` | `luxor:cache`, `luxor:queue:jobs` | Redis namespacing |
 | `RUST_LOG` | Sensible service defaults | Standard tracing filter syntax |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Empty/disabled | Enables batched OTLP tracing when set |
+| `OTEL_SERVICE_NAME` | `luxor` | OpenTelemetry `service.name` resource attribute |
 | `SENTRY_DSN` | Empty/disabled | Enables Sentry error capture when set |
 
 Do not commit real secrets or put them in image layers. Inject them at runtime through the deployment platform’s secret manager, use a long random JWT secret, terminate TLS before accepting secure cookies, restrict database/Redis network access, and rotate credentials through a controlled rollout.
@@ -111,7 +122,20 @@ OAuth is intentionally an extension boundary, not a half-configured provider flo
 
 ## Observability
 
-Development and test logs are compact; production logs are JSON. HTTP spans include method, URI, and request ID. When an OTLP endpoint is present, those spans are exported using the Tokio batch processor and flushed during graceful shutdown. Sentry initializes only when a DSN is present, and server-side errors are captured without exposing internal messages to clients.
+Development and test logs are compact; production logs are JSON. HTTP spans include OpenTelemetry server-span metadata, method, path, response status, and request ID. Incoming W3C `traceparent`, `tracestate`, and `baggage` headers are extracted so Luxor traces continue an upstream distributed trace. When an OTLP endpoint is present, spans are exported over OTLP/gRPC using the Tokio batch processor and flushed during graceful shutdown. Sentry initializes only when a DSN is present, and server-side errors are captured without exposing internal messages to clients.
+
+The Compose observability profile runs a local, in-memory Jaeger collector and UI. It is a development demo, not a production storage setup:
+
+```sh
+docker compose --profile observability up -d
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+OTEL_SERVICE_NAME=luxor \
+cargo run
+```
+
+Open <http://localhost:8080>, choose **Generate trace** in the OpenTelemetry card, and then open <http://localhost:16686>. The API response shows the `service.name`, request ID, trace ID, span ID, and sampling decision; the trace may take a few seconds to appear because export is batched. In Jaeger, select the `luxor` service or paste the trace ID into its trace lookup. The demo trace contains the HTTP server span, the instrumented handler span, and two concurrent child spans.
+
+For production, send OTLP to an OpenTelemetry Collector or managed backend, use a deliberate sampling policy, and configure durable retention outside this repository. The local Jaeger profile keeps traces only in memory.
 
 ## Tests and quality gates
 

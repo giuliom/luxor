@@ -10,7 +10,7 @@
     <main class="page-shell">
       <header class="hero">
         <div>
-          <p class="eyebrow">Rust · Axum · PostgreSQL · Redis</p>
+          <p class="eyebrow">Rust · Axum · PostgreSQL · Redis · OpenTelemetry</p>
           <h1>Luxor backend console</h1>
           <p class="intro">A small same-origin client for exercising the reference API. Access tokens live only in this page’s memory.</p>
         </div>
@@ -24,7 +24,10 @@
         <article class="card wide">
           <div class="card-heading">
             <div><span class="number">01</span><h2>Service</h2></div>
-            <span id="health-badge" class="badge">Unchecked</span>
+            <div class="badge-group">
+              <span id="runtime-badge" class="badge">Checking mode…</span>
+              <span id="health-badge" class="badge">Unchecked</span>
+            </div>
           </div>
           <p>Check the public health and clock endpoints.</p>
           <div class="actions">
@@ -38,6 +41,7 @@
             <div><span class="number">02</span><h2>Authentication</h2></div>
             <span id="auth-badge" class="badge">Checking…</span>
           </div>
+          <p id="auth-description">Register or sign in against PostgreSQL-backed sessions.</p>
           <form id="auth-form" hidden>
             <label>Email<input id="email" type="email" autocomplete="email" value="demo@example.com" required></label>
             <label>Password<input id="password" type="password" autocomplete="current-password" minlength="12" value="change-this-password" required></label>
@@ -82,6 +86,23 @@
             <label>Action<input id="job-action" value="demo_button_clicked" maxlength="200" required></label>
             <button type="submit">Enqueue event</button>
           </form>
+        </article>
+
+        <article class="card wide telemetry-card">
+          <div class="card-heading">
+            <div><span class="number">05</span><h2>OpenTelemetry</h2></div>
+            <span id="telemetry-badge" class="badge">Not checked</span>
+          </div>
+          <p>Generate an HTTP trace with two concurrent child spans, then correlate its request and W3C trace identifiers in your collector.</p>
+          <div class="actions">
+            <button id="telemetry-button" type="button">Generate trace</button>
+            <a class="button-link secondary" href="http://localhost:16686" target="_blank" rel="noreferrer">Open local Jaeger</a>
+          </div>
+          <dl id="telemetry-result" class="telemetry-result" hidden>
+            <div><dt>Service</dt><dd id="telemetry-service">—</dd></div>
+            <div><dt>Request ID</dt><dd id="telemetry-request-id">—</dd></div>
+            <div><dt>Trace ID</dt><dd id="telemetry-trace-id">—</dd></div>
+          </dl>
         </article>
       </section>
 

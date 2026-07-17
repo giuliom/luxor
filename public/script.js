@@ -1,4 +1,5 @@
 let accessToken = null;
+let standaloneMode = false;
 
 const message = document.querySelector("#message");
 const identity = document.querySelector("#identity");
@@ -18,13 +19,20 @@ function show(label, data) {
 function setIdentity(user) {
   const signedIn = Boolean(user);
 
-  identity.textContent = signedIn ? `Signed in as ${user.email}` : "Signed out";
+  identity.textContent = standaloneMode
+    ? "Standalone · no database"
+    : signedIn
+      ? `Signed in as ${user.email}`
+      : "Signed out";
   authDot.classList.remove("checking");
-  authDot.classList.toggle("online", signedIn);
-  identityPill.classList.toggle("online", signedIn);
+  authDot.classList.toggle("online", signedIn && !standaloneMode);
+  authDot.classList.toggle("standalone", standaloneMode);
+  identityPill.classList.toggle("online", signedIn && !standaloneMode);
+  identityPill.classList.toggle("standalone", standaloneMode);
 
-  authBadge.textContent = signedIn ? "Signed in" : "Signed out";
-  authBadge.classList.toggle("ok", signedIn);
+  authBadge.textContent = standaloneMode ? "Unavailable" : signedIn ? "Signed in" : "Signed out";
+  authBadge.classList.toggle("ok", signedIn && !standaloneMode);
+  authBadge.classList.toggle("offline", standaloneMode);
 
   authForm.hidden = signedIn;
   sessionPanel.hidden = !signedIn;
@@ -37,8 +45,23 @@ function setIdentity(user) {
   }
 
   for (const badge of document.querySelectorAll(".badge.protected")) {
-    badge.textContent = signedIn ? "Unlocked" : "Log in required";
-    badge.classList.toggle("unlocked", signedIn);
+    badge.textContent = standaloneMode ? "Memory demo" : signedIn ? "Unlocked" : "Log in required";
+    badge.classList.toggle("unlocked", standaloneMode || signedIn);
+  }
+}
+
+function setRuntime(runtime) {
+  standaloneMode = runtime.mode === "standalone";
+  const runtimeBadge = document.querySelector("#runtime-badge");
+  runtimeBadge.textContent = standaloneMode ? "Standalone" : "Full stack";
+  runtimeBadge.classList.toggle("standalone", standaloneMode);
+  runtimeBadge.classList.toggle("ok", !standaloneMode);
+
+  document.querySelector("#auth-description").textContent = standaloneMode
+    ? "Persistent authentication is disabled. Cache and queue actions use ephemeral in-memory backends."
+    : "Register or sign in against PostgreSQL-backed sessions.";
+  for (const control of authForm.querySelectorAll("input, button")) {
+    control.disabled = standaloneMode;
   }
 }
 
@@ -157,12 +180,50 @@ document.querySelector("#job-form").addEventListener("submit", (event) => {
   }));
 });
 
-// A surviving HTTP-only refresh cookie may restore the session after a reload.
-refreshAccessToken().then((restored) => {
-  show(
-    "Session",
-    restored
-      ? "Restored from the refresh cookie."
-      : "No active session. Log in or register to use the protected endpoints.",
-  );
-});
+document.querySelector("#telemetry-button").addEventListener("click", () => run("OpenTelemetry trace", async () => {
+  const data = await api("/api/telemetry/demo");
+  const badge = document.querySelector("#telemetry-badge");
+  badge.textContent = data.enabled ? "Exporting" : "Exporter off";
+  badge.classList.toggle("ok", data.enabled);
+
+  document.querySelector("#telemetry-service").textContent = data.service_name;
+  document.querySelector("#telemetry-request-id").textContent = data.request_id || "Unavailable";
+  document.querySelector("#telemetry-trace-id").textContent = data.trace_id || "Enable OTLP export to create one";
+  document.querySelector("#telemetry-result").hidden = false;
+
+  return {
+    ...data,
+    hint: data.enabled
+      ? "The batch exporter may take a few seconds before this trace appears in Jaeger."
+      : "Set OTEL_EXPORTER_OTLP_ENDPOINT and restart Luxor to export traces.",
+  };
+}));
+
+async function initialize() {
+  try {
+    const runtime = await api("/api/runtime", {}, false);
+    setRuntime(runtime);
+    if (standaloneMode) {
+      setIdentity(null);
+      show("Runtime", {
+        ...runtime,
+        note: "Data is kept in memory and is cleared when Luxor stops.",
+      });
+      return;
+    }
+
+    // A surviving HTTP-only refresh cookie may restore the session after a reload.
+    const restored = await refreshAccessToken();
+    show(
+      "Session",
+      restored
+        ? "Restored from the refresh cookie."
+        : "No active session. Log in or register to use the protected endpoints.",
+    );
+  } catch (error) {
+    setIdentity(null);
+    show("Startup check failed", error.message);
+  }
+}
+
+initialize();

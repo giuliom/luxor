@@ -73,7 +73,10 @@ pub struct Config {
     pub cors_origins: Vec<String>,
     pub body_limit_bytes: usize,
     pub auto_migrate: bool,
+    pub standalone: bool,
+    pub open_browser: bool,
     pub otlp_endpoint: Option<String>,
+    pub otel_service_name: String,
     pub sentry_dsn: Option<SecretString>,
     pub oauth: Option<OAuthConfig>,
     pub cache_namespace: String,
@@ -174,11 +177,26 @@ impl Config {
                 "AUTO_MIGRATE cannot be enabled in production".into(),
             ));
         }
+        let standalone = parse(&values, "APP_STANDALONE", false)?;
+        if production && standalone {
+            return Err(ConfigError::Validation(
+                "APP_STANDALONE cannot be enabled in production".into(),
+            ));
+        }
+        let open_browser = parse(&values, "APP_OPEN_BROWSER", false)?;
+        if production && open_browser {
+            return Err(ConfigError::Validation(
+                "APP_OPEN_BROWSER cannot be enabled in production".into(),
+            ));
+        }
 
         let otlp_endpoint = optional(&values, "OTEL_EXPORTER_OTLP_ENDPOINT");
         if let Some(endpoint) = &otlp_endpoint {
             parse_url("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint, &["http", "https"])?;
         }
+        let otel_service_name = get(&values, "OTEL_SERVICE_NAME")
+            .unwrap_or("luxor")
+            .to_owned();
         let sentry_dsn = optional(&values, "SENTRY_DSN");
         if let Some(dsn) = &sentry_dsn {
             dsn.parse::<sentry::types::Dsn>()
@@ -205,7 +223,10 @@ impl Config {
             cors_origins,
             body_limit_bytes,
             auto_migrate,
+            standalone,
+            open_browser,
             otlp_endpoint,
+            otel_service_name,
             sentry_dsn: sentry_dsn.map(SecretString::from),
             oauth,
             cache_namespace,
@@ -350,7 +371,61 @@ mod tests {
         assert_eq!(config.app_port, 8080);
         assert_eq!(config.cors_origins, vec!["http://localhost:8080"]);
         assert!(config.auto_migrate);
+        assert!(!config.standalone);
+        assert!(!config.open_browser);
         assert!(!config.refresh_cookie_secure);
+        assert_eq!(config.otel_service_name, "luxor");
+    }
+
+    #[test]
+    fn accepts_standard_opentelemetry_service_name() {
+        let values = HashMap::from([("OTEL_SERVICE_NAME".into(), "checkout-api".into())]);
+        let config = Config::from_map(values).unwrap();
+        assert_eq!(config.otel_service_name, "checkout-api");
+    }
+
+    #[test]
+    fn standalone_mode_is_development_only() {
+        let standalone =
+            Config::from_map(HashMap::from([("APP_STANDALONE".into(), "true".into())])).unwrap();
+        assert!(standalone.standalone);
+
+        let production = HashMap::from([
+            ("APP_ENV".into(), "production".into()),
+            ("DATABASE_URL".into(), DEV_DATABASE_URL.into()),
+            ("REDIS_URL".into(), DEV_REDIS_URL.into()),
+            (
+                "JWT_SECRET".into(),
+                "production-test-secret-at-least-32-characters".into(),
+            ),
+            ("APP_STANDALONE".into(), "true".into()),
+        ]);
+        assert!(matches!(
+            Config::from_map(production),
+            Err(ConfigError::Validation(message)) if message.contains("APP_STANDALONE")
+        ));
+    }
+
+    #[test]
+    fn browser_launch_is_development_only() {
+        let development =
+            Config::from_map(HashMap::from([("APP_OPEN_BROWSER".into(), "true".into())])).unwrap();
+        assert!(development.open_browser);
+
+        let production = HashMap::from([
+            ("APP_ENV".into(), "production".into()),
+            ("DATABASE_URL".into(), DEV_DATABASE_URL.into()),
+            ("REDIS_URL".into(), DEV_REDIS_URL.into()),
+            (
+                "JWT_SECRET".into(),
+                "production-test-secret-at-least-32-characters".into(),
+            ),
+            ("APP_OPEN_BROWSER".into(), "true".into()),
+        ]);
+        assert!(matches!(
+            Config::from_map(production),
+            Err(ConfigError::Validation(message)) if message.contains("APP_OPEN_BROWSER")
+        ));
     }
 
     #[test]

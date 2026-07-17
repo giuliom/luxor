@@ -1,8 +1,12 @@
 use crate::config::{Config, Environment};
 use anyhow::{Context, Result};
 use opentelemetry::global;
+use opentelemetry::propagation::TextMapCompositePropagator;
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+use opentelemetry_sdk::Resource;
 use secrecy::ExposeSecret;
 use sentry::ClientInitGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -28,7 +32,7 @@ pub fn init(config: &Config) -> Result<ObservabilityGuard> {
     let otel_tracer = config
         .otlp_endpoint
         .as_deref()
-        .map(build_otlp_tracer)
+        .map(|endpoint| build_otlp_tracer(endpoint, &config.otel_service_name))
         .transpose()?;
     let otel_enabled = otel_tracer.is_some();
 
@@ -88,9 +92,21 @@ fn init_sentry(config: &Config) -> Result<Option<ClientInitGuard>> {
         .transpose()
 }
 
-fn build_otlp_tracer(endpoint: &str) -> Result<opentelemetry_sdk::trace::Tracer> {
+fn build_otlp_tracer(
+    endpoint: &str,
+    service_name: &str,
+) -> Result<opentelemetry_sdk::trace::Tracer> {
+    global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
+        Box::new(TraceContextPropagator::new()),
+        Box::new(BaggagePropagator::new()),
+    ]));
+    let resource = Resource::default().merge(&Resource::new(vec![KeyValue::new(
+        "service.name",
+        service_name.to_owned(),
+    )]));
     let provider = opentelemetry_otlp::new_pipeline()
         .tracing()
+        .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(resource))
         .with_exporter(
             opentelemetry_otlp::new_exporter()
                 .tonic()

@@ -15,12 +15,14 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use opentelemetry::{global, propagation::Extractor};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     trace::TraceLayer,
 };
-use tracing::Level;
+use tracing::{field, Level};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Clone)]
 struct SecurityHeaders {
@@ -37,8 +39,10 @@ pub fn app(state: AppState) -> Router {
 
     let api = Router::new()
         .route("/health", get(basic::health))
+        .route("/runtime", get(basic::runtime))
         .route("/hello", get(basic::hello))
         .route("/time", get(basic::time))
+        .route("/telemetry/demo", get(basic::telemetry_demo))
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/auth/refresh", post(auth::refresh))
@@ -63,20 +67,39 @@ pub fn app(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(cors)
         .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
-                let request_id = request
-                    .headers()
-                    .get("x-request-id")
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("unknown");
-                tracing::span!(
-                    Level::INFO,
-                    "http_request",
-                    method = %request.method(),
-                    uri = %request.uri(),
-                    request_id = %request_id,
-                )
-            }),
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<Body>| {
+                    let request_id = request
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("unknown");
+                    let span = tracing::span!(
+                        Level::INFO,
+                        "http_request",
+                        otel.name = %format!("{} {}", request.method(), request.uri().path()),
+                        otel.kind = "server",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                        http.request.method = %request.method(),
+                        url.path = %request.uri().path(),
+                        http.response.status_code = field::Empty,
+                        otel.status_code = field::Empty,
+                        request_id = %request_id,
+                    );
+                    global::get_text_map_propagator(|propagator| {
+                        span.set_parent(propagator.extract(&HeaderExtractor(request.headers())));
+                    });
+                    span
+                })
+                .on_response(
+                    |response: &Response, _latency: std::time::Duration, span: &tracing::Span| {
+                        span.record("http.response.status_code", response.status().as_u16());
+                        if response.status().is_server_error() {
+                            span.record("otel.status_code", "ERROR");
+                        }
+                    },
+                ),
         )
         .layer(PropagateRequestIdLayer::new(request_id_header.clone()))
         .layer(SetRequestIdLayer::new(request_id_header, MakeRequestUuid))
@@ -84,6 +107,18 @@ pub fn app(state: AppState) -> Router {
             security_headers,
             apply_security_headers,
         ))
+}
+
+struct HeaderExtractor<'a>(&'a HeaderMap);
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(HeaderName::as_str).collect()
+    }
 }
 
 async fn apply_security_headers(
@@ -141,7 +176,13 @@ fn cors_layer(state: &AppState) -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            HeaderName::from_static("traceparent"),
+            HeaderName::from_static("tracestate"),
+            HeaderName::from_static("baggage"),
+        ])
         .allow_credentials(true)
 }
 
@@ -182,8 +223,14 @@ mod tests {
         body::{to_bytes, Body},
         http::{Request, StatusCode},
     };
+    use opentelemetry::{
+        propagation::TextMapPropagator,
+        trace::{TraceContextExt, TracerProvider as _},
+    };
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
     use std::{collections::HashMap, sync::Arc};
     use tower::ServiceExt;
+    use tracing_subscriber::prelude::*;
 
     fn test_app() -> Router {
         test_app_with_config(Config::from_map(HashMap::new()).unwrap())
@@ -333,6 +380,109 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(body_text(response).await, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn telemetry_demo_reports_disabled_export_without_a_tracer() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/telemetry/demo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        assert!(body.contains(r#""enabled":false"#));
+        assert!(body.contains(r#""service_name":"luxor""#));
+        assert!(body.contains(r#""request_id":""#));
+        assert!(body.contains(r#""trace_id":null"#));
+    }
+
+    #[tokio::test]
+    async fn standalone_mode_uses_memory_backends_without_authentication() {
+        let config =
+            Config::from_map(HashMap::from([("APP_STANDALONE".into(), "true".into())])).unwrap();
+        let app = test_app_with_config(config);
+
+        let runtime = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.status(), StatusCode::OK);
+        let runtime_body = body_text(runtime).await;
+        assert!(runtime_body.contains(r#""mode":"standalone""#));
+        assert!(runtime_body.contains(r#""cache":"memory""#));
+
+        let cache_write = app
+            .clone()
+            .oneshot(
+                Request::put("/api/cache/demo")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"value":{"source":"memory"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cache_write.status(), StatusCode::OK);
+
+        let register = app
+            .oneshot(
+                Request::post("/api/auth/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"email":"demo@example.com","password":"long-enough-password"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(register.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body_text(register)
+            .await
+            .contains(r#""code":"service_unavailable""#));
+    }
+
+    #[test]
+    fn header_extractor_accepts_w3c_trace_context() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+        );
+        let context = TraceContextPropagator::new().extract(&HeaderExtractor(&headers));
+        let span = context.span();
+        let span_context = span.span_context();
+
+        assert_eq!(
+            span_context.trace_id().to_string(),
+            "0af7651916cd43dd8448eb211c80319c"
+        );
+        assert!(span_context.is_remote());
+        assert!(span_context.is_sampled());
+
+        let provider = opentelemetry_sdk::trace::TracerProvider::builder().build();
+        let tracer = provider.tracer("luxor-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        tracing::subscriber::with_default(subscriber, || {
+            let server_span = tracing::info_span!("http_request");
+            server_span.set_parent(context);
+            let server_context = server_span.context();
+            let server_otel_span = server_context.span();
+            assert_eq!(
+                server_otel_span.span_context().trace_id().to_string(),
+                "0af7651916cd43dd8448eb211c80319c"
+            );
+        });
     }
 
     async fn body_text(response: axum::response::Response) -> String {

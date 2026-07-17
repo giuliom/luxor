@@ -14,14 +14,45 @@
       },
       "args": [],
       "cwd": "${workspaceFolder}",
+      "terminal": "console",
       "env": {
+        "APP_ENV": "development",
+        "APP_HOST": "127.0.0.1",
+        "APP_OPEN_BROWSER": "true",
+        "APP_STANDALONE": "true",
+        "AUTO_MIGRATE": "false",
+        "REFRESH_COOKIE_SECURE": "false",
         "RUST_BACKTRACE": "1",
+        "RUST_LOG": "luxor=info,tower_http=info,sqlx=warn,redis=warn",
         "PORT": "8080"
       },
-      "serverReadyAction": {
-        "pattern": "server listening address=(127\\.0\\.0\\.1:[0-9]+)",
-        "uriFormat": "http://%s/",
-        "action": "openExternally"
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "name": "Debug luxor (PostgreSQL + Redis)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--bin", "luxor"],
+        "filter": {
+          "name": "luxor",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "luxor: start infrastructure",
+      "terminal": "console",
+      "env": {
+        "APP_ENV": "development",
+        "APP_HOST": "127.0.0.1",
+        "APP_OPEN_BROWSER": "true",
+        "APP_STANDALONE": "false",
+        "AUTO_MIGRATE": "true",
+        "REFRESH_COOKIE_SECURE": "false",
+        "RUST_BACKTRACE": "1",
+        "RUST_LOG": "luxor=info,tower_http=info,sqlx=warn,redis=warn",
+        "PORT": "8080"
       },
       "sourceLanguages": ["rust"]
     },
