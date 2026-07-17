@@ -2,7 +2,9 @@ use anyhow::{bail, Context, Result};
 use luxor::{
     cache::{Cache, MemoryCache, RedisCache},
     config::Config,
-    db, observability,
+    db,
+    dev_postgres::DevPostgres,
+    observability,
     queue::{MemoryQueue, Queue, RedisQueue},
     server,
     state::AppState,
@@ -41,35 +43,53 @@ async fn serve() -> Result<()> {
     let config = Arc::new(Config::from_env().context("invalid application configuration")?);
     let telemetry = observability::init(&config).context("failed to initialize observability")?;
 
-    let (db, cache, queue): (_, Arc<dyn Cache>, Arc<dyn Queue>) = if config.standalone {
-        tracing::warn!(
-            "standalone mode enabled; using in-memory cache and queue with persistent authentication disabled"
-        );
-        (
-            db::connect_lazy(config.database_url.expose_secret())
-                .context("invalid standalone DATABASE_URL placeholder")?,
-            Arc::new(MemoryCache::default()),
-            Arc::new(MemoryQueue::default()),
-        )
-    } else {
-        let db = db::connect(&config.database_url)
-            .await
-            .context("database startup failed")?;
-        if config.auto_migrate {
-            db::migrate(&db).await?;
+    let (db, dev_postgres) = match &config.database_url {
+        Some(database_url) => {
+            let db = db::connect(database_url)
+                .await
+                .context("database startup failed")?;
+            if config.auto_migrate {
+                db::migrate(&db).await?;
+            }
+            (db, None)
         }
+        None => {
+            tracing::info!(
+                "DATABASE_URL is not set; starting the embedded development PostgreSQL server"
+            );
+            let server = DevPostgres::start().await?;
+            let db = db::connect(&server.database_url())
+                .await
+                .context("embedded database startup failed")?;
+            // The embedded cluster exists only for the application, so it
+            // always migrates itself regardless of AUTO_MIGRATE.
+            db::migrate(&db).await?;
+            (db, Some(server))
+        }
+    };
 
-        let redis =
-            redis::Client::open(config.redis_url.expose_secret()).context("invalid REDIS_URL")?;
-        let redis_manager = redis::aio::ConnectionManager::new(redis)
-            .await
-            .context("could not connect to Redis")?;
-        let cache = Arc::new(RedisCache::new(
-            redis_manager.clone(),
-            config.cache_namespace.clone(),
-        ));
-        let queue = Arc::new(RedisQueue::new(redis_manager, config.queue_key.clone()));
-        (db, cache, queue)
+    let (cache, queue): (Arc<dyn Cache>, Arc<dyn Queue>) = match &config.redis_url {
+        Some(redis_url) => {
+            let redis =
+                redis::Client::open(redis_url.expose_secret()).context("invalid REDIS_URL")?;
+            let redis_manager = redis::aio::ConnectionManager::new(redis)
+                .await
+                .context("could not connect to Redis")?;
+            (
+                Arc::new(RedisCache::new(
+                    redis_manager.clone(),
+                    config.cache_namespace.clone(),
+                )),
+                Arc::new(RedisQueue::new(redis_manager, config.queue_key.clone())),
+            )
+        }
+        None => {
+            tracing::info!("REDIS_URL is not set; using the in-memory cache and queue");
+            (
+                Arc::new(MemoryCache::default()),
+                Arc::new(MemoryQueue::default()),
+            )
+        }
     };
     let state = AppState::new(config.clone(), db, cache, queue);
     let app = server::app(state);
@@ -91,6 +111,10 @@ async fn serve() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("HTTP server failed")?;
+
+    if let Some(server) = dev_postgres {
+        server.stop().await;
+    }
 
     // Give exporters a short opportunity to drain before their guards are dropped.
     tokio::time::sleep(Duration::from_millis(50)).await;

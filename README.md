@@ -2,35 +2,39 @@
 
 [![Build & Tests](https://github.com/giuliom/luxor/actions/workflows/CI.yml/badge.svg)](https://github.com/giuliom/luxor/actions/workflows/CI.yml)
 
-Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, JWT access tokens with rotating refresh sessions, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console.
+Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, JWT access tokens with rotating refresh sessions, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
 
 ## Quick start
 
-Prerequisites:
+Prerequisites: a current stable Rust toolchain. No Docker is required.
 
-- A current stable Rust toolchain
-- Docker with Compose
-- `sqlx-cli` 0.8 for creating, applying, and reverting migrations
+```sh
+cargo run
+```
+
+Open <http://localhost:8080>. When `DATABASE_URL` is not set outside production, Luxor starts an embedded development PostgreSQL server: the first run downloads the server binaries once into `~/.theseus/postgresql`, and cluster data persists in the gitignored `.luxor/` directory, so accounts and sessions survive restarts. When `REDIS_URL` is not set, the cache and queue use in-memory backends. The embedded database always applies the checked-in migrations at startup; an external `DATABASE_URL` migrates when `AUTO_MIGRATE=true`. Production requires both URLs, and should set `AUTO_MIGRATE=false` and run `luxor migrate` (or `cargo sqlx migrate run`) as a separate, controlled deployment step.
+
+### Running against Docker PostgreSQL and Redis
+
+To exercise the Redis-backed cache and queue, or to develop against the same services production uses, point the URLs at real instances — the Compose file provides both:
 
 ```sh
 cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,postgres --locked
-cp .env.example .env
+cp .env.example .env   # then set DATABASE_URL and REDIS_URL to the Compose URLs
 docker compose up -d
 cargo sqlx migrate run
 cargo run
 ```
 
-Open <http://localhost:8080>. By default the application connects to a local PostgreSQL instance at `localhost:5432` (and Redis at `localhost:6379`); the Compose file provides both, but any locally running PostgreSQL works — point `DATABASE_URL` at it in `.env`. Development startup also applies checked-in migrations when `AUTO_MIGRATE=true`. Production should set it to `false` and run `luxor migrate` (or `cargo sqlx migrate run`) as a separate, controlled deployment step.
-
-Compose reads `POSTGRES_PORT` and `REDIS_PORT` for its host mappings. If either default port is occupied, change that value and the corresponding URL in `.env` before starting the services.
+Compose reads `POSTGRES_PORT` and `REDIS_PORT` for its host mappings. If either default port is occupied, change that value and the corresponding URL in `.env` before starting the services. `sqlx-cli` 0.8 is used for creating, applying, and reverting migrations.
 
 To stop local infrastructure, use `docker compose down`. Add `--volumes` only when you intentionally want to delete local database and Redis data.
 
 ### Debugging in VS Code
 
-With the CodeLLDB extension installed, choose **Debug luxor** and press F5. This default configuration needs no Docker: it starts Luxor with an ephemeral in-memory cache and queue, while persistent authentication is disabled. The service, OpenTelemetry, cache, and queue browser demos remain available, and all in-memory data is cleared when the process stops.
+With the CodeLLDB extension installed, choose **Debug luxor** and press F5. This default configuration needs no Docker: it runs the embedded development PostgreSQL server with the in-memory cache and queue, so the complete authentication and persistence flow works out of the box. It pins `DATABASE_URL` and `REDIS_URL` to empty values so a local `.env` cannot re-point it at external services.
 
-Choose **Debug luxor (PostgreSQL + Redis)** when you need the complete authentication and persistence flow. Its pre-launch task requires Docker Desktop, starts PostgreSQL and Redis, and waits for both health checks before launching Luxor. Both configurations set `APP_OPEN_BROWSER=true`, so Luxor opens <http://127.0.0.1:8080/> in the system-default browser immediately after binding its listener. An external browser is intentional because Luxor's security headers prevent the frontend from being embedded in VS Code's Simple Browser.
+Choose **Debug luxor (Docker PostgreSQL + Redis)** to run against real Redis and an external PostgreSQL. Its pre-launch task requires Docker Desktop, starts PostgreSQL and Redis, and waits for both health checks before launching Luxor. Both configurations set `APP_OPEN_BROWSER=true`, so Luxor opens <http://127.0.0.1:8080/> in the system-default browser immediately after binding its listener. An external browser is intentional because Luxor's security headers prevent the frontend from being embedded in VS Code's Simple Browser.
 
 ## HTTP API
 
@@ -45,7 +49,7 @@ Every response carries `x-request-id`; an incoming value is preserved, otherwise
 | Method | Route | Authentication | Purpose |
 | --- | --- | --- | --- |
 | `GET` | `/api/health` | No | Liveness response |
-| `GET` | `/api/runtime` | No | Report full-stack or standalone backend capabilities |
+| `GET` | `/api/runtime` | No | Report the active database, cache, and queue backends |
 | `GET` | `/api/hello?name=Ada` | No | Lightweight query demo |
 | `GET` | `/api/time` | No | UTC server clock |
 | `GET` | `/api/telemetry/demo` | No | Emit nested spans and return trace correlation IDs |
@@ -69,16 +73,15 @@ Refresh tokens are SHA-256 hashed in PostgreSQL and rotate on every use. Reusing
 | --- | --- | --- |
 | `APP_ENV` | `development` | `development`, `test`, or `production`; production switches logs to JSON |
 | `APP_HOST`, `APP_PORT` | `127.0.0.1`, `8080` | Listener address; production defaults to `0.0.0.0`, and a platform-injected `PORT` overrides `APP_PORT` |
-| `DATABASE_URL` | Local default outside production | PostgreSQL URL; required in production |
-| `REDIS_URL` | Local default outside production | `redis://` or `rediss://`; required in production |
+| `DATABASE_URL` | Embedded PostgreSQL outside production | PostgreSQL URL; required in production. Unset or empty selects the app-managed embedded development server |
+| `REDIS_URL` | In-memory backends outside production | `redis://` or `rediss://`; required in production. Unset or empty selects the in-memory cache and queue |
 | `JWT_SECRET` | Unsafe local default outside production | Required in production; unique and at least 32 characters |
 | `ACCESS_TOKEN_TTL_SECONDS` | `900` | JWT lifetime |
 | `REFRESH_TOKEN_TTL_SECONDS` | `2592000` | Must exceed the access lifetime |
 | `REFRESH_COOKIE_SECURE` | true only in production | Keep true behind production HTTPS |
 | `CORS_ORIGINS` | `http://localhost:8080` | Comma-separated exact origins; credentials are enabled |
 | `BODY_LIMIT_BYTES` | `1048576` | JSON body limit |
-| `AUTO_MIGRATE` | true outside production | Must normally be false in production |
-| `APP_STANDALONE` | `false` | Development-only in-memory mode; disables persistent authentication and avoids PostgreSQL/Redis connections |
+| `AUTO_MIGRATE` | true outside production | Must normally be false in production; the embedded development database always migrates itself |
 | `APP_OPEN_BROWSER` | `false` | Development-only opt-in that opens the frontend in the system-default browser after startup |
 | `CACHE_NAMESPACE`, `QUEUE_KEY` | `luxor:cache`, `luxor:queue:jobs` | Redis namespacing |
 | `RUST_LOG` | Sensible service defaults | Standard tracing filter syntax |
@@ -168,7 +171,7 @@ The scoped RustSec exception is for RSA timing advisory `RUSTSEC-2023-0071`, whi
 
 ## Deploying to Railway
 
-The repository ships with a multi-stage `Dockerfile` and a `railway.json` that configure the build, the `/api/health` health check, and a pre-deploy `luxor migrate` step, so migrations run as an explicit release step while `AUTO_MIGRATE` stays disabled in production.
+The repository ships with a multi-stage `Dockerfile` and a `railway.json` that configure the build, the `/api/health` health check, and a pre-deploy `luxor migrate` step, so migrations run as an explicit release step while `AUTO_MIGRATE` stays disabled in production. The image builds with `--no-default-features`, which keeps the embedded development PostgreSQL server (the `embedded-postgres` cargo feature) out of production binaries.
 
 1. Create a Railway project and add **PostgreSQL** and **Redis** database services.
 2. Add a service from this GitHub repository. Railway detects the `Dockerfile` and `railway.json` automatically.

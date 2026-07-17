@@ -23,8 +23,6 @@ pub enum AppError {
     NotFound(&'static str),
     #[error("{0} already exists")]
     Conflict(&'static str),
-    #[error("{0} is unavailable in standalone mode")]
-    ServiceUnavailable(&'static str),
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
     #[error("cache operation failed")]
@@ -58,7 +56,6 @@ impl AppError {
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Database(_)
             | Self::Cache(_)
             | Self::Serialization(_)
@@ -76,7 +73,6 @@ impl AppError {
             Self::MethodNotAllowed => "method_not_allowed",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
-            Self::ServiceUnavailable(_) => "service_unavailable",
             Self::Database(_)
             | Self::Cache(_)
             | Self::Serialization(_)
@@ -125,7 +121,7 @@ fn map_json_rejection(rejection: JsonRejection) -> AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        if status.is_server_error() && !matches!(&self, Self::ServiceUnavailable(_)) {
+        if status.is_server_error() {
             tracing::error!(error = ?self, "request failed");
             sentry::capture_error(&self);
         }

@@ -5,8 +5,10 @@ WORKDIR /app
 
 # Static assets and migrations are embedded into the binary at compile time
 # (include_str! and sqlx::migrate!), so the build needs the full source tree.
+# Default features are disabled to exclude the embedded development
+# PostgreSQL server; production always connects to an external DATABASE_URL.
 COPY . .
-RUN cargo build --release --locked
+RUN cargo build --release --locked --no-default-features
 
 # Runtime stage: a minimal image containing only the binary and TLS roots.
 FROM debian:bookworm-slim AS runtime

@@ -60,6 +60,7 @@ pub fn app(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(index))
+        .route("/favicon.svg", get(favicon))
         .route("/styles.css", get(styles))
         .route("/script.js", get(script))
         .nest("/api", api)
@@ -190,6 +191,16 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../public/index.html"))
 }
 
+async fn favicon() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("image/svg+xml; charset=utf-8"),
+        )],
+        include_str!("../public/favicon.svg"),
+    )
+}
+
 async fn styles() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, HeaderValue::from_static("text/css"))],
@@ -256,7 +267,26 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_header_starts_with(&response, header::CONTENT_TYPE.as_str(), "text/html");
-        assert!(body_text(response).await.contains("Luxor backend console"));
+        let body = body_text(response).await;
+        assert!(body.contains("Luxor backend console"));
+        assert!(body.contains(r#"rel="icon" href="/favicon.svg""#));
+    }
+
+    #[tokio::test]
+    async fn serves_svg_favicon() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/favicon.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_header_starts_with(&response, header::CONTENT_TYPE.as_str(), "image/svg+xml");
+        assert!(body_text(response).await.contains("<svg"));
     }
 
     #[tokio::test]
@@ -402,13 +432,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standalone_mode_uses_memory_backends_without_authentication() {
-        let config =
-            Config::from_map(HashMap::from([("APP_STANDALONE".into(), "true".into())])).unwrap();
-        let app = test_app_with_config(config);
-
-        let runtime = app
-            .clone()
+    async fn runtime_reports_the_active_backends() {
+        let development = test_app()
             .oneshot(
                 Request::builder()
                     .uri("/api/runtime")
@@ -417,38 +442,39 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(runtime.status(), StatusCode::OK);
-        let runtime_body = body_text(runtime).await;
-        assert!(runtime_body.contains(r#""mode":"standalone""#));
-        assert!(runtime_body.contains(r#""cache":"memory""#));
+        assert_eq!(development.status(), StatusCode::OK);
+        assert_eq!(
+            body_text(development).await,
+            r#"{"database":"embedded-postgresql","cache":"memory","queue":"memory"}"#
+        );
 
-        let cache_write = app
-            .clone()
+        let production_config = Config::from_map(HashMap::from([
+            ("APP_ENV".into(), "production".into()),
+            (
+                "DATABASE_URL".into(),
+                "postgres://luxor:luxor@localhost/luxor".into(),
+            ),
+            ("REDIS_URL".into(), "redis://localhost:6379/".into()),
+            (
+                "JWT_SECRET".into(),
+                "production-test-secret-at-least-32-characters".into(),
+            ),
+        ]))
+        .unwrap();
+        let production = test_app_with_config(production_config)
             .oneshot(
-                Request::put("/api/cache/demo")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"value":{"source":"memory"}}"#))
+                Request::builder()
+                    .uri("/api/runtime")
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(cache_write.status(), StatusCode::OK);
-
-        let register = app
-            .oneshot(
-                Request::post("/api/auth/register")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"email":"demo@example.com","password":"long-enough-password"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(register.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body_text(register)
-            .await
-            .contains(r#""code":"service_unavailable""#));
+        assert_eq!(production.status(), StatusCode::OK);
+        assert_eq!(
+            body_text(production).await,
+            r#"{"database":"postgresql","cache":"redis","queue":"redis"}"#
+        );
     }
 
     #[test]

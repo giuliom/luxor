@@ -80,9 +80,6 @@ impl FromRequestParts<AppState> for AuthUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if state.config.standalone {
-            return Ok(Self { id: Uuid::nil() });
-        }
         let value = parts
             .headers
             .get(header::AUTHORIZATION)

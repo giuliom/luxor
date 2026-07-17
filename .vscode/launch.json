@@ -19,8 +19,11 @@
         "APP_ENV": "development",
         "APP_HOST": "127.0.0.1",
         "APP_OPEN_BROWSER": "true",
-        "APP_STANDALONE": "true",
-        "AUTO_MIGRATE": "false",
+        // Explicitly empty so a .env file cannot re-point this Docker-free
+        // configuration at external services: empty means "use the embedded
+        // PostgreSQL server and the in-memory cache and queue".
+        "DATABASE_URL": "",
+        "REDIS_URL": "",
         "REFRESH_COOKIE_SECURE": "false",
         "RUST_BACKTRACE": "1",
         "RUST_LOG": "luxor=info,tower_http=info,sqlx=warn,redis=warn",
@@ -29,7 +32,7 @@
       "sourceLanguages": ["rust"]
     },
     {
-      "name": "Debug luxor (PostgreSQL + Redis)",
+      "name": "Debug luxor (Docker PostgreSQL + Redis)",
       "type": "lldb",
       "request": "launch",
       "cargo": {
@@ -47,7 +50,8 @@
         "APP_ENV": "development",
         "APP_HOST": "127.0.0.1",
         "APP_OPEN_BROWSER": "true",
-        "APP_STANDALONE": "false",
+        "DATABASE_URL": "postgres://luxor:luxor@localhost:5432/luxor",
+        "REDIS_URL": "redis://127.0.0.1:6379/",
         "AUTO_MIGRATE": "true",
         "REFRESH_COOKIE_SECURE": "false",
         "RUST_BACKTRACE": "1",

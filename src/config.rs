@@ -8,8 +8,6 @@ use std::{
 use thiserror::Error;
 use url::Url;
 
-const DEV_DATABASE_URL: &str = "postgres://luxor:luxor@localhost:5432/luxor";
-const DEV_REDIS_URL: &str = "redis://127.0.0.1:6379/";
 const DEV_JWT_SECRET: &str = "development-only-secret-change-me";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,8 +62,12 @@ pub struct Config {
     pub environment: Environment,
     pub app_host: String,
     pub app_port: u16,
-    pub database_url: SecretString,
-    pub redis_url: SecretString,
+    /// `None` selects the embedded development PostgreSQL server; production
+    /// configuration always carries a URL.
+    pub database_url: Option<SecretString>,
+    /// `None` selects the in-memory cache and queue; production configuration
+    /// always carries a URL.
+    pub redis_url: Option<SecretString>,
     pub jwt_secret: SecretString,
     pub access_token_ttl_seconds: i64,
     pub refresh_token_ttl_seconds: i64,
@@ -73,7 +75,6 @@ pub struct Config {
     pub cors_origins: Vec<String>,
     pub body_limit_bytes: usize,
     pub auto_migrate: bool,
-    pub standalone: bool,
     pub open_browser: bool,
     pub otlp_endpoint: Option<String>,
     pub otel_service_name: String,
@@ -111,11 +112,13 @@ impl Config {
             ));
         }
 
-        let database_url = required_or_dev(&values, "DATABASE_URL", production, DEV_DATABASE_URL)?;
-        parse_url("DATABASE_URL", &database_url, &["postgres", "postgresql"])?;
-
-        let redis_url = required_or_dev(&values, "REDIS_URL", production, DEV_REDIS_URL)?;
-        parse_url("REDIS_URL", &redis_url, &["redis", "rediss"])?;
+        let database_url = infrastructure_url(
+            &values,
+            "DATABASE_URL",
+            production,
+            &["postgres", "postgresql"],
+        )?;
+        let redis_url = infrastructure_url(&values, "REDIS_URL", production, &["redis", "rediss"])?;
 
         let jwt_secret = required_or_dev(&values, "JWT_SECRET", production, DEV_JWT_SECRET)?;
         if jwt_secret.len() < 32 {
@@ -177,12 +180,6 @@ impl Config {
                 "AUTO_MIGRATE cannot be enabled in production".into(),
             ));
         }
-        let standalone = parse(&values, "APP_STANDALONE", false)?;
-        if production && standalone {
-            return Err(ConfigError::Validation(
-                "APP_STANDALONE cannot be enabled in production".into(),
-            ));
-        }
         let open_browser = parse(&values, "APP_OPEN_BROWSER", false)?;
         if production && open_browser {
             return Err(ConfigError::Validation(
@@ -214,8 +211,8 @@ impl Config {
             environment,
             app_host,
             app_port,
-            database_url: SecretString::from(database_url),
-            redis_url: SecretString::from(redis_url),
+            database_url,
+            redis_url,
             jwt_secret: SecretString::from(jwt_secret),
             access_token_ttl_seconds,
             refresh_token_ttl_seconds,
@@ -223,7 +220,6 @@ impl Config {
             cors_origins,
             body_limit_bytes,
             auto_migrate,
-            standalone,
             open_browser,
             otlp_endpoint,
             otel_service_name,
@@ -271,6 +267,25 @@ fn required_or_dev(
         .map(ToOwned::to_owned)
         .or_else(|| (!production).then(|| development_default.to_owned()))
         .ok_or(ConfigError::Missing(key))
+}
+
+/// Production must point at real infrastructure; outside production a missing
+/// URL selects the built-in development fallback (the embedded PostgreSQL
+/// server, or the in-memory cache and queue).
+fn infrastructure_url(
+    values: &HashMap<String, String>,
+    key: &'static str,
+    production: bool,
+    schemes: &[&str],
+) -> Result<Option<SecretString>, ConfigError> {
+    match get(values, key) {
+        Some(value) => {
+            parse_url(key, value, schemes)?;
+            Ok(Some(SecretString::from(value.to_owned())))
+        }
+        None if production => Err(ConfigError::Missing(key)),
+        None => Ok(None),
+    }
 }
 
 fn parse<T>(
@@ -364,6 +379,9 @@ fn parse_oauth(values: &HashMap<String, String>) -> Result<Option<OAuthConfig>, 
 mod tests {
     use super::*;
 
+    const TEST_DATABASE_URL: &str = "postgres://luxor:luxor@localhost:5432/luxor";
+    const TEST_REDIS_URL: &str = "redis://127.0.0.1:6379/";
+
     #[test]
     fn development_defaults_are_valid() {
         let config = Config::from_map(HashMap::new()).unwrap();
@@ -371,7 +389,8 @@ mod tests {
         assert_eq!(config.app_port, 8080);
         assert_eq!(config.cors_origins, vec!["http://localhost:8080"]);
         assert!(config.auto_migrate);
-        assert!(!config.standalone);
+        assert!(config.database_url.is_none());
+        assert!(config.redis_url.is_none());
         assert!(!config.open_browser);
         assert!(!config.refresh_cookie_secure);
         assert_eq!(config.otel_service_name, "luxor");
@@ -385,24 +404,19 @@ mod tests {
     }
 
     #[test]
-    fn standalone_mode_is_development_only() {
-        let standalone =
-            Config::from_map(HashMap::from([("APP_STANDALONE".into(), "true".into())])).unwrap();
-        assert!(standalone.standalone);
-
-        let production = HashMap::from([
-            ("APP_ENV".into(), "production".into()),
-            ("DATABASE_URL".into(), DEV_DATABASE_URL.into()),
-            ("REDIS_URL".into(), DEV_REDIS_URL.into()),
-            (
-                "JWT_SECRET".into(),
-                "production-test-secret-at-least-32-characters".into(),
-            ),
-            ("APP_STANDALONE".into(), "true".into()),
+    fn explicit_infrastructure_urls_are_kept() {
+        let values = HashMap::from([
+            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
+            ("REDIS_URL".into(), TEST_REDIS_URL.into()),
         ]);
+        let config = Config::from_map(values).unwrap();
+        assert!(config.database_url.is_some());
+        assert!(config.redis_url.is_some());
+
+        let invalid = HashMap::from([("DATABASE_URL".into(), "mysql://nope".into())]);
         assert!(matches!(
-            Config::from_map(production),
-            Err(ConfigError::Validation(message)) if message.contains("APP_STANDALONE")
+            Config::from_map(invalid),
+            Err(ConfigError::Invalid("DATABASE_URL", _))
         ));
     }
 
@@ -414,8 +428,8 @@ mod tests {
 
         let production = HashMap::from([
             ("APP_ENV".into(), "production".into()),
-            ("DATABASE_URL".into(), DEV_DATABASE_URL.into()),
-            ("REDIS_URL".into(), DEV_REDIS_URL.into()),
+            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
+            ("REDIS_URL".into(), TEST_REDIS_URL.into()),
             (
                 "JWT_SECRET".into(),
                 "production-test-secret-at-least-32-characters".into(),
@@ -443,8 +457,8 @@ mod tests {
     fn production_binds_all_interfaces_by_default() {
         let values = HashMap::from([
             ("APP_ENV".into(), "production".into()),
-            ("DATABASE_URL".into(), DEV_DATABASE_URL.into()),
-            ("REDIS_URL".into(), DEV_REDIS_URL.into()),
+            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
+            ("REDIS_URL".into(), TEST_REDIS_URL.into()),
             (
                 "JWT_SECRET".into(),
                 "production-test-secret-at-least-32-characters".into(),
@@ -463,6 +477,15 @@ mod tests {
         assert_eq!(
             Config::from_map(values).unwrap_err(),
             ConfigError::Missing("DATABASE_URL")
+        );
+
+        let values = HashMap::from([
+            ("APP_ENV".into(), "production".into()),
+            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
+        ]);
+        assert_eq!(
+            Config::from_map(values).unwrap_err(),
+            ConfigError::Missing("REDIS_URL")
         );
     }
 
@@ -498,8 +521,8 @@ mod tests {
     fn production_security_controls_cannot_be_disabled() {
         let base = HashMap::from([
             ("APP_ENV".into(), "production".into()),
-            ("DATABASE_URL".into(), DEV_DATABASE_URL.into()),
-            ("REDIS_URL".into(), DEV_REDIS_URL.into()),
+            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
+            ("REDIS_URL".into(), TEST_REDIS_URL.into()),
             (
                 "JWT_SECRET".into(),
                 "production-test-secret-at-least-32-characters".into(),

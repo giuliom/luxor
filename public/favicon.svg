@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Luxor">
+  <rect width="64" height="64" rx="14" fill="#25322a"/>
+  <path d="m32 10 7 12-3 25h-8l-3-25z" fill="#e9e4d8"/>
+  <path d="m32 10 7 12H25z" fill="#a84b2d"/>
+  <path d="M21 47h22v6H21z" fill="#a84b2d"/>
+</svg>

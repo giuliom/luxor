@@ -1,5 +1,4 @@
 let accessToken = null;
-let standaloneMode = false;
 
 const message = document.querySelector("#message");
 const identity = document.querySelector("#identity");
@@ -19,20 +18,13 @@ function show(label, data) {
 function setIdentity(user) {
   const signedIn = Boolean(user);
 
-  identity.textContent = standaloneMode
-    ? "Standalone · no database"
-    : signedIn
-      ? `Signed in as ${user.email}`
-      : "Signed out";
+  identity.textContent = signedIn ? `Signed in as ${user.email}` : "Signed out";
   authDot.classList.remove("checking");
-  authDot.classList.toggle("online", signedIn && !standaloneMode);
-  authDot.classList.toggle("standalone", standaloneMode);
-  identityPill.classList.toggle("online", signedIn && !standaloneMode);
-  identityPill.classList.toggle("standalone", standaloneMode);
+  authDot.classList.toggle("online", signedIn);
+  identityPill.classList.toggle("online", signedIn);
 
-  authBadge.textContent = standaloneMode ? "Unavailable" : signedIn ? "Signed in" : "Signed out";
-  authBadge.classList.toggle("ok", signedIn && !standaloneMode);
-  authBadge.classList.toggle("offline", standaloneMode);
+  authBadge.textContent = signedIn ? "Signed in" : "Signed out";
+  authBadge.classList.toggle("ok", signedIn);
 
   authForm.hidden = signedIn;
   sessionPanel.hidden = !signedIn;
@@ -45,24 +37,16 @@ function setIdentity(user) {
   }
 
   for (const badge of document.querySelectorAll(".badge.protected")) {
-    badge.textContent = standaloneMode ? "Memory demo" : signedIn ? "Unlocked" : "Log in required";
-    badge.classList.toggle("unlocked", standaloneMode || signedIn);
+    badge.textContent = signedIn ? "Unlocked" : "Log in required";
+    badge.classList.toggle("unlocked", signedIn);
   }
 }
 
 function setRuntime(runtime) {
-  standaloneMode = runtime.mode === "standalone";
   const runtimeBadge = document.querySelector("#runtime-badge");
-  runtimeBadge.textContent = standaloneMode ? "Standalone" : "Full stack";
-  runtimeBadge.classList.toggle("standalone", standaloneMode);
-  runtimeBadge.classList.toggle("ok", !standaloneMode);
-
-  document.querySelector("#auth-description").textContent = standaloneMode
-    ? "Persistent authentication is disabled. Cache and queue actions use ephemeral in-memory backends."
-    : "Register or sign in against PostgreSQL-backed sessions.";
-  for (const control of authForm.querySelectorAll("input, button")) {
-    control.disabled = standaloneMode;
-  }
+  runtimeBadge.textContent =
+    runtime.database === "embedded-postgresql" ? "Embedded database" : "Full stack";
+  runtimeBadge.classList.add("ok");
 }
 
 async function parseResponse(response) {
@@ -203,14 +187,6 @@ async function initialize() {
   try {
     const runtime = await api("/api/runtime", {}, false);
     setRuntime(runtime);
-    if (standaloneMode) {
-      setIdentity(null);
-      show("Runtime", {
-        ...runtime,
-        note: "Data is kept in memory and is cleared when Luxor stops.",
-      });
-      return;
-    }
 
     // A surviving HTTP-only refresh cookie may restore the session after a reload.
     const restored = await refreshAccessToken();

@@ -22,29 +22,27 @@ pub async fn health() -> Json<HealthResponse> {
 
 #[derive(Serialize)]
 pub struct RuntimeResponse {
-    mode: &'static str,
-    authentication: &'static str,
+    database: &'static str,
     cache: &'static str,
     queue: &'static str,
 }
 
 pub async fn runtime(State(state): State<AppState>) -> Json<RuntimeResponse> {
-    let response = if state.config.standalone {
-        RuntimeResponse {
-            mode: "standalone",
-            authentication: "disabled",
-            cache: "memory",
-            queue: "memory",
-        }
+    let database = if state.config.database_url.is_some() {
+        "postgresql"
     } else {
-        RuntimeResponse {
-            mode: "full",
-            authentication: "postgresql",
-            cache: "redis",
-            queue: "redis",
-        }
+        "embedded-postgresql"
     };
-    Json(response)
+    let (cache, queue) = if state.config.redis_url.is_some() {
+        ("redis", "redis")
+    } else {
+        ("memory", "memory")
+    };
+    Json(RuntimeResponse {
+        database,
+        cache,
+        queue,
+    })
 }
 
 #[derive(Deserialize)]

@@ -33,7 +33,6 @@ pub async fn register(
     jar: CookieJar,
     ApiJson(request): ApiJson<CredentialsRequest>,
 ) -> Result<(StatusCode, CookieJar, Json<AuthResponse>), AppError> {
-    require_persistent_auth(&state)?;
     let (user, grant) = services::auth::register(
         &state.db,
         &request.email,
@@ -55,7 +54,6 @@ pub async fn login(
     jar: CookieJar,
     ApiJson(request): ApiJson<CredentialsRequest>,
 ) -> Result<(CookieJar, Json<AuthResponse>), AppError> {
-    require_persistent_auth(&state)?;
     let (user, grant) = services::auth::login(
         &state.db,
         &request.email,
@@ -72,7 +70,6 @@ pub async fn refresh(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> Result<(CookieJar, Json<AuthResponse>), AppError> {
-    require_persistent_auth(&state)?;
     let presented_token = jar
         .get(REFRESH_COOKIE)
         .map(Cookie::value)
@@ -95,7 +92,6 @@ pub async fn logout(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> Result<(StatusCode, CookieJar), AppError> {
-    require_persistent_auth(&state)?;
     if let Some(cookie) = jar.get(REFRESH_COOKIE) {
         db::revoke_session(&state.db, &hash_refresh_token(cookie.value())).await?;
     }
@@ -109,20 +105,11 @@ pub async fn me(
     State(state): State<AppState>,
     auth: AuthUser,
 ) -> Result<Json<PublicUser>, AppError> {
-    require_persistent_auth(&state)?;
     db::user_by_id(&state.db, auth.id)
         .await?
         .map(PublicUser::from)
         .map(Json)
         .ok_or(AppError::Unauthorized)
-}
-
-fn require_persistent_auth(state: &AppState) -> Result<(), AppError> {
-    if state.config.standalone {
-        Err(AppError::ServiceUnavailable("persistent authentication"))
-    } else {
-        Ok(())
-    }
 }
 
 fn auth_response(state: &AppState, access_token: String, user: PublicUser) -> AuthResponse {

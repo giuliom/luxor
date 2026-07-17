@@ -2,6 +2,7 @@ pub mod auth;
 pub mod cache;
 pub mod config;
 pub mod db;
+pub mod dev_postgres;
 pub mod error;
 pub mod handlers;
 pub mod models;
