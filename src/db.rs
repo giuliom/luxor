@@ -89,26 +89,6 @@ pub async fn user_by_id(pool: &PgPool, id: Uuid) -> Result<Option<UserRecord>, A
     .map_err(AppError::from)
 }
 
-pub async fn update_user_role(
-    pool: &PgPool,
-    id: Uuid,
-    role: Role,
-) -> Result<Option<UserRecord>, AppError> {
-    sqlx::query_as::<_, UserRecord>(
-        r#"
-        UPDATE users
-        SET role = $2, updated_at = now()
-        WHERE id = $1
-        RETURNING id, email, password_hash, role, created_at, updated_at
-        "#,
-    )
-    .bind(id)
-    .bind(role)
-    .fetch_optional(pool)
-    .await
-    .map_err(AppError::from)
-}
-
 pub async fn create_session(
     pool: &PgPool,
     user_id: Uuid,
@@ -189,6 +169,18 @@ pub async fn revoke_family(
     .execute(&mut **transaction)
     .await?;
     Ok(())
+}
+
+/// Deletes sessions whose whole rotation family has expired. Every token in
+/// such a family already fails rotation on the expiry check, so removing the
+/// rows changes no behavior — it only stops the table from growing without
+/// bound. Rows are deliberately kept until then: a revoked row is what lets
+/// rotation detect the replay of a stolen token and revoke its family.
+pub async fn delete_expired_session_families(pool: &PgPool) -> Result<u64, AppError> {
+    let result = sqlx::query("DELETE FROM auth_sessions WHERE family_expires_at <= now()")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 pub fn is_unique_violation(error: &sqlx::Error) -> bool {

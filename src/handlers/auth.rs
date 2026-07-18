@@ -25,7 +25,8 @@ pub struct CredentialsRequest {
 pub struct RegisterRequest {
     email: String,
     password: String,
-    /// The demo role for the new account; omitted means a regular user.
+    /// The account's role, fixed at registration; omitted means a regular
+    /// user.
     #[serde(default)]
     role: Role,
 }
@@ -121,28 +122,6 @@ pub async fn me(
         .map(PublicUser::from)
         .map(Json)
         .ok_or(AppError::Unauthorized)
-}
-
-#[derive(Deserialize)]
-pub struct ChangeRoleRequest {
-    role: Role,
-}
-
-/// Switches the signed-in account's role and mints a fresh access token so
-/// the new role applies immediately (the role travels as a JWT claim; tokens
-/// issued earlier keep the old role until they expire). Self-service role
-/// changes are a demo testing surface; a real system would restrict them to
-/// administrators.
-pub async fn change_role(
-    State(state): State<AppState>,
-    auth: AuthUser,
-    ApiJson(request): ApiJson<ChangeRoleRequest>,
-) -> Result<Json<AuthResponse>, AppError> {
-    let user = db::update_user_role(&state.db, auth.id, request.role)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
-    let access_token = state.jwt.issue(user.id, user.role)?;
-    Ok(Json(auth_response(&state, access_token, user.into())))
 }
 
 fn auth_response(state: &AppState, access_token: String, user: PublicUser) -> AuthResponse {

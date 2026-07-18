@@ -199,16 +199,12 @@ code {
   font-size: 0.78rem;
 }
 
-.permissions-matrix input[type="checkbox"] {
-  width: 1.05rem;
-  height: 1.05rem;
-  min-height: 0;
-  margin: 0;
-  accent-color: #3f7d53;
-  cursor: pointer;
+.permissions-matrix .grant-mark {
+  font-weight: 600;
+  color: #3f7d53;
 }
 
-.permissions-matrix input[type="checkbox"]:disabled { cursor: not-allowed; }
+.permissions-matrix .grant-mark.denied { color: #b3b0a8; font-weight: 400; }
 
 .endpoints { display: grid; gap: 0.7rem; margin-top: 1.25rem; }
 

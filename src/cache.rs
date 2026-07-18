@@ -74,13 +74,14 @@ impl Cache for RedisCache {
         value: &serde_json::Value,
         ttl: Duration,
     ) -> Result<(), AppError> {
-        if ttl.is_zero() {
-            return Err(AppError::BadRequest("cache TTL must be positive".into()));
-        }
+        validate_ttl(ttl)?;
         let mut manager = self.manager.clone();
         let serialized = serde_json::to_string(value)?;
+        // Millisecond precision (PSETEX) keeps sub-second TTLs meaningful;
+        // SETEX would truncate them to zero seconds, which Redis rejects.
+        let ttl_millis = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
         let _: () = manager
-            .set_ex(self.namespaced_key(key)?, serialized, ttl.as_secs())
+            .pset_ex(self.namespaced_key(key)?, serialized, ttl_millis)
             .await?;
         Ok(())
     }
@@ -123,9 +124,7 @@ impl Cache for MemoryCache {
         ttl: Duration,
     ) -> Result<(), AppError> {
         validate_key(key)?;
-        if ttl.is_zero() {
-            return Err(AppError::BadRequest("cache TTL must be positive".into()));
-        }
+        validate_ttl(ttl)?;
         self.values.write().await.insert(
             key.to_owned(),
             (value.clone(), tokio::time::Instant::now() + ttl),
@@ -138,6 +137,17 @@ impl Cache for MemoryCache {
         self.values.write().await.remove(key);
         Ok(())
     }
+}
+
+/// Both backends store with millisecond precision, so anything below one
+/// millisecond is effectively no TTL at all.
+fn validate_ttl(ttl: Duration) -> Result<(), AppError> {
+    if ttl.as_millis() == 0 {
+        return Err(AppError::BadRequest(
+            "cache TTL must be at least one millisecond".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_key(key: &str) -> Result<(), AppError> {
@@ -183,5 +193,13 @@ mod tests {
     fn validates_cache_keys() {
         assert!(validate_key("user:123_profile").is_ok());
         assert!(validate_key("spaces are unsafe").is_err());
+    }
+
+    #[test]
+    fn validates_cache_ttls_with_millisecond_precision() {
+        assert!(validate_ttl(Duration::from_millis(500)).is_ok());
+        assert!(validate_ttl(Duration::from_secs(300)).is_ok());
+        assert!(validate_ttl(Duration::ZERO).is_err());
+        assert!(validate_ttl(Duration::from_micros(900)).is_err());
     }
 }

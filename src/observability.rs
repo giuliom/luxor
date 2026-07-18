@@ -131,7 +131,7 @@ impl ObservabilityGuard {
 }
 
 pub fn init(config: &Config) -> Result<(ObservabilityGuard, TraceStore)> {
-    let sentry = init_sentry(config)?;
+    let sentry = init_sentry(config);
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("luxor=info,tower_http=info,sqlx=warn,redis=warn"));
     let trace_store = TraceStore::default();
@@ -155,29 +155,26 @@ pub fn init(config: &Config) -> Result<(ObservabilityGuard, TraceStore)> {
     Ok((ObservabilityGuard { sentry }, trace_store))
 }
 
-fn init_sentry(config: &Config) -> Result<Option<ClientInitGuard>> {
-    config
-        .sentry_dsn
-        .as_ref()
-        .map(|dsn| {
-            let dsn = dsn
-                .expose_secret()
-                .parse::<sentry::types::Dsn>()
-                .context("invalid SENTRY_DSN")?;
-            Ok(sentry::init((
-                dsn,
-                sentry::ClientOptions {
-                    release: sentry::release_name!(),
-                    environment: Some(match config.environment {
-                        Environment::Development => "development".into(),
-                        Environment::Test => "test".into(),
-                        Environment::Production => "production".into(),
-                    }),
-                    ..Default::default()
-                },
-            )))
-        })
-        .transpose()
+fn init_sentry(config: &Config) -> Option<ClientInitGuard> {
+    config.sentry_dsn.as_ref().map(|dsn| {
+        // Configuration parsing already rejected invalid DSNs.
+        let dsn = dsn
+            .expose_secret()
+            .parse::<sentry::types::Dsn>()
+            .expect("SENTRY_DSN is validated when the configuration is loaded");
+        sentry::init((
+            dsn,
+            sentry::ClientOptions {
+                release: sentry::release_name!(),
+                environment: Some(match config.environment {
+                    Environment::Development => "development".into(),
+                    Environment::Test => "test".into(),
+                    Environment::Production => "production".into(),
+                }),
+                ..Default::default()
+            },
+        ))
+    })
 }
 
 /// Builds the tracer pipeline. Finished spans always feed the in-process

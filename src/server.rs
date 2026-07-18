@@ -13,7 +13,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
     Router,
 };
 use opentelemetry::{global, propagation::Extractor};
@@ -62,9 +62,7 @@ pub fn app(state: AppState) -> Router {
         .route("/telemetry/demo", get(basic::telemetry_demo))
         .route("/telemetry/traces/{trace_id}", get(basic::trace))
         .route("/me", get(auth::me))
-        .route("/me/role", put(auth::change_role))
         .route("/permissions", get(permissions::matrix))
-        .route("/permissions/{role}", put(permissions::update_role))
         .route("/demo/reports", get(demo::reports))
         .route("/demo/records", delete(demo::purge_records))
         .route(
@@ -462,10 +460,10 @@ mod tests {
     async fn rejects_protected_routes_without_a_bearer_token() {
         for (method, uri) in [
             ("GET", "/api/me"),
-            ("PUT", "/api/me/role"),
             ("GET", "/api/demo/reports"),
             ("DELETE", "/api/demo/records"),
-            ("PUT", "/api/permissions/user"),
+            ("GET", "/api/cache/demo"),
+            ("POST", "/api/jobs"),
         ] {
             let response = test_app()
                 .oneshot(
@@ -524,7 +522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_matrix_is_public_and_starts_with_the_default_grants() {
+    async fn permission_matrix_is_public_and_reports_the_fixed_grants() {
         let response = test_app()
             .oneshot(
                 Request::builder()
@@ -543,13 +541,42 @@ mod tests {
         assert!(body.contains(r#""name":"records.purge""#));
     }
 
+    // The grants are part of the authorization contract; the write surface
+    // must not exist at all, and the role stored at registration must not be
+    // editable afterwards.
+    #[tokio::test]
+    async fn matrix_and_role_write_endpoints_do_not_exist() {
+        let app = test_app();
+        let admin = bearer(Role::Admin);
+
+        let matrix_edit = send(
+            &app,
+            "PUT",
+            "/api/permissions/user",
+            Some(&admin),
+            Some(r#"{"permissions":[]}"#),
+        )
+        .await;
+        assert_eq!(matrix_edit.status(), StatusCode::NOT_FOUND);
+
+        let role_switch = send(
+            &app,
+            "PUT",
+            "/api/me/role",
+            Some(&admin),
+            Some(r#"{"role":"admin"}"#),
+        )
+        .await;
+        assert_eq!(role_switch.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn permission_grants_control_the_demo_endpoints() {
         let app = test_app();
         let admin = bearer(Role::Admin);
         let user = bearer(Role::User);
 
-        // Default grants: the user role reads reports but cannot purge.
+        // The user role reads reports but cannot purge.
         let reports = send(&app, "GET", "/api/demo/reports", Some(&user), None).await;
         assert_eq!(reports.status(), StatusCode::OK);
         assert!(body_text(reports)
@@ -565,87 +592,54 @@ mod tests {
         let allowed = send(&app, "DELETE", "/api/demo/records", Some(&admin), None).await;
         assert_eq!(allowed.status(), StatusCode::OK);
         assert!(body_text(allowed).await.contains(r#""simulated":true"#));
-
-        // Granting records.purge to the user role flips the outcome.
-        let update = send(
-            &app,
-            "PUT",
-            "/api/permissions/user",
-            Some(&admin),
-            Some(r#"{"permissions":["reports.view","records.purge"]}"#),
-        )
-        .await;
-        assert_eq!(update.status(), StatusCode::OK);
-        assert!(body_text(update)
-            .await
-            .contains(r#""user":["reports.view","records.purge"]"#));
-        let now_allowed = send(&app, "DELETE", "/api/demo/records", Some(&user), None).await;
-        assert_eq!(now_allowed.status(), StatusCode::OK);
-
-        // Revoking every grant locks the role out again.
-        let revoke = send(
-            &app,
-            "PUT",
-            "/api/permissions/user",
-            Some(&user),
-            Some(r#"{"permissions":[]}"#),
-        )
-        .await;
-        assert_eq!(revoke.status(), StatusCode::OK);
-        let now_denied = send(&app, "GET", "/api/demo/reports", Some(&user), None).await;
-        assert_eq!(now_denied.status(), StatusCode::FORBIDDEN);
-    }
-
-    // The unknown role is rejected while parsing the body, before the
-    // handler touches the database, so the lazy test pool suffices. The
-    // successful switch needs a real user row and lives in the PostgreSQL
-    // integration test.
-    #[tokio::test]
-    async fn rejects_switching_to_an_unknown_role() {
-        let response = send(
-            &test_app(),
-            "PUT",
-            "/api/me/role",
-            Some(&bearer(Role::User)),
-            Some(r#"{"role":"root"}"#),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(body_text(response)
-            .await
-            .contains(r#""code":"bad_request""#));
     }
 
     #[tokio::test]
-    async fn rejects_unknown_roles_and_permissions() {
+    async fn accepts_a_case_insensitive_bearer_scheme() {
         let app = test_app();
-        let admin = bearer(Role::Admin);
+        let authorization = bearer(Role::User).replace("Bearer", "bearer");
+        let response = send(&app, "GET", "/api/demo/reports", Some(&authorization), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 
-        let unknown_role = send(
-            &app,
-            "PUT",
-            "/api/permissions/superuser",
-            Some(&admin),
-            Some(r#"{"permissions":[]}"#),
-        )
-        .await;
-        assert_eq!(unknown_role.status(), StatusCode::NOT_FOUND);
+    #[tokio::test]
+    async fn maps_json_body_rejections_to_the_error_contract() {
+        let app = test_app();
+        let user = bearer(Role::User);
 
-        let unknown_permission = send(
-            &app,
-            "PUT",
-            "/api/permissions/user",
-            Some(&admin),
-            Some(r#"{"permissions":["reports.destroy"]}"#),
-        )
-        .await;
-        assert_eq!(unknown_permission.status(), StatusCode::BAD_REQUEST);
-
-        // A rejected update must leave the grants untouched.
-        let matrix = send(&app, "GET", "/api/permissions", None, None).await;
-        assert!(body_text(matrix)
+        // A JSON body without the JSON content type is 415, not a generic 400.
+        let missing_content_type = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/jobs")
+                    .header(header::AUTHORIZATION, &user)
+                    .body(Body::from(r#"{"kind":"audit_event","action":"x"}"#))
+                    .unwrap(),
+            )
             .await
-            .contains(r#""user":["reports.view"]"#));
+            .unwrap();
+        assert_eq!(
+            missing_content_type.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert!(body_text(missing_content_type)
+            .await
+            .contains(r#""code":"unsupported_media_type""#));
+
+        // Deserialization failures name the problem instead of a generic
+        // "invalid JSON" message.
+        let unknown_variant = send(
+            &app,
+            "POST",
+            "/api/jobs",
+            Some(&user),
+            Some(r#"{"kind":"reboot_world"}"#),
+        )
+        .await;
+        assert_eq!(unknown_variant.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(unknown_variant).await.contains("reboot_world"));
     }
 
     #[tokio::test]

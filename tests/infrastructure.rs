@@ -2,7 +2,9 @@ use axum::{
     body::{to_bytes, Body},
     http::{header, Request, StatusCode},
 };
+use chrono::{Duration as ChronoDuration, Utc};
 use luxor::{
+    auth::hash_refresh_token,
     cache::{Cache, MemoryCache, RedisCache},
     config::{Config, RateLimitQuota},
     db,
@@ -121,9 +123,8 @@ async fn migrations_and_authentication_flow_work_against_postgres() {
     assert_eq!(purge_allowed.status(), StatusCode::OK);
     assert_eq!(response_json(purge_allowed).await["simulated"], true);
 
-    // Self-service role switch: the user promotes themselves to admin and
-    // receives a fresh access token carrying the new role claim.
-    let promoted = app
+    // Roles are fixed at registration; the write surfaces do not exist.
+    let role_switch = app
         .clone()
         .oneshot(
             Request::builder()
@@ -136,39 +137,25 @@ async fn migrations_and_authentication_flow_work_against_postgres() {
         )
         .await
         .unwrap();
-    assert_eq!(promoted.status(), StatusCode::OK);
-    let promoted_body = response_json(promoted).await;
-    assert_eq!(promoted_body["user"]["role"], "admin");
-    let promoted_token = promoted_body["access_token"].as_str().unwrap();
+    assert_eq!(role_switch.status(), StatusCode::NOT_FOUND);
 
-    let purge_after_promotion = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri("/api/demo/records")
-                .header(header::AUTHORIZATION, format!("Bearer {promoted_token}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(purge_after_promotion.status(), StatusCode::OK);
-
-    // The pre-switch token still carries the old role claim until it expires.
-    let stale_token_purge = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri("/api/demo/records")
-                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(stale_token_purge.status(), StatusCode::FORBIDDEN);
+    // Pruning removes sessions whose whole rotation family has expired and
+    // leaves live ones alone (the refresh flow below still works).
+    let user_id: Uuid = profile_body["id"].as_str().unwrap().parse().unwrap();
+    let expired_hash = hash_refresh_token(&format!("expired-family-{}", Uuid::new_v4()));
+    db::insert_session(
+        &pool,
+        Uuid::new_v4(),
+        user_id,
+        Uuid::new_v4(),
+        &expired_hash,
+        Utc::now() - ChronoDuration::hours(2),
+        Utc::now() - ChronoDuration::hours(1),
+    )
+    .await
+    .unwrap();
+    let pruned = db::delete_expired_session_families(&pool).await.unwrap();
+    assert!(pruned >= 1, "the expired family must be deleted");
 
     let refresh = app
         .clone()
@@ -266,6 +253,16 @@ async fn cache_and_queue_contracts_work_against_redis() {
     );
     cache.invalidate("sample").await.unwrap();
     assert!(cache.get_json("sample").await.unwrap().is_none());
+
+    // Sub-second TTLs survive the trip to Redis (PSETEX, not SETEX).
+    cache
+        .put_json("sample", &json!({"value": 7}), Duration::from_millis(750))
+        .await
+        .unwrap();
+    assert_eq!(
+        cache.get_json("sample").await.unwrap(),
+        Some(json!({"value": 7}))
+    );
 
     let envelope = queue
         .enqueue(Job::SendEmail {

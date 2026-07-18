@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-/// The authorization role chosen at registration. Roles are fixed; the
-/// permissions each role carries live in
-/// [`crate::permissions::PermissionStore`] and are editable at runtime.
+/// The authorization role, chosen once at registration and immutable
+/// afterwards. The fixed permissions each role carries live in
+/// [`crate::permissions::PermissionStore`].
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {

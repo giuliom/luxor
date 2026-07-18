@@ -115,6 +115,8 @@ async fn serve() -> Result<()> {
     // first unknown-email login is not measurably slower than later ones.
     tokio::task::spawn_blocking(luxor::auth::prewarm_login_timing_equalizer);
 
+    spawn_session_pruner(db.clone());
+
     let state = AppState::new(config.clone(), db, cache, queue, rate_limiter, trace_store);
     let app = server::app(state);
 
@@ -146,6 +148,26 @@ async fn serve() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(50)).await;
     telemetry.shutdown();
     Ok(())
+}
+
+const SESSION_PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Periodically deletes auth sessions whose whole rotation family has
+/// expired (see `db::delete_expired_session_families`). Runs once at startup
+/// and then hourly; concurrent instances pruning the same database is
+/// harmless because the delete is idempotent.
+fn spawn_session_pruner(pool: sqlx::PgPool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SESSION_PRUNE_INTERVAL);
+        loop {
+            interval.tick().await;
+            match db::delete_expired_session_families(&pool).await {
+                Ok(0) => {}
+                Ok(deleted) => tracing::info!(deleted, "pruned expired auth session families"),
+                Err(error) => tracing::warn!(?error, "failed to prune expired auth sessions"),
+            }
+        }
+    });
 }
 
 #[cfg(target_os = "macos")]

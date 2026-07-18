@@ -11,7 +11,6 @@ const sessionPanel = document.querySelector("#session-panel");
 const sessionEmail = document.querySelector("#session-email");
 const sessionAvatar = document.querySelector("#session-avatar");
 const sessionRole = document.querySelector("#session-role");
-const sessionRoleSelect = document.querySelector("#session-role-select");
 const sessionMeta = document.querySelector("#session-meta");
 const matrixTable = document.querySelector("#permissions-matrix");
 const permissionsRoleBadge = document.querySelector("#permissions-role-badge");
@@ -47,7 +46,6 @@ function setIdentity(user) {
     sessionEmail.textContent = user.email;
     sessionAvatar.textContent = user.email.charAt(0).toUpperCase();
     sessionRole.textContent = user.role;
-    sessionRoleSelect.value = user.role;
     sessionMeta.textContent = user.created_at
       ? `Account created ${new Date(user.created_at).toLocaleString()}`
       : "";
@@ -152,28 +150,6 @@ document.querySelector("#auth-form").addEventListener("submit", (event) => {
 
 document.querySelector("#register-button").addEventListener("click", () => run("Registration", () => authenticate("/api/auth/register")));
 
-// Switching the role re-issues the access token: the role travels as a JWT
-// claim, so the server hands back a token carrying the new one.
-sessionRoleSelect.addEventListener("change", () => {
-  const role = sessionRoleSelect.value;
-  run(`Switch role to ${role}`, async () => {
-    try {
-      const response = await api("/api/me/role", {
-        method: "PUT",
-        body: JSON.stringify({ role }),
-      });
-      accessToken = response.access_token;
-      setIdentity(response.user);
-      return {
-        user: response.user,
-        note: "A fresh access token was issued so the new role applies immediately.",
-      };
-    } catch (error) {
-      sessionRoleSelect.value = currentRole;
-      throw error;
-    }
-  });
-});
 document.querySelector("#profile-button").addEventListener("click", () => run("Profile", () => api("/api/me")));
 document.querySelector("#logout-button").addEventListener("click", () => run("Logout", async () => {
   await api("/api/auth/logout", { method: "POST" }, false);
@@ -184,7 +160,8 @@ document.querySelector("#logout-button").addEventListener("click", () => run("Lo
 
 // --- Permissions ---------------------------------------------------------
 // The matrix is rendered from the server's catalog so the page never
-// hardcodes permission names; every toggle is saved immediately with a PUT.
+// hardcodes permission names. The grants are fixed server-side; this view is
+// read-only.
 
 async function loadPermissions() {
   renderMatrix(await api("/api/permissions", {}, false));
@@ -223,16 +200,19 @@ function renderMatrix(matrix) {
     const row = document.createElement("tr");
     row.append(name);
     for (const role of roles) {
-      const box = document.createElement("input");
-      box.type = "checkbox";
-      box.dataset.role = role;
-      box.dataset.permission = permission.name;
-      box.checked = matrix.roles[role].includes(permission.name);
-      box.setAttribute("aria-label", `${role}: ${permission.description}`);
+      const granted = matrix.roles[role].includes(permission.name);
+      const mark = document.createElement("span");
+      mark.className = granted ? "grant-mark" : "grant-mark denied";
+      mark.textContent = granted ? "✓" : "—";
+      mark.setAttribute("role", "img");
+      mark.setAttribute(
+        "aria-label",
+        `${role} ${granted ? "may" : "may not"}: ${permission.description}`,
+      );
       const grant = document.createElement("td");
       grant.className = "grant";
       grant.dataset.role = role;
-      grant.append(box);
+      grant.append(mark);
       row.append(grant);
     }
     tbody.append(row);
@@ -244,38 +224,12 @@ function renderMatrix(matrix) {
 
 function syncMatrixAccess() {
   const signedIn = Boolean(currentRole);
-  for (const box of matrixTable.querySelectorAll("input[type=checkbox]")) {
-    box.disabled = !signedIn;
-  }
   for (const element of matrixTable.querySelectorAll("[data-role]")) {
     element.classList.toggle("current", element.dataset.role === currentRole);
   }
   permissionsRoleBadge.textContent = signedIn ? `Acting as ${currentRole}` : "Signed out";
   permissionsRoleBadge.classList.toggle("ok", signedIn);
 }
-
-matrixTable.addEventListener("change", (event) => {
-  const box = event.target;
-  if (box.type !== "checkbox") return;
-  const role = box.dataset.role;
-  const permissions = [...matrixTable.querySelectorAll(`input[data-role="${role}"]`)]
-    .filter((input) => input.checked)
-    .map((input) => input.dataset.permission);
-  run(`Permissions for ${role}`, async () => {
-    try {
-      const matrix = await api(`/api/permissions/${role}`, {
-        method: "PUT",
-        body: JSON.stringify({ permissions }),
-      });
-      renderMatrix(matrix);
-      return { role, granted: matrix.roles[role] };
-    } catch (error) {
-      // Revert the optimistic toggle to the server's state.
-      await loadPermissions().catch(() => {});
-      throw error;
-    }
-  });
-});
 
 function bindDemoEndpoint(buttonId, badgeId, label, path, options) {
   const badge = document.querySelector(badgeId);

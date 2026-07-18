@@ -88,8 +88,11 @@ impl FromRequestParts<AppState> for AuthUser {
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .ok_or(AppError::Unauthorized)?;
+        // RFC 7235 makes the authentication scheme case-insensitive.
         let token = value
-            .strip_prefix("Bearer ")
+            .split_once(' ')
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, token)| token.trim())
             .filter(|token| !token.is_empty())
             .ok_or(AppError::Unauthorized)?;
         let claims = state.jwt.verify(token)?;

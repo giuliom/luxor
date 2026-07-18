@@ -65,10 +65,6 @@
               </div>
               <span id="session-role" class="badge role-chip">—</span>
             </div>
-            <label>Switch role · applies immediately<select id="session-role-select">
-              <option value="user">User</option>
-              <option value="admin">Admin</option>
-            </select></label>
             <p id="session-meta" class="session-meta"></p>
             <div class="actions">
               <button id="profile-button" class="secondary" type="button">Fetch profile</button>
@@ -98,7 +94,7 @@
               <span class="badge protected">Protected</span>
             </div>
           </div>
-          <p>Each role carries an editable set of grants that the endpoints below enforce server-side. Toggle a grant, then call the endpoints as the signed-in role — edits apply immediately and reset to the defaults on restart.</p>
+          <p>Each role carries a fixed set of grants — chosen at registration and enforced server-side. Call the endpoints below as each role to watch the same request succeed or fail.</p>
           <div class="matrix-scroll">
             <table id="permissions-matrix" class="permissions-matrix" aria-label="Role permission matrix"></table>
           </div>

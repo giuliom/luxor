@@ -34,7 +34,7 @@ impl AppState {
             queue,
             rate_limiter,
             jwt,
-            permissions: PermissionStore::default(),
+            permissions: PermissionStore,
             trace_store,
         }
     }

@@ -1,11 +1,8 @@
 use crate::{error::AppError, models::Role};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{Arc, RwLock},
-};
+use std::collections::{BTreeMap, BTreeSet};
 
-/// The fixed catalog of permissions enforced by the demo endpoints under
+/// The fixed catalog of permissions enforced by the endpoints under
 /// `/api/demo`.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Permission {
@@ -33,45 +30,36 @@ impl Permission {
     }
 }
 
-/// Runtime-editable role-to-permission grants.
-///
-/// The store is deliberately in-memory: the browser console edits it to
-/// demonstrate authorization outcomes without a redeploy, and a restart
-/// restores the defaults. A production system would persist grants and gate
-/// changes behind a dedicated management permission.
-#[derive(Clone)]
-pub struct PermissionStore {
-    grants: Arc<RwLock<BTreeMap<Role, BTreeSet<Permission>>>>,
-}
-
-impl Default for PermissionStore {
-    fn default() -> Self {
-        Self {
-            grants: Arc::new(RwLock::new(BTreeMap::from([
-                (Role::Admin, BTreeSet::from(Permission::ALL)),
-                (Role::User, BTreeSet::from([Permission::ReportsView])),
-            ]))),
-        }
+/// The permissions each role carries. This mapping is part of the
+/// application's authorization contract: it is fixed at compile time,
+/// identical across restarts and instances, and changes only through a code
+/// change and deployment.
+fn role_permissions(role: Role) -> &'static [Permission] {
+    match role {
+        Role::Admin => &Permission::ALL,
+        Role::User => &[Permission::ReportsView],
     }
 }
+
+/// Read-only view over the fixed role-to-permission grants.
+///
+/// The store is a stateless handle so that call sites keep a single
+/// enforcement seam; a future system that loads grants from storage can grow
+/// behind the same methods.
+#[derive(Clone, Copy, Default)]
+pub struct PermissionStore;
 
 impl PermissionStore {
+    /// The full matrix, in the shape the `/api/permissions` endpoint serves.
     pub fn grants(&self) -> BTreeMap<Role, BTreeSet<Permission>> {
-        self.read().clone()
-    }
-
-    /// Replaces one role's grants with the presented set.
-    pub fn set(&self, role: Role, permissions: BTreeSet<Permission>) {
-        self.grants
-            .write()
-            .expect("permission store lock poisoned")
-            .insert(role, permissions);
+        Role::ALL
+            .into_iter()
+            .map(|role| (role, role_permissions(role).iter().copied().collect()))
+            .collect()
     }
 
     pub fn allows(&self, role: Role, permission: Permission) -> bool {
-        self.read()
-            .get(&role)
-            .is_some_and(|granted| granted.contains(&permission))
+        role_permissions(role).contains(&permission)
     }
 
     pub fn require(&self, role: Role, permission: Permission) -> Result<(), AppError> {
@@ -81,10 +69,6 @@ impl PermissionStore {
             Err(AppError::MissingPermission(permission.name()))
         }
     }
-
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<Role, BTreeSet<Permission>>> {
-        self.grants.read().expect("permission store lock poisoned")
-    }
 }
 
 #[cfg(test)]
@@ -92,28 +76,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_grants_follow_least_privilege() {
-        let store = PermissionStore::default();
+    fn grants_follow_least_privilege() {
+        let store = PermissionStore;
         for permission in Permission::ALL {
             assert!(store.allows(Role::Admin, permission));
         }
         assert!(store.allows(Role::User, Permission::ReportsView));
         assert!(!store.allows(Role::User, Permission::RecordsPurge));
+        assert!(matches!(
+            store.require(Role::User, Permission::RecordsPurge),
+            Err(AppError::MissingPermission("records.purge"))
+        ));
     }
 
     #[test]
-    fn replacing_grants_changes_enforcement() {
-        let store = PermissionStore::default();
-        assert!(store.require(Role::User, Permission::RecordsPurge).is_err());
-
-        store.set(Role::User, BTreeSet::from(Permission::ALL));
-        assert!(store.require(Role::User, Permission::RecordsPurge).is_ok());
-
-        store.set(Role::User, BTreeSet::new());
-        assert!(matches!(
-            store.require(Role::User, Permission::ReportsView),
-            Err(AppError::MissingPermission("reports.view"))
-        ));
+    fn matrix_covers_every_role() {
+        let grants = PermissionStore.grants();
+        assert_eq!(grants.len(), Role::ALL.len());
+        assert!(grants[&Role::Admin].contains(&Permission::RecordsPurge));
+        assert_eq!(
+            grants[&Role::User],
+            BTreeSet::from([Permission::ReportsView])
+        );
     }
 
     #[test]
