@@ -1,6 +1,6 @@
 use axum::{
     extract::{rejection::JsonRejection, FromRequest, Request},
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -19,6 +19,10 @@ pub enum AppError {
     BadRequest(String),
     #[error("request body is too large")]
     PayloadTooLarge,
+    #[error("too many requests; retry after {retry_after_seconds} seconds")]
+    RateLimited { retry_after_seconds: u64 },
+    #[error("the request took too long to process")]
+    RequestTimeout,
     #[error("method not allowed for this route")]
     MethodNotAllowed,
     #[error("{0} was not found")]
@@ -55,6 +59,8 @@ impl AppError {
             Self::Forbidden | Self::MissingPermission(_) => StatusCode::FORBIDDEN,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
@@ -72,6 +78,8 @@ impl AppError {
             Self::Forbidden | Self::MissingPermission(_) => "forbidden",
             Self::BadRequest(_) => "bad_request",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::RequestTimeout => "request_timeout",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
@@ -127,7 +135,13 @@ impl IntoResponse for AppError {
             tracing::error!(error = ?self, "request failed");
             sentry::capture_error(&self);
         }
-        (
+        let retry_after_seconds = match &self {
+            Self::RateLimited {
+                retry_after_seconds,
+            } => Some(*retry_after_seconds),
+            _ => None,
+        };
+        let mut response = (
             status,
             Json(ApiErrorResponse {
                 error: ApiErrorBody {
@@ -136,7 +150,15 @@ impl IntoResponse for AppError {
                 },
             }),
         )
-            .into_response()
+            .into_response();
+        if let Some(seconds) = retry_after_seconds {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                HeaderValue::from_str(&seconds.to_string())
+                    .expect("decimal digits are a valid header value"),
+            );
+        }
+        response
     }
 }
 
@@ -154,5 +176,19 @@ mod tests {
             String::from_utf8(bytes.to_vec()).unwrap(),
             r#"{"error":{"code":"bad_request","message":"invalid email"}}"#
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_responses_advertise_the_retry_delay() {
+        let response = AppError::RateLimited {
+            retry_after_seconds: 9,
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "9");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains(r#""code":"rate_limited""#));
+        assert!(body.contains("retry after 9 seconds"));
     }
 }

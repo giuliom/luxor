@@ -36,6 +36,54 @@ impl FromStr for Environment {
     }
 }
 
+/// Where the client address used for per-client policies (rate limiting)
+/// comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientIpSource {
+    /// The peer address of the TCP connection. Correct when clients connect
+    /// directly, as in local development.
+    Socket,
+    /// The rightmost `X-Forwarded-For` entry, appended by the platform proxy
+    /// in front of the app. Correct on Railway, Heroku, and similar
+    /// platforms; unsafe without a trusted proxy, because clients can send
+    /// the header themselves.
+    XForwardedFor,
+}
+
+impl FromStr for ClientIpSource {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "socket" => Ok(Self::Socket),
+            "x-forwarded-for" => Ok(Self::XForwardedFor),
+            _ => Err(ConfigError::Invalid("CLIENT_IP_SOURCE", value.to_owned())),
+        }
+    }
+}
+
+/// A fixed-window request budget: at most `max_requests` per client per
+/// `window_seconds`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateLimitQuota {
+    pub max_requests: u32,
+    pub window_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RateLimitSettings {
+    /// Cannot be disabled in production.
+    pub enabled: bool,
+    pub client_ip_source: ClientIpSource,
+    /// Prefix for the Redis keys of the distributed limiter.
+    pub namespace: String,
+    /// Budget for the credential endpoints under `/api/auth`, the
+    /// brute-force surface. Applies on top of `api`.
+    pub auth: RateLimitQuota,
+    /// Budget for everything under `/api`.
+    pub api: RateLimitQuota,
+}
+
 #[derive(Clone)]
 pub struct OAuthConfig {
     pub authorization_url: Url,
@@ -71,9 +119,14 @@ pub struct Config {
     pub jwt_secret: SecretString,
     pub access_token_ttl_seconds: i64,
     pub refresh_token_ttl_seconds: i64,
+    /// Absolute cap on a refresh-token rotation family: rotations renew the
+    /// session, but never past this many seconds after the first login.
+    pub refresh_family_ttl_seconds: i64,
     pub refresh_cookie_secure: bool,
     pub cors_origins: Vec<String>,
     pub body_limit_bytes: usize,
+    pub request_timeout_seconds: u64,
+    pub rate_limit: RateLimitSettings,
     pub auto_migrate: bool,
     pub open_browser: bool,
     pub otlp_endpoint: Option<String>,
@@ -144,6 +197,13 @@ impl Config {
                 "refresh token lifetime must exceed access token lifetime".into(),
             ));
         }
+        let refresh_family_ttl_seconds =
+            parse(&values, "REFRESH_FAMILY_TTL_SECONDS", 7_776_000_i64)?;
+        if refresh_family_ttl_seconds < refresh_token_ttl_seconds {
+            return Err(ConfigError::Validation(
+                "refresh family lifetime must be at least the refresh token lifetime".into(),
+            ));
+        }
 
         let oauth = parse_oauth(&values)?;
         let cors_origins = get(&values, "CORS_ORIGINS")
@@ -168,6 +228,13 @@ impl Config {
                 "BODY_LIMIT_BYTES must be greater than zero".into(),
             ));
         }
+        let request_timeout_seconds = parse(&values, "REQUEST_TIMEOUT_SECONDS", 30_u64)?;
+        if request_timeout_seconds == 0 {
+            return Err(ConfigError::Validation(
+                "REQUEST_TIMEOUT_SECONDS must be greater than zero".into(),
+            ));
+        }
+        let rate_limit = parse_rate_limit(&values, production)?;
         let refresh_cookie_secure = parse(&values, "REFRESH_COOKIE_SECURE", production)?;
         if production && !refresh_cookie_secure {
             return Err(ConfigError::Validation(
@@ -216,9 +283,12 @@ impl Config {
             jwt_secret: SecretString::from(jwt_secret),
             access_token_ttl_seconds,
             refresh_token_ttl_seconds,
+            refresh_family_ttl_seconds,
             refresh_cookie_secure,
             cors_origins,
             body_limit_bytes,
+            request_timeout_seconds,
+            rate_limit,
             auto_migrate,
             open_browser,
             otlp_endpoint,
@@ -335,6 +405,72 @@ fn validate_origin(origin: &str) -> Result<(), ConfigError> {
     }
 }
 
+fn parse_rate_limit(
+    values: &HashMap<String, String>,
+    production: bool,
+) -> Result<RateLimitSettings, ConfigError> {
+    let enabled = parse(values, "RATE_LIMIT_ENABLED", true)?;
+    if production && !enabled {
+        return Err(ConfigError::Validation(
+            "RATE_LIMIT_ENABLED cannot be disabled in production".into(),
+        ));
+    }
+    // Deployed containers sit behind the platform proxy, so the peer address
+    // would be the proxy itself; local development connects directly.
+    let default_source = if production {
+        ClientIpSource::XForwardedFor
+    } else {
+        ClientIpSource::Socket
+    };
+    let client_ip_source = match get(values, "CLIENT_IP_SOURCE") {
+        Some(value) => value.parse()?,
+        None => default_source,
+    };
+    let namespace = get(values, "RATE_LIMIT_NAMESPACE")
+        .unwrap_or("luxor:ratelimit")
+        .to_owned();
+    let auth = parse_quota(
+        values,
+        ("RATE_LIMIT_AUTH_MAX_REQUESTS", 10),
+        ("RATE_LIMIT_AUTH_WINDOW_SECONDS", 60),
+    )?;
+    let api = parse_quota(
+        values,
+        ("RATE_LIMIT_API_MAX_REQUESTS", 120),
+        ("RATE_LIMIT_API_WINDOW_SECONDS", 60),
+    )?;
+    Ok(RateLimitSettings {
+        enabled,
+        client_ip_source,
+        namespace,
+        auth,
+        api,
+    })
+}
+
+fn parse_quota(
+    values: &HashMap<String, String>,
+    (max_key, default_max): (&'static str, u32),
+    (window_key, default_window): (&'static str, u64),
+) -> Result<RateLimitQuota, ConfigError> {
+    let max_requests = parse(values, max_key, default_max)?;
+    if max_requests == 0 {
+        return Err(ConfigError::Validation(format!(
+            "{max_key} must be greater than zero"
+        )));
+    }
+    let window_seconds = parse(values, window_key, default_window)?;
+    if !(1..=86_400).contains(&window_seconds) {
+        return Err(ConfigError::Validation(format!(
+            "{window_key} must be between 1 and 86400 seconds"
+        )));
+    }
+    Ok(RateLimitQuota {
+        max_requests,
+        window_seconds,
+    })
+}
+
 fn parse_oauth(values: &HashMap<String, String>) -> Result<Option<OAuthConfig>, ConfigError> {
     const KEYS: [&str; 5] = [
         "OAUTH_AUTHORIZATION_URL",
@@ -394,6 +530,124 @@ mod tests {
         assert!(!config.open_browser);
         assert!(!config.refresh_cookie_secure);
         assert_eq!(config.otel_service_name, "luxor");
+        assert_eq!(config.refresh_family_ttl_seconds, 7_776_000);
+        assert_eq!(config.request_timeout_seconds, 30);
+        assert!(config.rate_limit.enabled);
+        assert_eq!(config.rate_limit.client_ip_source, ClientIpSource::Socket);
+        assert_eq!(config.rate_limit.namespace, "luxor:ratelimit");
+        assert_eq!(
+            config.rate_limit.auth,
+            RateLimitQuota {
+                max_requests: 10,
+                window_seconds: 60
+            }
+        );
+        assert_eq!(
+            config.rate_limit.api,
+            RateLimitQuota {
+                max_requests: 120,
+                window_seconds: 60
+            }
+        );
+    }
+
+    fn production_base() -> HashMap<String, String> {
+        HashMap::from([
+            ("APP_ENV".into(), "production".into()),
+            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
+            ("REDIS_URL".into(), TEST_REDIS_URL.into()),
+            (
+                "JWT_SECRET".into(),
+                "production-test-secret-at-least-32-characters".into(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn rate_limiting_cannot_be_disabled_in_production() {
+        let mut values = production_base();
+        values.insert("RATE_LIMIT_ENABLED".into(), "false".into());
+        assert!(matches!(
+            Config::from_map(values),
+            Err(ConfigError::Validation(message)) if message.contains("RATE_LIMIT_ENABLED")
+        ));
+
+        let development = Config::from_map(HashMap::from([(
+            "RATE_LIMIT_ENABLED".into(),
+            "false".into(),
+        )]))
+        .unwrap();
+        assert!(!development.rate_limit.enabled);
+    }
+
+    #[test]
+    fn client_ip_source_follows_the_deployment_shape() {
+        let production = Config::from_map(production_base()).unwrap();
+        assert_eq!(
+            production.rate_limit.client_ip_source,
+            ClientIpSource::XForwardedFor
+        );
+
+        let mut direct_production = production_base();
+        direct_production.insert("CLIENT_IP_SOURCE".into(), "socket".into());
+        assert_eq!(
+            Config::from_map(direct_production)
+                .unwrap()
+                .rate_limit
+                .client_ip_source,
+            ClientIpSource::Socket
+        );
+
+        let invalid = HashMap::from([("CLIENT_IP_SOURCE".into(), "guess".into())]);
+        assert!(matches!(
+            Config::from_map(invalid),
+            Err(ConfigError::Invalid("CLIENT_IP_SOURCE", _))
+        ));
+    }
+
+    #[test]
+    fn rate_limit_quotas_are_validated() {
+        let zero_budget = HashMap::from([("RATE_LIMIT_AUTH_MAX_REQUESTS".into(), "0".into())]);
+        assert!(matches!(
+            Config::from_map(zero_budget),
+            Err(ConfigError::Validation(message))
+                if message.contains("RATE_LIMIT_AUTH_MAX_REQUESTS")
+        ));
+
+        let oversized_window =
+            HashMap::from([("RATE_LIMIT_API_WINDOW_SECONDS".into(), "86401".into())]);
+        assert!(matches!(
+            Config::from_map(oversized_window),
+            Err(ConfigError::Validation(message))
+                if message.contains("RATE_LIMIT_API_WINDOW_SECONDS")
+        ));
+    }
+
+    #[test]
+    fn refresh_family_lifetime_covers_the_token_lifetime() {
+        let too_short = HashMap::from([("REFRESH_FAMILY_TTL_SECONDS".into(), "3600".into())]);
+        assert!(matches!(
+            Config::from_map(too_short),
+            Err(ConfigError::Validation(message)) if message.contains("family")
+        ));
+
+        let equal = HashMap::from([
+            ("REFRESH_TOKEN_TTL_SECONDS".into(), "86400".into()),
+            ("REFRESH_FAMILY_TTL_SECONDS".into(), "86400".into()),
+        ]);
+        assert_eq!(
+            Config::from_map(equal).unwrap().refresh_family_ttl_seconds,
+            86_400
+        );
+    }
+
+    #[test]
+    fn request_timeout_must_be_positive() {
+        let values = HashMap::from([("REQUEST_TIMEOUT_SECONDS".into(), "0".into())]);
+        assert!(matches!(
+            Config::from_map(values),
+            Err(ConfigError::Validation(message)) if message.contains("REQUEST_TIMEOUT_SECONDS")
+        ));
     }
 
     #[test]

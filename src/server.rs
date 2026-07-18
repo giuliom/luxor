@@ -1,6 +1,7 @@
 use crate::{
     error::AppError,
     handlers::{auth, basic, cache, demo, jobs, permissions},
+    rate_limit::{self, RateLimitPolicy},
     state::AppState,
 };
 use axum::{
@@ -16,6 +17,7 @@ use axum::{
     Router,
 };
 use opentelemetry::{global, propagation::Extractor};
+use std::time::Duration;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
@@ -33,9 +35,24 @@ pub fn app(state: AppState) -> Router {
     let request_id_header = HeaderName::from_static("x-request-id");
     let cors = cors_layer(&state);
     let body_limit = state.config.body_limit_bytes;
+    let request_timeout = Duration::from_secs(state.config.request_timeout_seconds);
     let security_headers = SecurityHeaders {
         hsts: state.config.environment.is_production(),
     };
+    let auth_rate_limit = RateLimitPolicy::new(&state, "auth", state.config.rate_limit.auth);
+    let api_rate_limit = RateLimitPolicy::new(&state, "api", state.config.rate_limit.api);
+
+    // The credential endpoints are the brute-force surface, so they carry
+    // their own, much stricter budget on top of the API-wide one.
+    let auth_routes = Router::new()
+        .route("/auth/register", post(auth::register))
+        .route("/auth/login", post(auth::login))
+        .route("/auth/refresh", post(auth::refresh))
+        .route("/auth/logout", post(auth::logout))
+        .route_layer(middleware::from_fn_with_state(
+            auth_rate_limit,
+            rate_limit::enforce,
+        ));
 
     let api = Router::new()
         .route("/health", get(basic::health))
@@ -44,10 +61,6 @@ pub fn app(state: AppState) -> Router {
         .route("/time", get(basic::time))
         .route("/telemetry/demo", get(basic::telemetry_demo))
         .route("/telemetry/traces/{trace_id}", get(basic::trace))
-        .route("/auth/register", post(auth::register))
-        .route("/auth/login", post(auth::login))
-        .route("/auth/refresh", post(auth::refresh))
-        .route("/auth/logout", post(auth::logout))
         .route("/me", get(auth::me))
         .route("/me/role", put(auth::change_role))
         .route("/permissions", get(permissions::matrix))
@@ -61,8 +74,13 @@ pub fn app(state: AppState) -> Router {
                 .delete(cache::delete_demo),
         )
         .route("/jobs", post(jobs::enqueue))
+        .merge(auth_routes)
         .fallback(api_not_found)
-        .method_not_allowed_fallback(api_method_not_allowed);
+        .method_not_allowed_fallback(api_method_not_allowed)
+        .layer(middleware::from_fn_with_state(
+            api_rate_limit,
+            rate_limit::enforce,
+        ));
 
     Router::new()
         .route("/", get(index))
@@ -73,6 +91,10 @@ pub fn app(state: AppState) -> Router {
         .nest("/api", api)
         .with_state(state)
         .layer(DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn_with_state(
+            request_timeout,
+            enforce_request_timeout,
+        ))
         .layer(cors)
         .layer(
             TraceLayer::new_for_http()
@@ -115,6 +137,24 @@ pub fn app(state: AppState) -> Router {
             security_headers,
             apply_security_headers,
         ))
+}
+
+/// Bounds end-to-end request processing. Axum reads the body inside handler
+/// extractors, so the deadline also covers clients that send a body slowly,
+/// not just slow handlers.
+async fn enforce_request_timeout(
+    State(timeout): State<Duration>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let uri = request.uri().clone();
+    match tokio::time::timeout(timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_elapsed) => {
+            tracing::warn!(%uri, timeout_seconds = timeout.as_secs(), "request timed out");
+            AppError::RequestTimeout.into_response()
+        }
+    }
 }
 
 struct HeaderExtractor<'a>(&'a HeaderMap);
@@ -258,6 +298,7 @@ mod tests {
         models::Role,
         observability::{StoredSpan, TraceStore},
         queue::MemoryQueue,
+        rate_limit::MemoryRateLimiter,
         state::AppState,
     };
     use axum::{
@@ -290,6 +331,7 @@ mod tests {
             pool,
             Arc::new(MemoryCache::default()),
             Arc::new(MemoryQueue::default()),
+            Arc::new(MemoryRateLimiter::default()),
             trace_store,
         ))
     }
@@ -604,6 +646,130 @@ mod tests {
         assert!(body_text(matrix)
             .await
             .contains(r#""user":["reports.view"]"#));
+    }
+
+    #[tokio::test]
+    async fn auth_rate_limit_rejects_excess_attempts_with_retry_headers() {
+        let config = Config::from_map(HashMap::from([(
+            "RATE_LIMIT_AUTH_MAX_REQUESTS".into(),
+            "2".into(),
+        )]))
+        .unwrap();
+        let app = test_app_with_config(config);
+
+        // Refresh without a cookie fails authentication before touching the
+        // database, so the first two attempts get 401 and the third trips
+        // the auth quota.
+        for _ in 0..2 {
+            let response = send(&app, "POST", "/api/auth/refresh", None, None).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = send(&app, "POST", "/api/auth/refresh", None, None).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(limited.headers().get("ratelimit-limit").unwrap(), "2");
+        assert_eq!(limited.headers().get("ratelimit-remaining").unwrap(), "0");
+        assert!(limited.headers().contains_key("ratelimit-reset"));
+        assert!(limited.headers().contains_key(header::RETRY_AFTER));
+        assert!(body_text(limited)
+            .await
+            .contains(r#""code":"rate_limited""#));
+    }
+
+    #[tokio::test]
+    async fn api_rate_limit_meters_api_routes_but_not_static_assets() {
+        let config = Config::from_map(HashMap::from([(
+            "RATE_LIMIT_API_MAX_REQUESTS".into(),
+            "2".into(),
+        )]))
+        .unwrap();
+        let app = test_app_with_config(config);
+
+        for _ in 0..2 {
+            let response = send(&app, "GET", "/api/time", None, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let limited = send(&app, "GET", "/api/time", None, None).await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The embedded frontend assets stay reachable.
+        let index = send(&app, "GET", "/", None, None).await;
+        assert_eq!(index.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rate_limiting_can_be_disabled_outside_production() {
+        let config = Config::from_map(HashMap::from([
+            ("RATE_LIMIT_ENABLED".into(), "false".into()),
+            ("RATE_LIMIT_API_MAX_REQUESTS".into(), "1".into()),
+        ]))
+        .unwrap();
+        let app = test_app_with_config(config);
+        for _ in 0..3 {
+            let response = send(&app, "GET", "/api/time", None, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    async fn get_time_forwarded_for(app: &Router, forwarded_for: &str) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/time")
+                    .header("x-forwarded-for", forwarded_for)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn forwarded_clients_are_limited_independently() {
+        let config = Config::from_map(HashMap::from([
+            ("CLIENT_IP_SOURCE".into(), "x-forwarded-for".into()),
+            ("RATE_LIMIT_API_MAX_REQUESTS".into(), "1".into()),
+        ]))
+        .unwrap();
+        let app = test_app_with_config(config);
+
+        let first = get_time_forwarded_for(&app, "198.51.100.7").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let repeat = get_time_forwarded_for(&app, "198.51.100.7").await;
+        assert_eq!(repeat.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A different client has its own budget.
+        let other = get_time_forwarded_for(&app, "198.51.100.8").await;
+        assert_eq!(other.status(), StatusCode::OK);
+
+        // Prepending spoofed entries does not mint a fresh identity: only
+        // the rightmost, proxy-appended address counts.
+        let spoofed = get_time_forwarded_for(&app, "203.0.113.99, 198.51.100.8").await;
+        assert_eq!(spoofed.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requests_exceeding_the_deadline_return_the_timeout_contract() {
+        let app = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    "done"
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                Duration::from_secs(1),
+                enforce_request_timeout,
+            ));
+
+        let response = app
+            .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(body_text(response)
+            .await
+            .contains(r#""code":"request_timeout""#));
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ pub mod models;
 pub mod observability;
 pub mod permissions;
 pub mod queue;
+pub mod rate_limit;
 pub mod server;
 pub mod services;
 pub mod state;

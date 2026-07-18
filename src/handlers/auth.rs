@@ -1,5 +1,5 @@
 use crate::{
-    auth::{hash_refresh_token, rotate_refresh_token, AuthUser},
+    auth::{hash_refresh_token, rotate_refresh_token, AuthUser, RefreshGrant, RefreshPolicy},
     db,
     error::{ApiJson, AppError},
     models::{PublicUser, Role},
@@ -8,6 +8,7 @@ use crate::{
 };
 use axum::{extract::State, http::StatusCode, Json};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use time::Duration;
 
@@ -47,11 +48,11 @@ pub async fn register(
         &request.email,
         request.password,
         request.role,
-        state.config.refresh_token_ttl_seconds,
+        RefreshPolicy::from_config(&state.config),
     )
     .await?;
     let access_token = state.jwt.issue(user.id, user.role)?;
-    let jar = jar.add(refresh_cookie(&state, grant.token));
+    let jar = jar.add(refresh_cookie(&state, &grant));
     Ok((
         StatusCode::CREATED,
         jar,
@@ -68,11 +69,11 @@ pub async fn login(
         &state.db,
         &request.email,
         request.password,
-        state.config.refresh_token_ttl_seconds,
+        RefreshPolicy::from_config(&state.config),
     )
     .await?;
     let access_token = state.jwt.issue(user.id, user.role)?;
-    let jar = jar.add(refresh_cookie(&state, grant.token));
+    let jar = jar.add(refresh_cookie(&state, &grant));
     Ok((jar, Json(auth_response(&state, access_token, user.into()))))
 }
 
@@ -87,14 +88,14 @@ pub async fn refresh(
     let grant = rotate_refresh_token(
         &state.db,
         presented_token,
-        state.config.refresh_token_ttl_seconds,
+        RefreshPolicy::from_config(&state.config),
     )
     .await?;
     let user = db::user_by_id(&state.db, grant.user_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
     let access_token = state.jwt.issue(user.id, user.role)?;
-    let jar = jar.add(refresh_cookie(&state, grant.token));
+    let jar = jar.add(refresh_cookie(&state, &grant));
     Ok((jar, Json(auth_response(&state, access_token, user.into()))))
 }
 
@@ -153,13 +154,16 @@ fn auth_response(state: &AppState, access_token: String, user: PublicUser) -> Au
     }
 }
 
-fn refresh_cookie(state: &AppState, token: String) -> Cookie<'static> {
-    Cookie::build((REFRESH_COOKIE, token))
+fn refresh_cookie(state: &AppState, grant: &RefreshGrant) -> Cookie<'static> {
+    // The cookie tracks the token's real validity, which near the end of a
+    // rotation family is shorter than the configured token lifetime.
+    let max_age_seconds = (grant.expires_at - Utc::now()).num_seconds().max(0);
+    Cookie::build((REFRESH_COOKIE, grant.token.clone()))
         .path(REFRESH_COOKIE_PATH)
         .http_only(true)
         .secure(state.config.refresh_cookie_secure)
         .same_site(SameSite::Strict)
-        .max_age(Duration::seconds(state.config.refresh_token_ttl_seconds))
+        .max_age(Duration::seconds(max_age_seconds))
         .build()
 }
 

@@ -44,7 +44,9 @@ All application endpoints are under `/api` and JSON errors use this shape:
 {"error":{"code":"bad_request","message":"a valid email is required"}}
 ```
 
-Every response carries `x-request-id`; an incoming value is preserved, otherwise the server generates one.
+Every response carries `x-request-id`; an incoming value is preserved, otherwise the server generates one. Requests that exceed the processing deadline (`REQUEST_TIMEOUT_SECONDS`) answer `408` with a `request_timeout` error.
+
+Every `/api` route is rate limited per client IP inside a fixed window, and the `/api/auth` endpoints carry an additional, much stricter budget because they are the brute-force surface. Exceeding a budget answers `429` with a `rate_limited` error plus `Retry-After`, `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` headers. Counters live in Redis when `REDIS_URL` is set (shared across instances) and in memory otherwise; see the `RATE_LIMIT_*` and `CLIENT_IP_SOURCE` settings.
 
 | Method | Route | Authentication | Purpose |
 | --- | --- | --- | --- |
@@ -69,7 +71,7 @@ Every response carries `x-request-id`; an incoming value is preserved, otherwise
 
 Registration and login accept `{"email":"...","password":"..."}`; registration additionally accepts an optional `"role"` of `"admin"` or `"user"` (the default). They return a short-lived access token in JSON and set an opaque refresh token as an HTTP-only, `SameSite=Strict` cookie. Production cookies are `Secure`. The browser demo keeps the access token in a JavaScript variable only—never local or session storage—and sends the refresh cookie only to `/api/auth`.
 
-Refresh tokens are SHA-256 hashed in PostgreSQL and rotate on every use. Reusing a rotated token revokes its entire token family. Logout revokes refresh state; already-issued stateless access JWTs remain usable until their intentionally short expiry.
+Refresh tokens are SHA-256 hashed in PostgreSQL and rotate on every use. Reusing a rotated token revokes its entire token family, and a family can never be renewed past `REFRESH_FAMILY_TTL_SECONDS` after the login that created it, so a stolen cookie cannot be kept alive forever. Logout revokes refresh state; already-issued stateless access JWTs remain usable until their intentionally short expiry. Login responds identically — in status and in timing — whether the email is unknown or the password is wrong, so accounts cannot be enumerated.
 
 ## Roles and permissions
 
@@ -94,9 +96,16 @@ Because this is a testing surface, any signed-in user may edit the matrix or swi
 | `JWT_SECRET` | Unsafe local default outside production | Required in production; unique and at least 32 characters |
 | `ACCESS_TOKEN_TTL_SECONDS` | `900` | JWT lifetime |
 | `REFRESH_TOKEN_TTL_SECONDS` | `2592000` | Must exceed the access lifetime |
+| `REFRESH_FAMILY_TTL_SECONDS` | `7776000` | Absolute cap on refresh rotation (90 days); must be at least the refresh token lifetime |
 | `REFRESH_COOKIE_SECURE` | true only in production | Keep true behind production HTTPS |
 | `CORS_ORIGINS` | `http://localhost:8080` | Comma-separated exact origins; credentials are enabled |
 | `BODY_LIMIT_BYTES` | `1048576` | JSON body limit |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | End-to-end deadline per request, including body reads |
+| `RATE_LIMIT_ENABLED` | `true` | Cannot be disabled in production |
+| `RATE_LIMIT_AUTH_MAX_REQUESTS`, `RATE_LIMIT_AUTH_WINDOW_SECONDS` | `10` per `60` | Per-IP budget for `/api/auth` endpoints |
+| `RATE_LIMIT_API_MAX_REQUESTS`, `RATE_LIMIT_API_WINDOW_SECONDS` | `120` per `60` | Per-IP budget for all `/api` routes |
+| `RATE_LIMIT_NAMESPACE` | `luxor:ratelimit` | Redis key prefix for the distributed limiter |
+| `CLIENT_IP_SOURCE` | `socket`; `x-forwarded-for` in production | How clients are identified for rate limiting; only use `x-forwarded-for` behind a trusted proxy |
 | `AUTO_MIGRATE` | true outside production | Must normally be false in production; the embedded development database always migrates itself |
 | `APP_OPEN_BROWSER` | `false` | Development-only opt-in that opens the frontend in the system-default browser after startup |
 | `CACHE_NAMESPACE`, `QUEUE_KEY` | `luxor:cache`, `luxor:queue:jobs` | Redis namespacing |
@@ -227,6 +236,7 @@ The reference `DATABASE_URL`/`REDIS_URL` values above use Railway's private netw
 - Run migrations as an explicit release step before shifting traffic.
 - Use managed PostgreSQL/Redis with TLS, authentication, backups, and least-privilege network rules.
 - Terminate HTTPS at a trusted proxy and preserve or generate `x-request-id`.
+- Review the rate-limit budgets for your traffic shape; production runs with `x-forwarded-for` client identification by default, which is only safe behind the platform proxy.
 - Set resource limits, health probes, alerting, retention, and sampling for logs/traces/errors.
 - Plan JWT-secret rotation, refresh-session cleanup, database restore tests, and queue dead-letter handling.
 

@@ -4,10 +4,11 @@ use axum::{
 };
 use luxor::{
     cache::{Cache, MemoryCache, RedisCache},
-    config::Config,
+    config::{Config, RateLimitQuota},
     db,
     observability::TraceStore,
     queue::{Job, MemoryQueue, Queue, RedisQueue},
+    rate_limit::{MemoryRateLimiter, RateLimiter, RedisRateLimiter},
     server,
     state::AppState,
 };
@@ -37,6 +38,10 @@ async fn migrations_and_authentication_flow_work_against_postgres() {
                 "JWT_SECRET".into(),
                 "integration-test-secret-at-least-32-characters".into(),
             ),
+            // This test issues many credential requests from one client;
+            // rate limiting has its own dedicated tests.
+            ("RATE_LIMIT_AUTH_MAX_REQUESTS".into(), "1000".into()),
+            ("RATE_LIMIT_API_MAX_REQUESTS".into(), "1000".into()),
         ]))
         .unwrap(),
     );
@@ -45,6 +50,7 @@ async fn migrations_and_authentication_flow_work_against_postgres() {
         pool.clone(),
         Arc::new(MemoryCache::default()),
         Arc::new(MemoryQueue::default()),
+        Arc::new(MemoryRateLimiter::default()),
         TraceStore::default(),
     ));
     let email = format!("integration-{}@example.com", Uuid::new_v4());
@@ -245,8 +251,10 @@ async fn cache_and_queue_contracts_work_against_redis() {
     let suffix = Uuid::new_v4();
     let namespace = format!("luxor:test:cache:{suffix}");
     let queue_key = format!("luxor:test:queue:{suffix}");
+    let limiter_namespace = format!("luxor:test:ratelimit:{suffix}");
     let cache = RedisCache::new(manager.clone(), namespace.clone());
-    let queue = RedisQueue::new(manager, queue_key.clone());
+    let queue = RedisQueue::new(manager.clone(), queue_key.clone());
+    let limiter = RedisRateLimiter::new(manager, limiter_namespace.clone());
 
     cache
         .put_json("sample", &json!({"value": 42}), Duration::from_secs(30))
@@ -272,7 +280,29 @@ async fn cache_and_queue_contracts_work_against_redis() {
     assert_eq!(queued["id"], envelope.id.to_string());
     assert_eq!(queued["kind"], "send_email");
 
-    let keys = [format!("{namespace}:sample"), queue_key];
+    // The distributed limiter counts atomically and reports when the fixed
+    // window resets.
+    let quota = RateLimitQuota {
+        max_requests: 2,
+        window_seconds: 60,
+    };
+    let limiter_key = "api:198.51.100.7";
+    let first = limiter.hit(limiter_key, quota).await.unwrap();
+    assert!(first.allowed);
+    assert_eq!(first.remaining, 1);
+    let second = limiter.hit(limiter_key, quota).await.unwrap();
+    assert!(second.allowed);
+    assert_eq!(second.remaining, 0);
+    let third = limiter.hit(limiter_key, quota).await.unwrap();
+    assert!(!third.allowed);
+    assert_eq!(third.remaining, 0);
+    assert!((1..=60).contains(&third.retry_after_seconds));
+
+    let keys = [
+        format!("{namespace}:sample"),
+        queue_key,
+        format!("{limiter_namespace}:{limiter_key}"),
+    ];
     let _: usize = connection.del(&keys).await.unwrap();
 }
 

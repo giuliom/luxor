@@ -113,6 +113,9 @@ pub struct SessionRecord {
     pub family_id: Uuid,
     pub token_hash: String,
     pub expires_at: DateTime<Utc>,
+    /// Absolute expiry of the whole rotation family; rotations never issue a
+    /// token valid past this instant.
+    pub family_expires_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub replaced_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,

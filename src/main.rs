@@ -6,11 +6,12 @@ use luxor::{
     dev_postgres::DevPostgres,
     observability,
     queue::{MemoryQueue, Queue, RedisQueue},
+    rate_limit::{MemoryRateLimiter, RateLimiter, RedisRateLimiter},
     server,
     state::AppState,
 };
 use secrecy::{ExposeSecret, SecretString};
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -76,30 +77,45 @@ async fn serve() -> Result<()> {
         }
     };
 
-    let (cache, queue): (Arc<dyn Cache>, Arc<dyn Queue>) = match &config.redis_url {
-        Some(redis_url) => {
-            let redis =
-                redis::Client::open(redis_url.expose_secret()).context("invalid REDIS_URL")?;
-            let redis_manager = redis::aio::ConnectionManager::new(redis)
-                .await
-                .context("could not connect to Redis")?;
-            (
-                Arc::new(RedisCache::new(
-                    redis_manager.clone(),
-                    config.cache_namespace.clone(),
-                )),
-                Arc::new(RedisQueue::new(redis_manager, config.queue_key.clone())),
-            )
-        }
-        None => {
-            tracing::info!("REDIS_URL is not set; using the in-memory cache and queue");
-            (
-                Arc::new(MemoryCache::default()),
-                Arc::new(MemoryQueue::default()),
-            )
-        }
-    };
-    let state = AppState::new(config.clone(), db, cache, queue, trace_store);
+    let (cache, queue, rate_limiter): (Arc<dyn Cache>, Arc<dyn Queue>, Arc<dyn RateLimiter>) =
+        match &config.redis_url {
+            Some(redis_url) => {
+                let redis =
+                    redis::Client::open(redis_url.expose_secret()).context("invalid REDIS_URL")?;
+                let redis_manager = redis::aio::ConnectionManager::new(redis)
+                    .await
+                    .context("could not connect to Redis")?;
+                (
+                    Arc::new(RedisCache::new(
+                        redis_manager.clone(),
+                        config.cache_namespace.clone(),
+                    )),
+                    Arc::new(RedisQueue::new(
+                        redis_manager.clone(),
+                        config.queue_key.clone(),
+                    )),
+                    Arc::new(RedisRateLimiter::new(
+                        redis_manager,
+                        config.rate_limit.namespace.clone(),
+                    )),
+                )
+            }
+            None => {
+                tracing::info!(
+                    "REDIS_URL is not set; using the in-memory cache, queue, and rate limiter"
+                );
+                (
+                    Arc::new(MemoryCache::default()),
+                    Arc::new(MemoryQueue::default()),
+                    Arc::new(MemoryRateLimiter::default()),
+                )
+            }
+        };
+    // Compute the login timing-equalizer hash before traffic arrives so the
+    // first unknown-email login is not measurably slower than later ones.
+    tokio::task::spawn_blocking(luxor::auth::prewarm_login_timing_equalizer);
+
+    let state = AppState::new(config.clone(), db, cache, queue, rate_limiter, trace_store);
     let app = server::app(state);
 
     let address = listener.local_addr()?;
@@ -112,10 +128,15 @@ async fn serve() -> Result<()> {
         }
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("HTTP server failed")?;
+    // Connect info exposes the peer address, which the rate limiter uses to
+    // identify clients when CLIENT_IP_SOURCE is "socket".
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("HTTP server failed")?;
 
     if let Some(server) = dev_postgres {
         server.stop().await;

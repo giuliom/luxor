@@ -115,9 +115,19 @@ pub async fn create_session(
     family_id: Uuid,
     token_hash: &str,
     expires_at: DateTime<Utc>,
+    family_expires_at: DateTime<Utc>,
 ) -> Result<Uuid, AppError> {
     let id = Uuid::new_v4();
-    insert_session(pool, id, user_id, family_id, token_hash, expires_at).await?;
+    insert_session(
+        pool,
+        id,
+        user_id,
+        family_id,
+        token_hash,
+        expires_at,
+        family_expires_at,
+    )
+    .await?;
     Ok(id)
 }
 
@@ -128,14 +138,15 @@ pub async fn insert_session<'e, E>(
     family_id: Uuid,
     token_hash: &str,
     expires_at: DateTime<Utc>,
+    family_expires_at: DateTime<Utc>,
 ) -> Result<(), AppError>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
     sqlx::query(
         r#"
-        INSERT INTO auth_sessions (id, user_id, family_id, token_hash, expires_at)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO auth_sessions (id, user_id, family_id, token_hash, expires_at, family_expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6)
         "#,
     )
     .bind(id)
@@ -143,6 +154,7 @@ where
     .bind(family_id)
     .bind(token_hash)
     .bind(expires_at)
+    .bind(family_expires_at)
     .execute(executor)
     .await?;
     Ok(())
