@@ -1,4 +1,5 @@
 let accessToken = null;
+let currentRole = null;
 
 const message = document.querySelector("#message");
 const identity = document.querySelector("#identity");
@@ -9,7 +10,11 @@ const authForm = document.querySelector("#auth-form");
 const sessionPanel = document.querySelector("#session-panel");
 const sessionEmail = document.querySelector("#session-email");
 const sessionAvatar = document.querySelector("#session-avatar");
+const sessionRole = document.querySelector("#session-role");
+const sessionRoleSelect = document.querySelector("#session-role-select");
 const sessionMeta = document.querySelector("#session-meta");
+const matrixTable = document.querySelector("#permissions-matrix");
+const permissionsRoleBadge = document.querySelector("#permissions-role-badge");
 const activity = document.querySelector(".activity");
 
 function syncActivityHeight() {
@@ -26,8 +31,9 @@ function show(label, data) {
 
 function setIdentity(user) {
   const signedIn = Boolean(user);
+  currentRole = signedIn ? user.role : null;
 
-  identity.textContent = signedIn ? `Signed in as ${user.email}` : "Signed out";
+  identity.textContent = signedIn ? `Signed in as ${user.email} · ${user.role}` : "Signed out";
   authDot.classList.remove("checking");
   authDot.classList.toggle("online", signedIn);
   identityPill.classList.toggle("online", signedIn);
@@ -40,6 +46,8 @@ function setIdentity(user) {
   if (signedIn) {
     sessionEmail.textContent = user.email;
     sessionAvatar.textContent = user.email.charAt(0).toUpperCase();
+    sessionRole.textContent = user.role;
+    sessionRoleSelect.value = user.role;
     sessionMeta.textContent = user.created_at
       ? `Account created ${new Date(user.created_at).toLocaleString()}`
       : "";
@@ -49,6 +57,8 @@ function setIdentity(user) {
     badge.textContent = signedIn ? "Unlocked" : "Log in required";
     badge.classList.toggle("unlocked", signedIn);
   }
+
+  syncMatrixAccess();
 }
 
 function setRuntime(runtime) {
@@ -62,7 +72,9 @@ async function parseResponse(response) {
   if (response.status === 204) return null;
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data?.error?.message || `Server returned ${response.status}`);
+    const error = new Error(data?.error?.message || `Server returned ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
   return data;
 }
@@ -117,12 +129,16 @@ document.querySelector("#health-button").addEventListener("click", () => run("He
 document.querySelector("#time-button").addEventListener("click", () => run("Server time", () => api("/api/time")));
 
 async function authenticate(endpoint) {
+  const payload = {
+    email: document.querySelector("#email").value,
+    password: document.querySelector("#password").value,
+  };
+  if (endpoint.endsWith("/register")) {
+    payload.role = document.querySelector("#role").value;
+  }
   const response = await api(endpoint, {
     method: "POST",
-    body: JSON.stringify({
-      email: document.querySelector("#email").value,
-      password: document.querySelector("#password").value,
-    }),
+    body: JSON.stringify(payload),
   }, false);
   accessToken = response.access_token;
   setIdentity(response.user);
@@ -135,6 +151,29 @@ document.querySelector("#auth-form").addEventListener("submit", (event) => {
 });
 
 document.querySelector("#register-button").addEventListener("click", () => run("Registration", () => authenticate("/api/auth/register")));
+
+// Switching the role re-issues the access token: the role travels as a JWT
+// claim, so the server hands back a token carrying the new one.
+sessionRoleSelect.addEventListener("change", () => {
+  const role = sessionRoleSelect.value;
+  run(`Switch role to ${role}`, async () => {
+    try {
+      const response = await api("/api/me/role", {
+        method: "PUT",
+        body: JSON.stringify({ role }),
+      });
+      accessToken = response.access_token;
+      setIdentity(response.user);
+      return {
+        user: response.user,
+        note: "A fresh access token was issued so the new role applies immediately.",
+      };
+    } catch (error) {
+      sessionRoleSelect.value = currentRole;
+      throw error;
+    }
+  });
+});
 document.querySelector("#profile-button").addEventListener("click", () => run("Profile", () => api("/api/me")));
 document.querySelector("#logout-button").addEventListener("click", () => run("Logout", async () => {
   await api("/api/auth/logout", { method: "POST" }, false);
@@ -142,6 +181,128 @@ document.querySelector("#logout-button").addEventListener("click", () => run("Lo
   setIdentity(null);
   return "Refresh session revoked and cookie removed.";
 }));
+
+// --- Permissions ---------------------------------------------------------
+// The matrix is rendered from the server's catalog so the page never
+// hardcodes permission names; every toggle is saved immediately with a PUT.
+
+async function loadPermissions() {
+  renderMatrix(await api("/api/permissions", {}, false));
+}
+
+function renderMatrix(matrix) {
+  const roles = Object.keys(matrix.roles);
+
+  const headRow = document.createElement("tr");
+  const lead = document.createElement("th");
+  lead.scope = "col";
+  lead.textContent = "Permission";
+  headRow.append(lead);
+  for (const role of roles) {
+    const th = document.createElement("th");
+    th.scope = "col";
+    th.className = "grant";
+    th.dataset.role = role;
+    th.textContent = role;
+    headRow.append(th);
+  }
+  const thead = document.createElement("thead");
+  thead.append(headRow);
+
+  const tbody = document.createElement("tbody");
+  for (const permission of matrix.catalog) {
+    const name = document.createElement("th");
+    name.scope = "row";
+    const label = document.createElement("code");
+    label.textContent = permission.name;
+    const hint = document.createElement("span");
+    hint.className = "permission-hint";
+    hint.textContent = permission.description;
+    name.append(label, hint);
+
+    const row = document.createElement("tr");
+    row.append(name);
+    for (const role of roles) {
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.dataset.role = role;
+      box.dataset.permission = permission.name;
+      box.checked = matrix.roles[role].includes(permission.name);
+      box.setAttribute("aria-label", `${role}: ${permission.description}`);
+      const grant = document.createElement("td");
+      grant.className = "grant";
+      grant.dataset.role = role;
+      grant.append(box);
+      row.append(grant);
+    }
+    tbody.append(row);
+  }
+
+  matrixTable.replaceChildren(thead, tbody);
+  syncMatrixAccess();
+}
+
+function syncMatrixAccess() {
+  const signedIn = Boolean(currentRole);
+  for (const box of matrixTable.querySelectorAll("input[type=checkbox]")) {
+    box.disabled = !signedIn;
+  }
+  for (const element of matrixTable.querySelectorAll("[data-role]")) {
+    element.classList.toggle("current", element.dataset.role === currentRole);
+  }
+  permissionsRoleBadge.textContent = signedIn ? `Acting as ${currentRole}` : "Signed out";
+  permissionsRoleBadge.classList.toggle("ok", signedIn);
+}
+
+matrixTable.addEventListener("change", (event) => {
+  const box = event.target;
+  if (box.type !== "checkbox") return;
+  const role = box.dataset.role;
+  const permissions = [...matrixTable.querySelectorAll(`input[data-role="${role}"]`)]
+    .filter((input) => input.checked)
+    .map((input) => input.dataset.permission);
+  run(`Permissions for ${role}`, async () => {
+    try {
+      const matrix = await api(`/api/permissions/${role}`, {
+        method: "PUT",
+        body: JSON.stringify({ permissions }),
+      });
+      renderMatrix(matrix);
+      return { role, granted: matrix.roles[role] };
+    } catch (error) {
+      // Revert the optimistic toggle to the server's state.
+      await loadPermissions().catch(() => {});
+      throw error;
+    }
+  });
+});
+
+function bindDemoEndpoint(buttonId, badgeId, label, path, options) {
+  const badge = document.querySelector(badgeId);
+  document.querySelector(buttonId).addEventListener("click", () => run(label, async () => {
+    try {
+      const data = await api(path, options);
+      badge.textContent = "200 OK";
+      badge.className = "badge ok";
+      return data;
+    } catch (error) {
+      if (error.status === 403) {
+        badge.textContent = "403 Forbidden";
+        badge.className = "badge denied";
+      } else if (error.status === 401) {
+        badge.textContent = "401 Unauthorized";
+        badge.className = "badge";
+      } else {
+        badge.textContent = "Error";
+        badge.className = "badge";
+      }
+      throw error;
+    }
+  }));
+}
+
+bindDemoEndpoint("#reports-button", "#reports-outcome", "Demo report", "/api/demo/reports", {});
+bindDemoEndpoint("#purge-button", "#purge-outcome", "Record purge", "/api/demo/records", { method: "DELETE" });
 
 document.querySelector("#cache-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -356,6 +517,7 @@ async function initialize() {
   try {
     const runtime = await api("/api/runtime", {}, false);
     setRuntime(runtime);
+    await loadPermissions();
 
     // A surviving HTTP-only refresh cookie may restore the session after a reload.
     const restored = await refreshAccessToken();

@@ -1,4 +1,7 @@
-use crate::{error::AppError, models::UserRecord};
+use crate::{
+    error::AppError,
+    models::{Role, UserRecord},
+};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
@@ -41,16 +44,18 @@ pub async fn create_user(
     pool: &PgPool,
     email: &str,
     password_hash: &str,
+    role: Role,
 ) -> Result<UserRecord, AppError> {
     sqlx::query_as::<_, UserRecord>(
         r#"
-        INSERT INTO users (email, password_hash)
-        VALUES ($1, $2)
-        RETURNING id, email, password_hash, created_at, updated_at
+        INSERT INTO users (email, password_hash, role)
+        VALUES ($1, $2, $3)
+        RETURNING id, email, password_hash, role, created_at, updated_at
         "#,
     )
     .bind(email)
     .bind(password_hash)
+    .bind(role)
     .fetch_one(pool)
     .await
     .map_err(map_user_write_error)
@@ -59,7 +64,7 @@ pub async fn create_user(
 pub async fn user_by_email(pool: &PgPool, email: &str) -> Result<Option<UserRecord>, AppError> {
     sqlx::query_as::<_, UserRecord>(
         r#"
-        SELECT id, email, password_hash, created_at, updated_at
+        SELECT id, email, password_hash, role, created_at, updated_at
         FROM users
         WHERE email = $1
         "#,
@@ -73,12 +78,32 @@ pub async fn user_by_email(pool: &PgPool, email: &str) -> Result<Option<UserReco
 pub async fn user_by_id(pool: &PgPool, id: Uuid) -> Result<Option<UserRecord>, AppError> {
     sqlx::query_as::<_, UserRecord>(
         r#"
-        SELECT id, email, password_hash, created_at, updated_at
+        SELECT id, email, password_hash, role, created_at, updated_at
         FROM users
         WHERE id = $1
         "#,
     )
     .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from)
+}
+
+pub async fn update_user_role(
+    pool: &PgPool,
+    id: Uuid,
+    role: Role,
+) -> Result<Option<UserRecord>, AppError> {
+    sqlx::query_as::<_, UserRecord>(
+        r#"
+        UPDATE users
+        SET role = $2, updated_at = now()
+        WHERE id = $1
+        RETURNING id, email, password_hash, role, created_at, updated_at
+        "#,
+    )
+    .bind(id)
+    .bind(role)
     .fetch_optional(pool)
     .await
     .map_err(AppError::from)

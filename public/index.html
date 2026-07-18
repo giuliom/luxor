@@ -43,10 +43,14 @@
             <div><span class="number">02</span><h2>Authentication</h2></div>
             <span id="auth-badge" class="badge">Checking…</span>
           </div>
-          <p id="auth-description">Register or sign in against PostgreSQL-backed sessions.</p>
+          <p id="auth-description">Register or sign in against PostgreSQL-backed sessions. New accounts take the selected role.</p>
           <form id="auth-form" hidden>
             <label>Email<input id="email" type="email" autocomplete="email" value="demo@example.com" required></label>
             <label>Password<input id="password" type="password" autocomplete="current-password" minlength="12" value="change-this-password" required></label>
+            <label>Role · registration only<select id="role">
+              <option value="user" selected>User</option>
+              <option value="admin">Admin</option>
+            </select></label>
             <div class="actions">
               <button id="login-button" type="submit">Log in</button>
               <button id="register-button" class="secondary" type="button">Register</button>
@@ -59,7 +63,12 @@
                 <p class="session-label">Signed in as</p>
                 <p id="session-email" class="session-email">—</p>
               </div>
+              <span id="session-role" class="badge role-chip">—</span>
             </div>
+            <label>Switch role · applies immediately<select id="session-role-select">
+              <option value="user">User</option>
+              <option value="admin">Admin</option>
+            </select></label>
             <p id="session-meta" class="session-meta"></p>
             <div class="actions">
               <button id="profile-button" class="secondary" type="button">Fetch profile</button>
@@ -82,7 +91,39 @@
         </article>
 
         <article class="card wide">
-          <div class="card-heading"><div><span class="number">04</span><h2>Queue</h2></div><span class="badge protected">Protected</span></div>
+          <div class="card-heading">
+            <div><span class="number">04</span><h2>Permissions</h2></div>
+            <div class="badge-group">
+              <span id="permissions-role-badge" class="badge">Signed out</span>
+              <span class="badge protected">Protected</span>
+            </div>
+          </div>
+          <p>Each role carries an editable set of grants that the endpoints below enforce server-side. Toggle a grant, then call the endpoints as the signed-in role — edits apply immediately and reset to the defaults on restart.</p>
+          <div class="matrix-scroll">
+            <table id="permissions-matrix" class="permissions-matrix" aria-label="Role permission matrix"></table>
+          </div>
+          <div class="endpoints">
+            <div class="endpoint">
+              <div>
+                <p class="endpoint-name"><code>GET /api/demo/reports</code></p>
+                <p class="endpoint-permission">Requires <code>reports.view</code></p>
+              </div>
+              <span id="reports-outcome" class="badge">Not called</span>
+              <button id="reports-button" class="secondary" type="button">Fetch report</button>
+            </div>
+            <div class="endpoint">
+              <div>
+                <p class="endpoint-name"><code>DELETE /api/demo/records</code></p>
+                <p class="endpoint-permission">Requires <code>records.purge</code></p>
+              </div>
+              <span id="purge-outcome" class="badge">Not called</span>
+              <button id="purge-button" class="secondary" type="button">Purge records</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="card wide">
+          <div class="card-heading"><div><span class="number">05</span><h2>Queue</h2></div><span class="badge protected">Protected</span></div>
           <p>Enqueue an audit event using the documented Redis list message contract.</p>
           <form id="job-form" class="inline-form">
             <label>Action<input id="job-action" value="demo_button_clicked" maxlength="200" required></label>
@@ -92,7 +133,7 @@
 
         <article class="card wide telemetry-card">
           <div class="card-heading">
-            <div><span class="number">05</span><h2>OpenTelemetry</h2></div>
+            <div><span class="number">06</span><h2>OpenTelemetry</h2></div>
             <span id="telemetry-badge" class="badge">Not checked</span>
           </div>
           <p>Generate an HTTP trace with two concurrent child spans, then inspect the captured span waterfall without leaving the page.</p>
@@ -109,7 +150,7 @@
 
         <article class="card wide">
           <div class="card-heading">
-            <div><span class="number">06</span><h2>WebAssembly</h2></div>
+            <div><span class="number">07</span><h2>WebAssembly</h2></div>
             <span id="wasm-badge" class="badge">Not loaded</span>
           </div>
           <p>Stream-compile a Rust module with WebAssembly.instantiateStreaming, then count primes with the same sieve in WebAssembly and in JavaScript and compare their 10-run average timings.</p>

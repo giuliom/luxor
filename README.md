@@ -2,7 +2,7 @@
 
 [![Build & Tests](https://github.com/giuliom/luxor/actions/workflows/CI.yml/badge.svg)](https://github.com/giuliom/luxor/actions/workflows/CI.yml)
 
-Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, JWT access tokens with rotating refresh sessions, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console with in-page trace and Rust-to-WebAssembly demos. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
+Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, JWT access tokens with rotating refresh sessions, role-based permissions with a runtime-editable grant matrix, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console with in-page trace and Rust-to-WebAssembly demos. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
 
 ## Quick start
 
@@ -59,12 +59,27 @@ Every response carries `x-request-id`; an incoming value is preserved, otherwise
 | `POST` | `/api/auth/refresh` | Refresh cookie | Rotate the refresh token and issue access JWT |
 | `POST` | `/api/auth/logout` | Refresh cookie optional | Revoke the presented session and clear the cookie |
 | `GET` | `/api/me` | Bearer JWT | Return the current user |
+| `PUT` | `/api/me/role` | Bearer JWT | Switch the current account's role and issue a fresh access token |
+| `GET` | `/api/permissions` | No | Read the role-permission matrix and permission catalog |
+| `PUT` | `/api/permissions/{role}` | Bearer JWT | Replace one role's permission grants |
+| `GET` | `/api/demo/reports` | Bearer JWT + `reports.view` | Permission-gated sample report |
+| `DELETE` | `/api/demo/records` | Bearer JWT + `records.purge` | Permission-gated simulated purge |
 | `GET/PUT/DELETE` | `/api/cache/demo` | Bearer JWT | Read, cache, or invalidate a JSON value |
 | `POST` | `/api/jobs` | Bearer JWT | Enqueue an audit or email-contract job |
 
-Registration and login accept `{"email":"...","password":"..."}`. They return a short-lived access token in JSON and set an opaque refresh token as an HTTP-only, `SameSite=Strict` cookie. Production cookies are `Secure`. The browser demo keeps the access token in a JavaScript variable only—never local or session storage—and sends the refresh cookie only to `/api/auth`.
+Registration and login accept `{"email":"...","password":"..."}`; registration additionally accepts an optional `"role"` of `"admin"` or `"user"` (the default). They return a short-lived access token in JSON and set an opaque refresh token as an HTTP-only, `SameSite=Strict` cookie. Production cookies are `Secure`. The browser demo keeps the access token in a JavaScript variable only—never local or session storage—and sends the refresh cookie only to `/api/auth`.
 
 Refresh tokens are SHA-256 hashed in PostgreSQL and rotate on every use. Reusing a rotated token revokes its entire token family. Logout revokes refresh state; already-issued stateless access JWTs remain usable until their intentionally short expiry.
+
+## Roles and permissions
+
+Every account carries one of two fixed roles, chosen at registration and stored in PostgreSQL: `admin` or `user`. The role travels as a claim in the access JWT, so permission checks never re-query the database (tokens issued before this feature carry no role claim and fail verification, which pushes clients through the refresh flow for a new token).
+
+What a role may do is defined by an editable role-permission matrix backed by an in-memory store. The defaults grant `admin` both `reports.view` and `records.purge`, and `user` only `reports.view`. The two `/api/demo` endpoints enforce these grants server-side and answer `403` with a `forbidden` error naming the missing permission.
+
+The matrix exists to make authorization outcomes observable: the browser console renders it from `GET /api/permissions` and saves each toggle with `PUT /api/permissions/{role}`, so you can grant or revoke a permission and immediately watch the same endpoint flip between `200` and `403`. The console's session panel can also switch the signed-in account's role in place with `PUT /api/me/role`: the server updates the stored role and returns a fresh access token so the new claim applies immediately, while previously issued tokens keep the old role until they expire.
+
+Because this is a testing surface, any signed-in user may edit the matrix or switch their own role, and matrix edits reset to the defaults on restart. A production system would persist grants, restrict role changes to administrators, and gate matrix changes behind a dedicated management permission instead.
 
 ## Configuration
 

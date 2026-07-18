@@ -1,6 +1,6 @@
 use crate::{
     error::AppError,
-    handlers::{auth, basic, cache, jobs},
+    handlers::{auth, basic, cache, demo, jobs, permissions},
     state::AppState,
 };
 use axum::{
@@ -12,7 +12,7 @@ use axum::{
     },
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use opentelemetry::{global, propagation::Extractor};
@@ -49,6 +49,11 @@ pub fn app(state: AppState) -> Router {
         .route("/auth/refresh", post(auth::refresh))
         .route("/auth/logout", post(auth::logout))
         .route("/me", get(auth::me))
+        .route("/me/role", put(auth::change_role))
+        .route("/permissions", get(permissions::matrix))
+        .route("/permissions/{role}", put(permissions::update_role))
+        .route("/demo/reports", get(demo::reports))
+        .route("/demo/records", delete(demo::purge_records))
         .route(
             "/cache/demo",
             get(cache::get_demo)
@@ -246,9 +251,11 @@ async fn api_method_not_allowed() -> AppError {
 mod tests {
     use super::*;
     use crate::{
+        auth::JwtService,
         cache::MemoryCache,
         config::Config,
         db,
+        models::Role,
         observability::{StoredSpan, TraceStore},
         queue::MemoryQueue,
         state::AppState,
@@ -265,6 +272,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
     use tower::ServiceExt;
     use tracing_subscriber::prelude::*;
+    use uuid::Uuid;
 
     fn test_app() -> Router {
         test_app_with_config(Config::from_map(HashMap::new()).unwrap())
@@ -410,19 +418,192 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_protected_routes_without_a_bearer_token() {
+        for (method, uri) in [
+            ("GET", "/api/me"),
+            ("PUT", "/api/me/role"),
+            ("GET", "/api/demo/reports"),
+            ("DELETE", "/api/demo/records"),
+            ("PUT", "/api/permissions/user"),
+        ] {
+            let response = test_app()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+            assert!(body_text(response)
+                .await
+                .contains(r#""code":"unauthorized""#));
+        }
+    }
+
+    /// Mints a bearer token compatible with `test_app`, which signs with the
+    /// development JWT secret. The demo endpoints check permissions against
+    /// the role claim alone, so the user does not need to exist.
+    fn bearer(role: Role) -> String {
+        let config = Config::from_map(HashMap::new()).unwrap();
+        let token = JwtService::from_config(&config)
+            .issue(Uuid::new_v4(), role)
+            .unwrap();
+        format!("Bearer {token}")
+    }
+
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        authorization: Option<&str>,
+        body: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(authorization) = authorization {
+            builder = builder.header(header::AUTHORIZATION, authorization);
+        }
+        let body = match body {
+            Some(json) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(json.to_owned())
+            }
+            None => Body::empty(),
+        };
+        app.clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn permission_matrix_is_public_and_starts_with_the_default_grants() {
         let response = test_app()
             .oneshot(
                 Request::builder()
-                    .uri("/api/me")
+                    .uri("/api/permissions")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_text(response).await;
+        assert!(body.contains(
+            r#""roles":{"admin":["reports.view","records.purge"],"user":["reports.view"]}"#
+        ));
+        assert!(body.contains(r#""name":"reports.view""#));
+        assert!(body.contains(r#""name":"records.purge""#));
+    }
+
+    #[tokio::test]
+    async fn permission_grants_control_the_demo_endpoints() {
+        let app = test_app();
+        let admin = bearer(Role::Admin);
+        let user = bearer(Role::User);
+
+        // Default grants: the user role reads reports but cannot purge.
+        let reports = send(&app, "GET", "/api/demo/reports", Some(&user), None).await;
+        assert_eq!(reports.status(), StatusCode::OK);
+        assert!(body_text(reports)
+            .await
+            .contains(r#""required_permission":"reports.view""#));
+
+        let denied = send(&app, "DELETE", "/api/demo/records", Some(&user), None).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let denied_body = body_text(denied).await;
+        assert!(denied_body.contains(r#""code":"forbidden""#));
+        assert!(denied_body.contains("records.purge"));
+
+        let allowed = send(&app, "DELETE", "/api/demo/records", Some(&admin), None).await;
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert!(body_text(allowed).await.contains(r#""simulated":true"#));
+
+        // Granting records.purge to the user role flips the outcome.
+        let update = send(
+            &app,
+            "PUT",
+            "/api/permissions/user",
+            Some(&admin),
+            Some(r#"{"permissions":["reports.view","records.purge"]}"#),
+        )
+        .await;
+        assert_eq!(update.status(), StatusCode::OK);
+        assert!(body_text(update)
+            .await
+            .contains(r#""user":["reports.view","records.purge"]"#));
+        let now_allowed = send(&app, "DELETE", "/api/demo/records", Some(&user), None).await;
+        assert_eq!(now_allowed.status(), StatusCode::OK);
+
+        // Revoking every grant locks the role out again.
+        let revoke = send(
+            &app,
+            "PUT",
+            "/api/permissions/user",
+            Some(&user),
+            Some(r#"{"permissions":[]}"#),
+        )
+        .await;
+        assert_eq!(revoke.status(), StatusCode::OK);
+        let now_denied = send(&app, "GET", "/api/demo/reports", Some(&user), None).await;
+        assert_eq!(now_denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    // The unknown role is rejected while parsing the body, before the
+    // handler touches the database, so the lazy test pool suffices. The
+    // successful switch needs a real user row and lives in the PostgreSQL
+    // integration test.
+    #[tokio::test]
+    async fn rejects_switching_to_an_unknown_role() {
+        let response = send(
+            &test_app(),
+            "PUT",
+            "/api/me/role",
+            Some(&bearer(Role::User)),
+            Some(r#"{"role":"root"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(body_text(response)
             .await
-            .contains(r#""code":"unauthorized""#));
+            .contains(r#""code":"bad_request""#));
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_roles_and_permissions() {
+        let app = test_app();
+        let admin = bearer(Role::Admin);
+
+        let unknown_role = send(
+            &app,
+            "PUT",
+            "/api/permissions/superuser",
+            Some(&admin),
+            Some(r#"{"permissions":[]}"#),
+        )
+        .await;
+        assert_eq!(unknown_role.status(), StatusCode::NOT_FOUND);
+
+        let unknown_permission = send(
+            &app,
+            "PUT",
+            "/api/permissions/user",
+            Some(&admin),
+            Some(r#"{"permissions":["reports.destroy"]}"#),
+        )
+        .await;
+        assert_eq!(unknown_permission.status(), StatusCode::BAD_REQUEST);
+
+        // A rejected update must leave the grants untouched.
+        let matrix = send(&app, "GET", "/api/permissions", None, None).await;
+        assert!(body_text(matrix)
+            .await
+            .contains(r#""user":["reports.view"]"#));
     }
 
     #[tokio::test]

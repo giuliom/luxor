@@ -2,7 +2,7 @@ use crate::{
     auth::{hash_password, issue_refresh_token, verify_password, RefreshGrant},
     db,
     error::AppError,
-    models::UserRecord,
+    models::{Role, UserRecord},
 };
 use sqlx::PgPool;
 
@@ -10,11 +10,12 @@ pub async fn register(
     pool: &PgPool,
     email: &str,
     password: String,
+    role: Role,
     refresh_lifetime_seconds: i64,
 ) -> Result<(UserRecord, RefreshGrant), AppError> {
     validate_credentials(email, &password)?;
     let password_hash = hash_password(password).await?;
-    let user = db::create_user(pool, &normalize_email(email), &password_hash).await?;
+    let user = db::create_user(pool, &normalize_email(email), &password_hash, role).await?;
     let grant = issue_refresh_token(pool, user.id, refresh_lifetime_seconds).await?;
     Ok((user, grant))
 }

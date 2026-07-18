@@ -1,4 +1,4 @@
-use crate::{config::Config, error::AppError, state::AppState};
+use crate::{config::Config, error::AppError, models::Role, state::AppState};
 use axum::{
     extract::FromRequestParts,
     http::{header, request::Parts},
@@ -18,6 +18,7 @@ pub struct JwtService {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Claims {
     pub sub: Uuid,
+    pub role: Role,
     pub iat: i64,
     pub exp: i64,
     pub iss: String,
@@ -38,10 +39,11 @@ impl JwtService {
         }
     }
 
-    pub fn issue(&self, user_id: Uuid) -> Result<String, AppError> {
+    pub fn issue(&self, user_id: Uuid, role: Role) -> Result<String, AppError> {
         let now = Utc::now().timestamp();
         let claims = Claims {
             sub: user_id,
+            role,
             iat: now,
             exp: now + self.lifetime_seconds,
             iss: "luxor".into(),
@@ -71,6 +73,7 @@ impl JwtService {
 #[derive(Clone, Debug)]
 pub struct AuthUser {
     pub id: Uuid,
+    pub role: Role,
 }
 
 impl FromRequestParts<AppState> for AuthUser {
@@ -90,7 +93,10 @@ impl FromRequestParts<AppState> for AuthUser {
             .filter(|token| !token.is_empty())
             .ok_or(AppError::Unauthorized)?;
         let claims = state.jwt.verify(token)?;
-        Ok(Self { id: claims.sub })
+        Ok(Self {
+            id: claims.sub,
+            role: claims.role,
+        })
     }
 }
 
@@ -109,14 +115,47 @@ mod tests {
     #[test]
     fn issues_and_verifies_access_tokens() {
         let user_id = Uuid::new_v4();
-        let token = service(60).issue(user_id).unwrap();
-        assert_eq!(service(60).verify(&token).unwrap().sub, user_id);
+        let token = service(60).issue(user_id, Role::Admin).unwrap();
+        let claims = service(60).verify(&token).unwrap();
+        assert_eq!(claims.sub, user_id);
+        assert_eq!(claims.role, Role::Admin);
     }
 
     #[test]
     fn rejects_expired_access_tokens() {
-        let token = service(-1).issue(Uuid::new_v4()).unwrap();
+        let token = service(-1).issue(Uuid::new_v4(), Role::User).unwrap();
         thread::sleep(Duration::from_millis(10));
+        assert!(matches!(
+            service(60).verify(&token),
+            Err(AppError::Unauthorized)
+        ));
+    }
+
+    // Tokens minted before roles existed carry no role claim; they must fail
+    // verification so the client falls back to the refresh flow for a
+    // role-bearing token.
+    #[test]
+    fn rejects_tokens_without_a_role_claim() {
+        #[derive(Serialize)]
+        struct LegacyClaims {
+            sub: Uuid,
+            iat: i64,
+            exp: i64,
+            iss: String,
+        }
+        let now = Utc::now().timestamp();
+        let legacy = LegacyClaims {
+            sub: Uuid::new_v4(),
+            iat: now,
+            exp: now + 60,
+            iss: "luxor".into(),
+        };
+        let token = encode(
+            &Header::new(Algorithm::HS256),
+            &legacy,
+            &EncodingKey::from_secret(b"a-test-secret-with-at-least-32-characters"),
+        )
+        .unwrap();
         assert!(matches!(
             service(60).verify(&token),
             Err(AppError::Unauthorized)

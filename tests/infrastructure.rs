@@ -55,6 +55,7 @@ async fn migrations_and_authentication_flow_work_against_postgres() {
     let first_cookie = response_cookie(&registration);
     let registration_body = response_json(registration).await;
     let access_token = registration_body["access_token"].as_str().unwrap();
+    assert_eq!(registration_body["user"]["role"], "user");
 
     let profile = app
         .clone()
@@ -68,7 +69,100 @@ async fn migrations_and_authentication_flow_work_against_postgres() {
         .await
         .unwrap();
     assert_eq!(profile.status(), StatusCode::OK);
-    assert_eq!(response_json(profile).await["email"], email);
+    let profile_body = response_json(profile).await;
+    assert_eq!(profile_body["email"], email);
+    assert_eq!(profile_body["role"], "user");
+
+    // Roles persist through PostgreSQL, travel in the access token, and gate
+    // the permission-demo endpoints: the default user role cannot purge
+    // records while an admin can.
+    let admin_email = format!("integration-admin-{}@example.com", Uuid::new_v4());
+    let admin_credentials =
+        json!({"email": admin_email, "password": "integration-password", "role": "admin"});
+    let admin_registration =
+        request_json(&app, "/api/auth/register", &admin_credentials, None).await;
+    assert_eq!(admin_registration.status(), StatusCode::CREATED);
+    let admin_body = response_json(admin_registration).await;
+    assert_eq!(admin_body["user"]["role"], "admin");
+    let admin_token = admin_body["access_token"].as_str().unwrap();
+
+    let purge_denied = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/demo/records")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(purge_denied.status(), StatusCode::FORBIDDEN);
+
+    let purge_allowed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/demo/records")
+                .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(purge_allowed.status(), StatusCode::OK);
+    assert_eq!(response_json(purge_allowed).await["simulated"], true);
+
+    // Self-service role switch: the user promotes themselves to admin and
+    // receives a fresh access token carrying the new role claim.
+    let promoted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/me/role")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"role":"admin"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(promoted.status(), StatusCode::OK);
+    let promoted_body = response_json(promoted).await;
+    assert_eq!(promoted_body["user"]["role"], "admin");
+    let promoted_token = promoted_body["access_token"].as_str().unwrap();
+
+    let purge_after_promotion = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/demo/records")
+                .header(header::AUTHORIZATION, format!("Bearer {promoted_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(purge_after_promotion.status(), StatusCode::OK);
+
+    // The pre-switch token still carries the old role claim until it expires.
+    let stale_token_purge = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/demo/records")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_token_purge.status(), StatusCode::FORBIDDEN);
 
     let refresh = app
         .clone()
@@ -131,8 +225,8 @@ async fn migrations_and_authentication_flow_work_against_postgres() {
         .unwrap()
         .contains("Max-Age=0"));
 
-    sqlx::query("DELETE FROM users WHERE email = $1")
-        .bind(&email)
+    sqlx::query("DELETE FROM users WHERE email = ANY($1)")
+        .bind(vec![email, admin_email])
         .execute(&pool)
         .await
         .unwrap();

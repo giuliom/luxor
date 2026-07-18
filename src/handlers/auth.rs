@@ -2,7 +2,7 @@ use crate::{
     auth::{hash_refresh_token, rotate_refresh_token, AuthUser},
     db,
     error::{ApiJson, AppError},
-    models::PublicUser,
+    models::{PublicUser, Role},
     services,
     state::AppState,
 };
@@ -20,6 +20,15 @@ pub struct CredentialsRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+pub struct RegisterRequest {
+    email: String,
+    password: String,
+    /// The demo role for the new account; omitted means a regular user.
+    #[serde(default)]
+    role: Role,
+}
+
 #[derive(Serialize)]
 pub struct AuthResponse {
     access_token: String,
@@ -31,16 +40,17 @@ pub struct AuthResponse {
 pub async fn register(
     State(state): State<AppState>,
     jar: CookieJar,
-    ApiJson(request): ApiJson<CredentialsRequest>,
+    ApiJson(request): ApiJson<RegisterRequest>,
 ) -> Result<(StatusCode, CookieJar, Json<AuthResponse>), AppError> {
     let (user, grant) = services::auth::register(
         &state.db,
         &request.email,
         request.password,
+        request.role,
         state.config.refresh_token_ttl_seconds,
     )
     .await?;
-    let access_token = state.jwt.issue(user.id)?;
+    let access_token = state.jwt.issue(user.id, user.role)?;
     let jar = jar.add(refresh_cookie(&state, grant.token));
     Ok((
         StatusCode::CREATED,
@@ -61,7 +71,7 @@ pub async fn login(
         state.config.refresh_token_ttl_seconds,
     )
     .await?;
-    let access_token = state.jwt.issue(user.id)?;
+    let access_token = state.jwt.issue(user.id, user.role)?;
     let jar = jar.add(refresh_cookie(&state, grant.token));
     Ok((jar, Json(auth_response(&state, access_token, user.into()))))
 }
@@ -83,7 +93,7 @@ pub async fn refresh(
     let user = db::user_by_id(&state.db, grant.user_id)
         .await?
         .ok_or(AppError::Unauthorized)?;
-    let access_token = state.jwt.issue(user.id)?;
+    let access_token = state.jwt.issue(user.id, user.role)?;
     let jar = jar.add(refresh_cookie(&state, grant.token));
     Ok((jar, Json(auth_response(&state, access_token, user.into()))))
 }
@@ -110,6 +120,28 @@ pub async fn me(
         .map(PublicUser::from)
         .map(Json)
         .ok_or(AppError::Unauthorized)
+}
+
+#[derive(Deserialize)]
+pub struct ChangeRoleRequest {
+    role: Role,
+}
+
+/// Switches the signed-in account's role and mints a fresh access token so
+/// the new role applies immediately (the role travels as a JWT claim; tokens
+/// issued earlier keep the old role until they expire). Self-service role
+/// changes are a demo testing surface; a real system would restrict them to
+/// administrators.
+pub async fn change_role(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    ApiJson(request): ApiJson<ChangeRoleRequest>,
+) -> Result<Json<AuthResponse>, AppError> {
+    let user = db::update_user_role(&state.db, auth.id, request.role)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    let access_token = state.jwt.issue(user.id, user.role)?;
+    Ok(Json(auth_response(&state, access_token, user.into())))
 }
 
 fn auth_response(state: &AppState, access_token: String, user: PublicUser) -> AuthResponse {

@@ -123,6 +123,7 @@ h2 { margin: 0; font-family: Georgia, "Times New Roman", serif; font-size: 1.45r
 .badge.ok { color: #285f3a; background: #d7e6da; }
 .badge.protected { color: #7f482e; background: #edddd3; }
 .badge.protected.unlocked { color: #285f3a; background: #d7e6da; }
+.badge.denied { color: #933a29; background: #edd6cd; }
 
 .session-panel { display: grid; gap: 0.95rem; margin-top: 1.25rem; }
 
@@ -161,11 +162,76 @@ h2 { margin: 0; font-family: Georgia, "Times New Roman", serif; font-size: 1.45r
 .session-email { margin: 0.15rem 0 0; font-size: 0.95rem; font-weight: 700; word-break: break-all; }
 .session-meta { margin: 0; color: #6d6b65; font-size: 0.8rem; }
 .session-meta:empty { display: none; }
+.session-identity .role-chip { margin-left: auto; color: #285f3a; background: #d7e6da; }
+
+code {
+  padding: 0.08em 0.35em;
+  border-radius: 0.3rem;
+  background: rgba(35, 40, 34, 0.07);
+  font: 650 0.85em ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.matrix-scroll { margin-top: 1.2rem; overflow-x: auto; }
+.permissions-matrix { width: 100%; border-collapse: collapse; }
+
+.permissions-matrix th, .permissions-matrix td {
+  padding: 0.7rem 0.6rem;
+  border-bottom: 1px solid #d8d2c4;
+  text-align: left;
+}
+
+.permissions-matrix thead th {
+  color: #7d786f;
+  font-size: 0.64rem;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.permissions-matrix tbody th { font-weight: 500; }
+.permissions-matrix .grant { width: 7rem; text-align: center; }
+.permissions-matrix .current { background: rgba(63, 125, 83, 0.08); }
+
+.permission-hint {
+  display: block;
+  margin-top: 0.3rem;
+  color: #6d6b65;
+  font-size: 0.78rem;
+}
+
+.permissions-matrix input[type="checkbox"] {
+  width: 1.05rem;
+  height: 1.05rem;
+  min-height: 0;
+  margin: 0;
+  accent-color: #3f7d53;
+  cursor: pointer;
+}
+
+.permissions-matrix input[type="checkbox"]:disabled { cursor: not-allowed; }
+
+.endpoints { display: grid; gap: 0.7rem; margin-top: 1.25rem; }
+
+.endpoint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 1rem;
+  padding: 0.8rem 1rem;
+  border: 1px solid #d0c9bb;
+  border-radius: 0.6rem;
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.endpoint-name { margin: 0; font-size: 0.9rem; font-weight: 650; }
+.endpoint-permission { margin: 0.25rem 0 0; color: #6d6b65; font-size: 0.78rem; }
+.endpoint .badge { margin-left: auto; }
+.endpoint button { flex: 0 0 auto; }
 
 form { display: grid; gap: 0.85rem; margin-top: 1.25rem; }
 label { display: grid; gap: 0.4rem; color: #68665f; font-size: 0.74rem; font-weight: 800; letter-spacing: 0.055em; text-transform: uppercase; }
 
-input {
+input, select {
   width: 100%;
   min-height: 2.75rem;
   padding: 0 0.8rem;
@@ -179,7 +245,7 @@ input {
   letter-spacing: 0;
 }
 
-input:focus { border-color: #91583e; box-shadow: 0 0 0 3px rgba(145, 88, 62, 0.12); }
+input:focus, select:focus { border-color: #91583e; box-shadow: 0 0 0 3px rgba(145, 88, 62, 0.12); }
 .actions { display: flex; flex-wrap: wrap; gap: 0.55rem; }
 
 button {

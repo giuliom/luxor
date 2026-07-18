@@ -13,6 +13,8 @@ pub enum AppError {
     Unauthorized,
     #[error("access is forbidden")]
     Forbidden,
+    #[error("the {0} permission is required")]
+    MissingPermission(&'static str),
     #[error("{0}")]
     BadRequest(String),
     #[error("request body is too large")]
@@ -50,7 +52,7 @@ impl AppError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::Forbidden | Self::MissingPermission(_) => StatusCode::FORBIDDEN,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
@@ -67,7 +69,7 @@ impl AppError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Unauthorized => "unauthorized",
-            Self::Forbidden => "forbidden",
+            Self::Forbidden | Self::MissingPermission(_) => "forbidden",
             Self::BadRequest(_) => "bad_request",
             Self::PayloadTooLarge => "payload_too_large",
             Self::MethodNotAllowed => "method_not_allowed",

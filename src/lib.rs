@@ -7,6 +7,7 @@ pub mod error;
 pub mod handlers;
 pub mod models;
 pub mod observability;
+pub mod permissions;
 pub mod queue;
 pub mod server;
 pub mod services;
