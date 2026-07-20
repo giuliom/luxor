@@ -259,7 +259,7 @@ impl Config {
 
         let oauth = parse_oauth(&values)?;
         let cors_origins = get(&values, "CORS_ORIGINS")
-            .unwrap_or("http://localhost:8080")
+            .unwrap_or("https://localhost:8080")
             .split(',')
             .map(str::trim)
             .filter(|value| !value.is_empty())

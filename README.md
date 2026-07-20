@@ -98,7 +98,7 @@ What a role may do is defined by a fixed role-permission matrix that is part of 
 | `REFRESH_TOKEN_TTL_SECONDS` | `2592000` | Must exceed the access lifetime |
 | `REFRESH_FAMILY_TTL_SECONDS` | `7776000` | Absolute cap on refresh rotation (90 days); must be at least the refresh token lifetime |
 | `REFRESH_COOKIE_SECURE` | true only in production | Keep true behind production HTTPS |
-| `CORS_ORIGINS` | `http://localhost:8080` | Comma-separated exact origins; credentials are enabled. Must all be `https` in production |
+| `CORS_ORIGINS` | `https://localhost:8080` | Comma-separated exact origins; credentials are enabled. Must all be `https` in production |
 | `HSTS_ENABLED` | true only in production | Send `Strict-Transport-Security` |
 | `HSTS_MAX_AGE_SECONDS` | `31536000` | `0` releases browsers that cached a policy |
 | `HSTS_INCLUDE_SUBDOMAINS` | `true` | Adds `includeSubDomains` |
