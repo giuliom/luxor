@@ -635,7 +635,7 @@ mod tests {
         let config = Config::from_map(HashMap::new()).unwrap();
         assert_eq!(config.environment, Environment::Development);
         assert_eq!(config.app_port, 8080);
-        assert_eq!(config.cors_origins, vec!["http://localhost:8080"]);
+        assert_eq!(config.cors_origins, vec!["https://localhost:8080"]);
         assert!(config.auto_migrate);
         assert!(config.database_url.is_none());
         assert!(config.redis_url.is_none());
