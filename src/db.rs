@@ -75,6 +75,29 @@ pub async fn user_by_email(pool: &PgPool, email: &str) -> Result<Option<UserReco
     .map_err(AppError::from)
 }
 
+/// Replaces a stored password hash in place. Used to re-hash an account at
+/// the current argon2 cost after its owner logs in, so raising the pinned
+/// parameters upgrades existing users instead of only new ones.
+pub async fn update_password_hash(
+    pool: &PgPool,
+    id: Uuid,
+    password_hash: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET password_hash = $2, updated_at = now()
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(password_hash)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from)
+}
+
 pub async fn user_by_id(pool: &PgPool, id: Uuid) -> Result<Option<UserRecord>, AppError> {
     sqlx::query_as::<_, UserRecord>(
         r#"

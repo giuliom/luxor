@@ -21,6 +21,8 @@ pub enum AppError {
     PayloadTooLarge,
     #[error("request body must be encoded as application/json")]
     UnsupportedMediaType,
+    #[error("this endpoint is only available over https")]
+    HttpsRequired,
     #[error("too many requests; retry after {retry_after_seconds} seconds")]
     RateLimited { retry_after_seconds: u64 },
     #[error("the request took too long to process")]
@@ -62,6 +64,9 @@ impl AppError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            // Not a redirect: a request that already carried credentials over
+            // plaintext cannot be made safe by retrying it elsewhere.
+            Self::HttpsRequired => StatusCode::FORBIDDEN,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
@@ -82,6 +87,7 @@ impl AppError {
             Self::BadRequest(_) => "bad_request",
             Self::PayloadTooLarge => "payload_too_large",
             Self::UnsupportedMediaType => "unsupported_media_type",
+            Self::HttpsRequired => "https_required",
             Self::RateLimited { .. } => "rate_limited",
             Self::RequestTimeout => "request_timeout",
             Self::MethodNotAllowed => "method_not_allowed",

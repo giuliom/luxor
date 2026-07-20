@@ -84,6 +84,56 @@ pub struct RateLimitSettings {
     pub api: RateLimitQuota,
 }
 
+/// How the app decides a request reached it over TLS. TLS is terminated by
+/// the platform proxy, never in-process, so the only available signal is what
+/// that proxy reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpsEnforcement {
+    /// Accept plaintext. Correct for local development, and for a deployment
+    /// whose proxy does not set `x-forwarded-proto`.
+    Off,
+    /// Turn away requests the proxy marked as plaintext. Carries the same
+    /// trust assumption as `CLIENT_IP_SOURCE=x-forwarded-for`: safe only when
+    /// a proxy always overwrites the header, since a directly reachable app
+    /// lets clients forge it.
+    ProxyHeader,
+}
+
+impl FromStr for HttpsEnforcement {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "proxy-header" => Ok(Self::ProxyHeader),
+            _ => Err(ConfigError::Invalid("HTTPS_ENFORCEMENT", value.to_owned())),
+        }
+    }
+}
+
+/// `Strict-Transport-Security`: how long a browser refuses to reach this host
+/// over plaintext after a single successful HTTPS response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HstsSettings {
+    pub enabled: bool,
+    pub max_age_seconds: u64,
+    pub include_subdomains: bool,
+    pub preload: bool,
+}
+
+impl HstsSettings {
+    pub fn header_value(&self) -> String {
+        let mut value = format!("max-age={}", self.max_age_seconds);
+        if self.include_subdomains {
+            value.push_str("; includeSubDomains");
+        }
+        if self.preload {
+            value.push_str("; preload");
+        }
+        value
+    }
+}
+
 #[derive(Clone)]
 pub struct OAuthConfig {
     pub authorization_url: Url,
@@ -123,6 +173,8 @@ pub struct Config {
     /// session, but never past this many seconds after the first login.
     pub refresh_family_ttl_seconds: i64,
     pub refresh_cookie_secure: bool,
+    pub hsts: HstsSettings,
+    pub https_enforcement: HttpsEnforcement,
     pub cors_origins: Vec<String>,
     pub body_limit_bytes: usize,
     pub request_timeout_seconds: u64,
@@ -219,7 +271,7 @@ impl Config {
             ));
         }
         for origin in &cors_origins {
-            validate_origin(origin)?;
+            validate_origin(origin, production)?;
         }
 
         let body_limit_bytes = parse(&values, "BODY_LIMIT_BYTES", 1_048_576_usize)?;
@@ -235,6 +287,15 @@ impl Config {
             ));
         }
         let rate_limit = parse_rate_limit(&values, production)?;
+        let hsts = parse_hsts(&values, production)?;
+        // Production sits behind a platform proxy that terminates TLS and
+        // reports the original scheme; local development is reached directly
+        // over plaintext http, where the check would reject every request.
+        let https_enforcement = match get(&values, "HTTPS_ENFORCEMENT") {
+            Some(value) => value.parse()?,
+            None if production => HttpsEnforcement::ProxyHeader,
+            None => HttpsEnforcement::Off,
+        };
         let refresh_cookie_secure = parse(&values, "REFRESH_COOKIE_SECURE", production)?;
         if production && !refresh_cookie_secure {
             return Err(ConfigError::Validation(
@@ -285,6 +346,8 @@ impl Config {
             refresh_token_ttl_seconds,
             refresh_family_ttl_seconds,
             refresh_cookie_secure,
+            hsts,
+            https_enforcement,
             cors_origins,
             body_limit_bytes,
             request_timeout_seconds,
@@ -387,8 +450,17 @@ fn parse_url(key: &'static str, value: &str, schemes: &[&str]) -> Result<Url, Co
     }
 }
 
-fn validate_origin(origin: &str) -> Result<(), ConfigError> {
+fn validate_origin(origin: &str, production: bool) -> Result<(), ConfigError> {
     let url = parse_url("CORS_ORIGINS", origin, &["http", "https"])?;
+    // A plaintext origin in production means credentialed requests are
+    // expected over a channel that cannot carry a `Secure` cookie, which is
+    // a deployment mistake rather than a preference.
+    if production && url.scheme() != "https" {
+        return Err(ConfigError::Invalid(
+            "CORS_ORIGINS",
+            format!("{origin} must use https in production"),
+        ));
+    }
     let is_origin_only = url.host().is_some()
         && url.username().is_empty()
         && url.password().is_none()
@@ -403,6 +475,46 @@ fn validate_origin(origin: &str) -> Result<(), ConfigError> {
             format!("{origin} is not an HTTP(S) origin"),
         ))
     }
+}
+
+/// Requirements published by the browser preload list: a two-year max-age is
+/// the usual submission, and one year is the documented floor.
+const HSTS_PRELOAD_MIN_MAX_AGE: u64 = 31_536_000;
+
+fn parse_hsts(
+    values: &HashMap<String, String>,
+    production: bool,
+) -> Result<HstsSettings, ConfigError> {
+    // Sending HSTS from a development server would pin the developer's browser
+    // to https on localhost for a year, breaking every other local project on
+    // that port.
+    let enabled = parse(values, "HSTS_ENABLED", production)?;
+    // Zero is allowed and meaningful: it is the only way to release browsers
+    // that already cached a policy for this host.
+    let max_age_seconds = parse(values, "HSTS_MAX_AGE_SECONDS", 31_536_000_u64)?;
+    let include_subdomains = parse(values, "HSTS_INCLUDE_SUBDOMAINS", true)?;
+    let preload = parse(values, "HSTS_PRELOAD", false)?;
+
+    if preload && !enabled {
+        return Err(ConfigError::Validation(
+            "HSTS_PRELOAD requires HSTS_ENABLED".into(),
+        ));
+    }
+    // Submitting a host to the preload list is close to irreversible, so a
+    // header that claims preload while failing the list's own requirements is
+    // rejected here rather than silently ignored by the browser.
+    if preload && (!include_subdomains || max_age_seconds < HSTS_PRELOAD_MIN_MAX_AGE) {
+        return Err(ConfigError::Validation(format!(
+            "HSTS_PRELOAD requires HSTS_INCLUDE_SUBDOMAINS and an HSTS_MAX_AGE_SECONDS of at least {HSTS_PRELOAD_MIN_MAX_AGE}"
+        )));
+    }
+
+    Ok(HstsSettings {
+        enabled,
+        max_age_seconds,
+        include_subdomains,
+        preload,
+    })
 }
 
 fn parse_rate_limit(
@@ -560,6 +672,9 @@ mod tests {
                 "JWT_SECRET".into(),
                 "production-test-secret-at-least-32-characters".into(),
             ),
+            // Production rejects plaintext origins, so a valid production
+            // fixture has to carry an https one.
+            ("CORS_ORIGINS".into(), "https://app.example.com".into()),
         ])
     }
 
@@ -680,16 +795,8 @@ mod tests {
             Config::from_map(HashMap::from([("APP_OPEN_BROWSER".into(), "true".into())])).unwrap();
         assert!(development.open_browser);
 
-        let production = HashMap::from([
-            ("APP_ENV".into(), "production".into()),
-            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
-            ("REDIS_URL".into(), TEST_REDIS_URL.into()),
-            (
-                "JWT_SECRET".into(),
-                "production-test-secret-at-least-32-characters".into(),
-            ),
-            ("APP_OPEN_BROWSER".into(), "true".into()),
-        ]);
+        let mut production = production_base();
+        production.insert("APP_OPEN_BROWSER".into(), "true".into());
         assert!(matches!(
             Config::from_map(production),
             Err(ConfigError::Validation(message)) if message.contains("APP_OPEN_BROWSER")
@@ -709,16 +816,7 @@ mod tests {
 
     #[test]
     fn production_binds_all_interfaces_by_default() {
-        let values = HashMap::from([
-            ("APP_ENV".into(), "production".into()),
-            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
-            ("REDIS_URL".into(), TEST_REDIS_URL.into()),
-            (
-                "JWT_SECRET".into(),
-                "production-test-secret-at-least-32-characters".into(),
-            ),
-        ]);
-        let config = Config::from_map(values).unwrap();
+        let config = Config::from_map(production_base()).unwrap();
         assert_eq!(config.app_host, "0.0.0.0");
 
         let development = Config::from_map(HashMap::new()).unwrap();
@@ -772,16 +870,118 @@ mod tests {
     }
 
     #[test]
+    fn hsts_defaults_follow_the_environment() {
+        let development = Config::from_map(HashMap::new()).unwrap();
+        assert!(!development.hsts.enabled);
+        assert_eq!(development.https_enforcement, HttpsEnforcement::Off);
+
+        let production = Config::from_map(production_base()).unwrap();
+        assert!(production.hsts.enabled);
+        assert!(production.hsts.include_subdomains);
+        assert!(!production.hsts.preload);
+        assert_eq!(
+            production.hsts.header_value(),
+            "max-age=31536000; includeSubDomains"
+        );
+        assert_eq!(production.https_enforcement, HttpsEnforcement::ProxyHeader);
+    }
+
+    #[test]
+    fn hsts_preload_requires_the_preload_list_rules() {
+        let mut without_subdomains = production_base();
+        without_subdomains.insert("HSTS_PRELOAD".into(), "true".into());
+        without_subdomains.insert("HSTS_INCLUDE_SUBDOMAINS".into(), "false".into());
+        assert!(matches!(
+            Config::from_map(without_subdomains),
+            Err(ConfigError::Validation(message)) if message.contains("HSTS_PRELOAD")
+        ));
+
+        let mut short_max_age = production_base();
+        short_max_age.insert("HSTS_PRELOAD".into(), "true".into());
+        short_max_age.insert("HSTS_MAX_AGE_SECONDS".into(), "3600".into());
+        assert!(matches!(
+            Config::from_map(short_max_age),
+            Err(ConfigError::Validation(message)) if message.contains("HSTS_PRELOAD")
+        ));
+
+        let mut disabled = production_base();
+        disabled.insert("HSTS_PRELOAD".into(), "true".into());
+        disabled.insert("HSTS_ENABLED".into(), "false".into());
+        assert!(matches!(
+            Config::from_map(disabled),
+            Err(ConfigError::Validation(message)) if message.contains("HSTS_ENABLED")
+        ));
+
+        let mut valid = production_base();
+        valid.insert("HSTS_PRELOAD".into(), "true".into());
+        valid.insert("HSTS_MAX_AGE_SECONDS".into(), "63072000".into());
+        let config = Config::from_map(valid).unwrap();
+        assert_eq!(
+            config.hsts.header_value(),
+            "max-age=63072000; includeSubDomains; preload"
+        );
+    }
+
+    // max-age=0 is the only way to release browsers that already cached a
+    // policy, so it must stay expressible.
+    #[test]
+    fn hsts_max_age_can_be_zeroed_to_release_browsers() {
+        let mut values = production_base();
+        values.insert("HSTS_MAX_AGE_SECONDS".into(), "0".into());
+        let config = Config::from_map(values).unwrap();
+        assert_eq!(config.hsts.header_value(), "max-age=0; includeSubDomains");
+    }
+
+    #[test]
+    fn production_rejects_plaintext_cors_origins() {
+        let mut values = production_base();
+        values.insert("CORS_ORIGINS".into(), "http://app.example.com".into());
+        assert!(matches!(
+            Config::from_map(values),
+            Err(ConfigError::Invalid("CORS_ORIGINS", message)) if message.contains("https")
+        ));
+
+        // Mixed lists are rejected on the offending entry, not silently
+        // accepted because a valid origin appears first.
+        let mut mixed = production_base();
+        mixed.insert(
+            "CORS_ORIGINS".into(),
+            "https://app.example.com,http://staging.example.com".into(),
+        );
+        assert!(matches!(
+            Config::from_map(mixed),
+            Err(ConfigError::Invalid("CORS_ORIGINS", _))
+        ));
+
+        // Outside production a plaintext origin is how local development runs.
+        let development = Config::from_map(HashMap::from([(
+            "CORS_ORIGINS".into(),
+            "http://localhost:5173".into(),
+        )]))
+        .unwrap();
+        assert_eq!(development.cors_origins, vec!["http://localhost:5173"]);
+    }
+
+    #[test]
+    fn https_enforcement_rejects_unknown_modes() {
+        let mut values = production_base();
+        values.insert("HTTPS_ENFORCEMENT".into(), "maybe".into());
+        assert!(matches!(
+            Config::from_map(values),
+            Err(ConfigError::Invalid("HTTPS_ENFORCEMENT", _))
+        ));
+
+        let mut off = production_base();
+        off.insert("HTTPS_ENFORCEMENT".into(), "off".into());
+        assert_eq!(
+            Config::from_map(off).unwrap().https_enforcement,
+            HttpsEnforcement::Off
+        );
+    }
+
+    #[test]
     fn production_security_controls_cannot_be_disabled() {
-        let base = HashMap::from([
-            ("APP_ENV".into(), "production".into()),
-            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
-            ("REDIS_URL".into(), TEST_REDIS_URL.into()),
-            (
-                "JWT_SECRET".into(),
-                "production-test-secret-at-least-32-characters".into(),
-            ),
-        ]);
+        let base = production_base();
 
         let mut insecure_cookie = base.clone();
         insecure_cookie.insert("REFRESH_COOKIE_SECURE".into(), "false".into());

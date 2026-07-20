@@ -1,4 +1,5 @@
 use crate::{
+    config::HttpsEnforcement,
     error::AppError,
     handlers::{auth, basic, cache, demo, jobs, permissions},
     rate_limit::{self, RateLimitPolicy},
@@ -9,7 +10,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::{
         header::{self, HeaderName},
-        HeaderMap, HeaderValue, Method, Request,
+        HeaderMap, HeaderValue, Method, Request, StatusCode,
     },
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -28,7 +29,10 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Clone)]
 struct SecurityHeaders {
-    hsts: bool,
+    /// Prebuilt `Strict-Transport-Security` value, or `None` when the header
+    /// is switched off. Built once at startup so the per-response path stays
+    /// a header clone rather than a format.
+    hsts: Option<HeaderValue>,
 }
 
 pub fn app(state: AppState) -> Router {
@@ -36,9 +40,14 @@ pub fn app(state: AppState) -> Router {
     let cors = cors_layer(&state);
     let body_limit = state.config.body_limit_bytes;
     let request_timeout = Duration::from_secs(state.config.request_timeout_seconds);
+    let hsts = &state.config.hsts;
     let security_headers = SecurityHeaders {
-        hsts: state.config.environment.is_production(),
+        hsts: hsts.enabled.then(|| {
+            HeaderValue::try_from(hsts.header_value())
+                .expect("HSTS directives are built from digits and ASCII keywords")
+        }),
     };
+    let https_enforcement = state.config.https_enforcement;
     let auth_rate_limit = RateLimitPolicy::new(&state, "auth", state.config.rate_limit.auth);
     let api_rate_limit = RateLimitPolicy::new(&state, "api", state.config.rate_limit.api);
 
@@ -135,6 +144,12 @@ pub fn app(state: AppState) -> Router {
             security_headers,
             apply_security_headers,
         ))
+        // Outermost: a plaintext request is turned away before it reaches
+        // routing, rate limiting, or body reading.
+        .layer(middleware::from_fn_with_state(
+            https_enforcement,
+            enforce_https,
+        ))
 }
 
 /// Bounds end-to-end request processing. Axum reads the body inside handler
@@ -199,11 +214,87 @@ async fn apply_security_headers(
         insert_header(headers, "cache-control", "no-store, max-age=0");
         insert_header(headers, "pragma", "no-cache");
     }
-    if settings.hsts {
-        insert_header(headers, "strict-transport-security", "max-age=31536000");
+    if let Some(hsts) = &settings.hsts {
+        headers.insert(
+            HeaderName::from_static("strict-transport-security"),
+            hsts.clone(),
+        );
     }
 
     response
+}
+
+/// Turns away requests the proxy in front of the app marked as plaintext.
+///
+/// This closes the case where a browser is talking to the deployment over
+/// http — credentials in a request body, a refresh cookie replayed without
+/// `Secure` taking effect. It does not, and cannot, defend against an attacker
+/// who reaches the container directly: such a request either omits
+/// `x-forwarded-proto` or forges it, which is why the deployment contract puts
+/// a trusted proxy in front. That proxy must overwrite the header on every
+/// request rather than pass a client-supplied one through.
+async fn enforce_https(
+    State(enforcement): State<HttpsEnforcement>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if enforcement == HttpsEnforcement::Off {
+        return next.run(request).await;
+    }
+    let forwarded_proto = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        // A proxy may forward a comma-separated chain; the first entry is the
+        // scheme the original client used.
+        .and_then(|value| value.split(',').next())
+        .map(str::trim);
+
+    match forwarded_proto {
+        Some(proto) if proto.eq_ignore_ascii_case("https") => next.run(request).await,
+        // No proxy spoke for this request, so there is nothing to enforce
+        // against. Failing closed here would take the deployment down the
+        // moment a platform health check bypassed the proxy, and would buy
+        // nothing: a request that reaches the app directly can set the header
+        // to whatever it likes.
+        None => next.run(request).await,
+        Some(_) => plaintext_response(&request),
+    }
+}
+
+fn plaintext_response(request: &Request<Body>) -> Response {
+    // Safe methods are redirected so a person who typed the http URL lands on
+    // the right page. Everything else is refused outright: replaying a POST at
+    // a new location would resend a body that has already been exposed.
+    if request.method() == Method::GET || request.method() == Method::HEAD {
+        if let Some(redirect) = https_redirect(request) {
+            return redirect;
+        }
+    }
+    AppError::HttpsRequired.into_response()
+}
+
+fn https_redirect(request: &Request<Body>) -> Option<Response> {
+    let host = request.headers().get(header::HOST)?.to_str().ok()?;
+    // The Host header is client-controlled. Anything that could add a second
+    // URL component (and so retarget the redirect) disqualifies it; a caller
+    // that forges its own Host only ever redirects itself, but the value must
+    // not be able to smuggle a path or userinfo into `Location`.
+    if host.is_empty() || !host.is_ascii() || host.contains(['/', '\\', '@', '?', '#']) {
+        return None;
+    }
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map_or("/", |target| target.as_str());
+    let location = HeaderValue::try_from(format!("https://{host}{path_and_query}")).ok()?;
+    Some(
+        (
+            StatusCode::PERMANENT_REDIRECT,
+            [(header::LOCATION, location)],
+        )
+            .into_response(),
+    )
 }
 
 fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &'static str) {
@@ -321,6 +412,28 @@ mod tests {
         test_app_with_trace_store(config, TraceStore::default())
     }
 
+    /// A minimal valid production environment. Production refuses plaintext
+    /// CORS origins, so the https one is part of what makes it valid.
+    fn production_values() -> HashMap<String, String> {
+        HashMap::from([
+            ("APP_ENV".into(), "production".into()),
+            (
+                "DATABASE_URL".into(),
+                "postgres://luxor:luxor@localhost/luxor".into(),
+            ),
+            ("REDIS_URL".into(), "redis://localhost:6379/".into()),
+            (
+                "JWT_SECRET".into(),
+                "production-test-secret-at-least-32-characters".into(),
+            ),
+            ("CORS_ORIGINS".into(), "https://app.example.com".into()),
+        ])
+    }
+
+    fn production_config() -> Config {
+        Config::from_map(production_values()).unwrap()
+    }
+
     fn test_app_with_trace_store(config: Config, trace_store: TraceStore) -> Router {
         let config = Arc::new(config);
         let pool = db::connect_lazy("postgres://luxor:luxor@localhost/luxor").unwrap();
@@ -412,20 +525,7 @@ mod tests {
             .headers()
             .contains_key("strict-transport-security"));
 
-        let production_config = Config::from_map(HashMap::from([
-            ("APP_ENV".into(), "production".into()),
-            (
-                "DATABASE_URL".into(),
-                "postgres://luxor:luxor@localhost/luxor".into(),
-            ),
-            ("REDIS_URL".into(), "redis://localhost:6379/".into()),
-            (
-                "JWT_SECRET".into(),
-                "production-test-secret-at-least-32-characters".into(),
-            ),
-        ]))
-        .unwrap();
-        let production = test_app_with_config(production_config)
+        let production = test_app_with_config(production_config())
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -434,8 +534,143 @@ mod tests {
                 .headers()
                 .get("strict-transport-security")
                 .unwrap(),
-            "max-age=31536000"
+            "max-age=31536000; includeSubDomains"
         );
+    }
+
+    #[tokio::test]
+    async fn hsts_directives_follow_configuration() {
+        let mut values = production_values();
+        values.insert("HSTS_MAX_AGE_SECONDS".into(), "63072000".into());
+        values.insert("HSTS_PRELOAD".into(), "true".into());
+        let response = test_app_with_config(Config::from_map(values).unwrap())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get("strict-transport-security").unwrap(),
+            "max-age=63072000; includeSubDomains; preload"
+        );
+
+        // Turning the header off is what lets an operator release browsers
+        // that already cached a policy (paired with max-age=0 beforehand).
+        let mut disabled = production_values();
+        disabled.insert("HSTS_ENABLED".into(), "false".into());
+        let response = test_app_with_config(Config::from_map(disabled).unwrap())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(!response.headers().contains_key("strict-transport-security"));
+    }
+
+    #[tokio::test]
+    async fn https_enforcement_turns_away_proxied_plaintext() {
+        let app = test_app_with_config(production_config());
+
+        // A safe method is redirected to the same target over https.
+        let redirected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health?probe=1")
+                    .header("x-forwarded-proto", "http")
+                    .header(header::HOST, "app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(redirected.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            redirected.headers().get(header::LOCATION).unwrap(),
+            "https://app.example.com/api/health?probe=1"
+        );
+
+        // A credential-bearing method is refused outright rather than
+        // redirected: the body has already crossed the wire in the clear.
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("x-forwarded-proto", "http")
+                    .header(header::HOST, "app.example.com")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"email":"a@b.com","password":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert!(body_text(refused)
+            .await
+            .contains(r#""code":"https_required""#));
+
+        // A Host that could retarget the redirect is refused instead.
+        let hostile_host = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header("x-forwarded-proto", "http")
+                    .header(header::HOST, "app.example.com/@evil.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hostile_host.status(), StatusCode::FORBIDDEN);
+        assert!(!hostile_host.headers().contains_key(header::LOCATION));
+    }
+
+    #[tokio::test]
+    async fn https_enforcement_admits_tls_and_unproxied_requests() {
+        let app = test_app_with_config(production_config());
+
+        for proto in ["https", "https,http"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/health")
+                        .header("x-forwarded-proto", proto)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "proto {proto:?}");
+        }
+
+        // No proxy spoke for this request, so there is nothing to enforce
+        // against; failing closed here would break platform health checks
+        // that bypass the proxy without buying any protection.
+        let unproxied = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unproxied.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn https_enforcement_is_off_outside_production() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header("x-forwarded-proto", "http")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -904,20 +1139,7 @@ mod tests {
             r#"{"database":"embedded-postgresql","cache":"memory","queue":"memory"}"#
         );
 
-        let production_config = Config::from_map(HashMap::from([
-            ("APP_ENV".into(), "production".into()),
-            (
-                "DATABASE_URL".into(),
-                "postgres://luxor:luxor@localhost/luxor".into(),
-            ),
-            ("REDIS_URL".into(), "redis://localhost:6379/".into()),
-            (
-                "JWT_SECRET".into(),
-                "production-test-secret-at-least-32-characters".into(),
-            ),
-        ]))
-        .unwrap();
-        let production = test_app_with_config(production_config)
+        let production = test_app_with_config(production_config())
             .oneshot(
                 Request::builder()
                     .uri("/api/runtime")

@@ -21,6 +21,10 @@ use std::{collections::HashMap, env, sync::Arc, time::Duration};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+/// Scores 4/4 with the account email as context, so the fixture does not sit
+/// one zxcvbn dictionary update away from failing registration.
+const INTEGRATION_PASSWORD: &str = "integration-tsunami-cobalt-4417";
+
 #[tokio::test]
 async fn migrations_and_authentication_flow_work_against_postgres() {
     let Some(database_url) = env::var("DATABASE_URL").ok() else {
@@ -56,7 +60,9 @@ async fn migrations_and_authentication_flow_work_against_postgres() {
         TraceStore::default(),
     ));
     let email = format!("integration-{}@example.com", Uuid::new_v4());
-    let credentials = json!({"email": email, "password": "integration-password"});
+    // Registration enforces a zxcvbn strength floor, so the fixture has to be
+    // a password a real account could use.
+    let credentials = json!({"email": email, "password": INTEGRATION_PASSWORD});
 
     let registration = request_json(&app, "/api/auth/register", &credentials, None).await;
     assert_eq!(registration.status(), StatusCode::CREATED);
@@ -86,7 +92,7 @@ async fn migrations_and_authentication_flow_work_against_postgres() {
     // records while an admin can.
     let admin_email = format!("integration-admin-{}@example.com", Uuid::new_v4());
     let admin_credentials =
-        json!({"email": admin_email, "password": "integration-password", "role": "admin"});
+        json!({"email": admin_email, "password": INTEGRATION_PASSWORD, "role": "admin"});
     let admin_registration =
         request_json(&app, "/api/auth/register", &admin_credentials, None).await;
     assert_eq!(admin_registration.status(), StatusCode::CREATED);

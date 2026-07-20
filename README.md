@@ -69,6 +69,10 @@ Every `/api` route is rate limited per client IP inside a fixed window, and the 
 
 Registration and login accept `{"email":"...","password":"..."}`; registration additionally accepts an optional `"role"` of `"admin"` or `"user"` (the default). They return a short-lived access token in JSON and set an opaque refresh token as an HTTP-only, `SameSite=Strict` cookie. Production cookies are `Secure`. The browser demo keeps the access token in a JavaScript variable only—never local or session storage—and sends the refresh cookie only to `/api/auth`.
 
+Passwords travel as plaintext inside the TLS-protected request body — hashing in the browser would only make the hash the password — and are held server-side in a `SecretString` that zeroizes on drop. Neither credential request type derives `Debug`, so there is no way to format a password into a log line, a span field, or a Sentry event. Registration requires 12 to 1024 characters *and* a zxcvbn score of at least 3, with the account's own email supplied as context: `mike@northwind.com` cannot choose `Northwind2026!`, which scores full marks on shape alone because "northwind" is in no dictionary. Only the first 128 bytes are scored, since zxcvbn's matchers are superlinear and the input is attacker-controlled. Login deliberately does not re-check strength, so tightening the policy never locks an existing account out.
+
+Stored hashes are Argon2id at pinned parameters (19 MiB, t=2, p=1 — OWASP's second recommended configuration) with a per-password random salt, written as PHC strings. Pinning them here rather than taking `Argon2::default()` means a crate upgrade cannot move the cost unnoticed. Verification reads algorithm, version, and cost from each stored hash, so raising the pinned values keeps old hashes working; the next successful login for such an account transparently re-hashes it at the new cost and writes it back, best-effort, so an upgrade reaches existing users and not only new ones. A hash already stronger than the pinned values is left alone rather than downgraded.
+
 Refresh tokens are SHA-256 hashed in PostgreSQL and rotate on every use. Reusing a rotated token revokes its entire token family, and a family can never be renewed past `REFRESH_FAMILY_TTL_SECONDS` after the login that created it, so a stolen cookie cannot be kept alive forever. Logout revokes refresh state; already-issued stateless access JWTs remain usable until their intentionally short expiry. Login responds identically — in status and in timing — whether the email is unknown or the password is wrong, so accounts cannot be enumerated. A background task prunes sessions once their whole rotation family has expired (revoked rows are kept until then, because they are what lets rotation detect a replayed stolen token).
 
 ## Roles and permissions
@@ -94,7 +98,12 @@ What a role may do is defined by a fixed role-permission matrix that is part of 
 | `REFRESH_TOKEN_TTL_SECONDS` | `2592000` | Must exceed the access lifetime |
 | `REFRESH_FAMILY_TTL_SECONDS` | `7776000` | Absolute cap on refresh rotation (90 days); must be at least the refresh token lifetime |
 | `REFRESH_COOKIE_SECURE` | true only in production | Keep true behind production HTTPS |
-| `CORS_ORIGINS` | `http://localhost:8080` | Comma-separated exact origins; credentials are enabled |
+| `CORS_ORIGINS` | `http://localhost:8080` | Comma-separated exact origins; credentials are enabled. Must all be `https` in production |
+| `HSTS_ENABLED` | true only in production | Send `Strict-Transport-Security` |
+| `HSTS_MAX_AGE_SECONDS` | `31536000` | `0` releases browsers that cached a policy |
+| `HSTS_INCLUDE_SUBDOMAINS` | `true` | Adds `includeSubDomains` |
+| `HSTS_PRELOAD` | `false` | Adds `preload`; requires `includeSubDomains` and a max-age of at least one year |
+| `HTTPS_ENFORCEMENT` | `proxy-header` in production, else `off` | `off` or `proxy-header`; the latter turns away requests `x-forwarded-proto` marks as plaintext |
 | `BODY_LIMIT_BYTES` | `1048576` | JSON body limit |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | End-to-end deadline per request, including body reads |
 | `RATE_LIMIT_ENABLED` | `true` | Cannot be disabled in production |
@@ -231,7 +240,8 @@ The reference `DATABASE_URL`/`REDIS_URL` values above use Railway's private netw
 - Set `APP_ENV=production`, `AUTO_MIGRATE=false`, `REFRESH_COOKIE_SECURE=true`, and exact HTTPS CORS origins.
 - Run migrations as an explicit release step before shifting traffic.
 - Use managed PostgreSQL/Redis with TLS, authentication, backups, and least-privilege network rules.
-- Terminate HTTPS at a trusted proxy and preserve or generate `x-request-id`.
+- Terminate HTTPS at a trusted proxy and preserve or generate `x-request-id`. Production then defaults to `HTTPS_ENFORCEMENT=proxy-header`, which redirects plaintext `GET`/`HEAD` to https and refuses every other plaintext method with `403 https_required`. It reads `x-forwarded-proto`, so the proxy must overwrite that header on every request instead of passing a client-supplied one through; a request that arrives without it is allowed, because failing closed would break health checks that bypass the proxy while buying nothing against a caller who can reach the container directly. Network rules, not this check, are what keep that caller out.
+- Production also refuses to start with a plaintext `CORS_ORIGINS` entry, and sends `Strict-Transport-Security: max-age=31536000; includeSubDomains`. Enable `HSTS_PRELOAD` only deliberately: preload-list submission is close to irreversible, and the config rejects the flag unless it also meets the list's own `includeSubDomains` and one-year max-age rules.
 - Review the rate-limit budgets for your traffic shape; production runs with `x-forwarded-for` client identification by default, which is only safe behind the platform proxy.
 - Set resource limits, health probes, alerting, retention, and sampling for logs/traces/errors.
 - Plan JWT-secret rotation, database restore tests, and queue dead-letter handling (expired refresh sessions are pruned automatically).

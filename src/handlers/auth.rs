@@ -9,22 +9,29 @@ use crate::{
 use axum::{extract::State, http::StatusCode, Json};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::Utc;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use time::Duration;
 
 const REFRESH_COOKIE: &str = "luxor_refresh";
 const REFRESH_COOKIE_PATH: &str = "/api/auth";
 
+// Neither request derives `Debug`: without it there is no way to format a
+// submitted password into a log line, a span field, or a Sentry event. The
+// `SecretString` fields add zeroize-on-drop on top, so the plaintext does not
+// outlive the request in recycled heap memory. Note that serde still builds a
+// plain `String` before handing it over, so this narrows the window rather
+// than closing it.
 #[derive(Deserialize)]
 pub struct CredentialsRequest {
     email: String,
-    password: String,
+    password: SecretString,
 }
 
 #[derive(Deserialize)]
 pub struct RegisterRequest {
     email: String,
-    password: String,
+    password: SecretString,
     /// The account's role, fixed at registration; omitted means a regular
     /// user.
     #[serde(default)]
