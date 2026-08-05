@@ -1608,6 +1608,7 @@ dependencies = [
  "postgresql_embedded",
  "rand 0.8.6",
  "redis",
+ "rustls",
  "secrecy",
  "sentry",
  "serde",

@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use luxor::{
     cache::{Cache, MemoryCache, RedisCache},
     config::Config,
@@ -16,6 +16,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+    install_crypto_provider()?;
 
     if let Some(command) = std::env::args().nth(1) {
         return match command.as_str() {
@@ -25,6 +26,21 @@ async fn main() -> Result<()> {
     }
 
     serve().await
+}
+
+/// Settles which rustls crypto provider the process uses, before any TLS
+/// configuration can be built for the database, Sentry, or the archive
+/// download.
+///
+/// The two build profiles do not enable the same set: the production image
+/// (`--no-default-features`) compiles ring alone, while a development build
+/// also pulls in aws-lc-rs through postgresql_embedded. rustls panics rather
+/// than pick between two enabled providers, so leaving the choice implicit
+/// would mean code that works in the image and fails under `cargo run`.
+fn install_crypto_provider() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow!("a rustls crypto provider was installed before startup"))
 }
 
 /// Applies the embedded migrations and exits. Deployment platforms run this as

@@ -308,24 +308,10 @@ pub async fn run_connection(
 
     loop {
         tokio::select! {
-            event = events.recv() => match event {
-                Ok(event) => {
-                    if send_event(&mut socket, &event).await.is_err() {
-                        break;
-                    }
+            event = events.recv() => {
+                if forward_event(&mut socket, &hub, event).await.is_err() {
+                    break;
                 }
-                // The client is slower than the stream. Telling it how much it
-                // missed is more useful than a silently truncated history.
-                Err(broadcast::error::RecvError::Lagged(missed)) => {
-                    let notice = hub.envelope(EventPayload::Notice {
-                        code: "lagged",
-                        detail: format!("{missed} events were dropped because this connection fell behind"),
-                    });
-                    if send_event(&mut socket, &notice).await.is_err() {
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
             },
             incoming = socket.recv() => {
                 let Some(Ok(message)) = incoming else { break };
@@ -340,8 +326,7 @@ pub async fn run_connection(
                         match payload {
                             Outcome::Broadcast(payload) => { hub.publish(payload); }
                             Outcome::Notice(payload) => {
-                                let notice = hub.envelope(payload);
-                                if send_event(&mut socket, &notice).await.is_err() {
+                                if send_directly(&mut socket, &hub, &mut events, payload).await.is_err() {
                                     break;
                                 }
                             }
@@ -349,11 +334,11 @@ pub async fn run_connection(
                     }
                     Message::Close(_) => break,
                     Message::Binary(_) => {
-                        let notice = hub.envelope(EventPayload::Notice {
+                        let notice = EventPayload::Notice {
                             code: "unsupported_frame",
                             detail: "this endpoint speaks JSON text frames".into(),
-                        });
-                        if send_event(&mut socket, &notice).await.is_err() {
+                        };
+                        if send_directly(&mut socket, &hub, &mut events, notice).await.is_err() {
                             break;
                         }
                     }
@@ -374,8 +359,8 @@ pub async fn run_connection(
                     break;
                 }
                 tick_sequence += 1;
-                let tick = hub.envelope(EventPayload::Tick { sequence: tick_sequence });
-                if send_event(&mut socket, &tick).await.is_err() {
+                let tick = EventPayload::Tick { sequence: tick_sequence };
+                if send_directly(&mut socket, &hub, &mut events, tick).await.is_err() {
                     break;
                 }
                 if socket.send(Message::Ping(Bytes::new())).await.is_err() {
@@ -400,6 +385,59 @@ pub async fn run_connection(
             reason: "connection closed".into(),
         })))
         .await;
+}
+
+/// Writes one event from this connection's subscription, or reports that the
+/// connection is finished.
+async fn forward_event(
+    socket: &mut WebSocket,
+    hub: &RealtimeHub,
+    received: Result<ServerEvent, broadcast::error::RecvError>,
+) -> Result<(), ()> {
+    match received {
+        Ok(event) => send_event(socket, &event).await,
+        // The client is slower than the stream. Telling it how much it missed
+        // is more useful than a silently truncated history.
+        Err(broadcast::error::RecvError::Lagged(missed)) => {
+            let notice = hub.envelope(EventPayload::Notice {
+                code: "lagged",
+                detail: format!(
+                    "{missed} events were dropped because this connection fell behind"
+                ),
+            });
+            send_event(socket, &notice).await
+        }
+        Err(broadcast::error::RecvError::Closed) => Err(()),
+    }
+}
+
+/// Sends an event to this connection alone, behind everything already fanned
+/// out to it.
+///
+/// Publishing is synchronous, so a broadcast this connection has just accepted
+/// is already sitting in its own subscription — but that subscription is
+/// drained by another branch of the loop. Writing the socket straight from
+/// here would let a notice arrive ahead of the very messages it is a verdict
+/// on, so the pending fan-out goes out first.
+async fn send_directly(
+    socket: &mut WebSocket,
+    hub: &RealtimeHub,
+    events: &mut broadcast::Receiver<ServerEvent>,
+    payload: EventPayload,
+) -> Result<(), ()> {
+    loop {
+        let received = match events.try_recv() {
+            Ok(event) => Ok(event),
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(missed)) => {
+                Err(broadcast::error::RecvError::Lagged(missed))
+            }
+            Err(broadcast::error::TryRecvError::Closed) => Err(broadcast::error::RecvError::Closed),
+        };
+        forward_event(socket, hub, received).await?;
+    }
+    let event = hub.envelope(payload);
+    send_event(socket, &event).await
 }
 
 /// Where an accepted command goes: to everyone, or back to its sender.
