@@ -401,9 +401,7 @@ async fn forward_event(
         Err(broadcast::error::RecvError::Lagged(missed)) => {
             let notice = hub.envelope(EventPayload::Notice {
                 code: "lagged",
-                detail: format!(
-                    "{missed} events were dropped because this connection fell behind"
-                ),
+                detail: format!("{missed} events were dropped because this connection fell behind"),
             });
             send_event(socket, &notice).await
         }
