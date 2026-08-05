@@ -277,6 +277,49 @@ button.danger { color: #933a29; }
 .trace-bar.error { background: #933a29; }
 .trace-duration { color: #6d6b65; font: 650 0.72rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
 
+.realtime-feed {
+  display: grid;
+  gap: 0.3rem;
+  max-height: 15rem;
+  margin: 1.1rem 0 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.realtime-feed:empty { display: none; }
+
+.realtime-feed li {
+  display: grid;
+  grid-template-columns: 5.4rem minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 0.65rem;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid #d8d2c4;
+  border-radius: 0.45rem;
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.feed-kind {
+  padding: 0.2rem 0.35rem;
+  border-radius: 0.25rem;
+  background: #ded9ce;
+  color: #6a6862;
+  font-size: 0.6rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.feed-kind.welcome, .feed-kind.presence { color: #285f3a; background: #d7e6da; }
+.feed-kind.message { color: #7f482e; background: #edddd3; }
+.feed-kind.notice { color: #933a29; background: #edd6cd; }
+.feed-kind.tick { opacity: 0.65; }
+
+.realtime-feed .feed-text { overflow-wrap: anywhere; font-size: 0.82rem; line-height: 1.45; }
+.realtime-feed time { color: #8a867e; font: 650 0.68rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
 .inline-form { grid-template-columns: minmax(12rem, 1fr) auto; align-items: end; }
 .activity { position: fixed; right: 0; bottom: 0; left: 0; z-index: 10; display: grid; grid-template-columns: 10rem minmax(0, 1fr); width: min(100% - 2rem, 76rem); gap: 2rem; max-height: 40dvh; margin: 0 auto; overflow: hidden; background: #273129; color: #f2eee3; border-color: #273129; }
 .activity .eyebrow { color: #df9672; }
@@ -316,4 +359,6 @@ html::-webkit-scrollbar-thumb:hover, .activity pre::-webkit-scrollbar-thumb:hove
   .activity { gap: 0.75rem; max-height: 45dvh; }
   .activity pre { min-height: 3.5rem; max-height: calc(45dvh - 7rem); }
   .trace-row { grid-template-columns: minmax(6rem, 8rem) 1fr 3.6rem; }
+  .realtime-feed li { grid-template-columns: 4.6rem minmax(0, 1fr); }
+  .realtime-feed time { grid-column: 2; }
 }

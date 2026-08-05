@@ -84,6 +84,19 @@ pub struct RateLimitSettings {
     pub api: RateLimitQuota,
 }
 
+/// Bounds on the realtime WebSocket demo. Connections are long-lived, so the
+/// count is a resource limit per instance rather than a rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RealtimeSettings {
+    /// Sockets this instance serves at once; further handshakes are refused
+    /// with `503` until one closes.
+    pub max_connections: usize,
+    /// Lifetime of the single-use ticket that authorizes one handshake. It
+    /// only has to cover the round trip from issuing the ticket to opening the
+    /// socket, so it is deliberately short.
+    pub ticket_ttl_seconds: u64,
+}
+
 /// How the app decides a request reached it over TLS. TLS is terminated by
 /// the platform proxy, never in-process, so the only available signal is what
 /// that proxy reports.
@@ -179,6 +192,7 @@ pub struct Config {
     pub body_limit_bytes: usize,
     pub request_timeout_seconds: u64,
     pub rate_limit: RateLimitSettings,
+    pub realtime: RealtimeSettings,
     pub auto_migrate: bool,
     pub open_browser: bool,
     pub otlp_endpoint: Option<String>,
@@ -287,6 +301,7 @@ impl Config {
             ));
         }
         let rate_limit = parse_rate_limit(&values, production)?;
+        let realtime = parse_realtime(&values)?;
         let hsts = parse_hsts(&values, production)?;
         // Production sits behind a platform proxy that terminates TLS and
         // reports the original scheme; local development is reached directly
@@ -352,6 +367,7 @@ impl Config {
             body_limit_bytes,
             request_timeout_seconds,
             rate_limit,
+            realtime,
             auto_migrate,
             open_browser,
             otlp_endpoint,
@@ -560,6 +576,30 @@ fn parse_rate_limit(
     })
 }
 
+/// The upper bound on the ticket lifetime is a security setting, not a
+/// preference: a connection ticket is a bearer credential that travels in a
+/// URL, so it must expire long before anything could replay it from a log.
+const MAX_REALTIME_TICKET_TTL_SECONDS: u64 = 300;
+
+fn parse_realtime(values: &HashMap<String, String>) -> Result<RealtimeSettings, ConfigError> {
+    let max_connections = parse(values, "REALTIME_MAX_CONNECTIONS", 100_usize)?;
+    if max_connections == 0 {
+        return Err(ConfigError::Validation(
+            "REALTIME_MAX_CONNECTIONS must be greater than zero".into(),
+        ));
+    }
+    let ticket_ttl_seconds = parse(values, "REALTIME_TICKET_TTL_SECONDS", 30_u64)?;
+    if !(1..=MAX_REALTIME_TICKET_TTL_SECONDS).contains(&ticket_ttl_seconds) {
+        return Err(ConfigError::Validation(format!(
+            "REALTIME_TICKET_TTL_SECONDS must be between 1 and {MAX_REALTIME_TICKET_TTL_SECONDS} seconds"
+        )));
+    }
+    Ok(RealtimeSettings {
+        max_connections,
+        ticket_ttl_seconds,
+    })
+}
+
 fn parse_quota(
     values: &HashMap<String, String>,
     (max_key, default_max): (&'static str, u32),
@@ -735,6 +775,40 @@ mod tests {
             Config::from_map(oversized_window),
             Err(ConfigError::Validation(message))
                 if message.contains("RATE_LIMIT_API_WINDOW_SECONDS")
+        ));
+    }
+
+    #[test]
+    fn realtime_limits_are_validated() {
+        let defaults = Config::from_map(HashMap::new()).unwrap().realtime;
+        assert_eq!(defaults.max_connections, 100);
+        assert_eq!(defaults.ticket_ttl_seconds, 30);
+
+        let configured = Config::from_map(HashMap::from([
+            ("REALTIME_MAX_CONNECTIONS".into(), "2500".into()),
+            ("REALTIME_TICKET_TTL_SECONDS".into(), "10".into()),
+        ]))
+        .unwrap()
+        .realtime;
+        assert_eq!(configured.max_connections, 2_500);
+        assert_eq!(configured.ticket_ttl_seconds, 10);
+
+        // Zero connections would advertise an endpoint that always answers 503.
+        let no_connections = HashMap::from([("REALTIME_MAX_CONNECTIONS".into(), "0".into())]);
+        assert!(matches!(
+            Config::from_map(no_connections),
+            Err(ConfigError::Validation(message))
+                if message.contains("REALTIME_MAX_CONNECTIONS")
+        ));
+
+        // A connection ticket travels in a URL, so a long-lived one is a
+        // configuration mistake rather than a preference.
+        let long_lived_ticket =
+            HashMap::from([("REALTIME_TICKET_TTL_SECONDS".into(), "3600".into())]);
+        assert!(matches!(
+            Config::from_map(long_lived_ticket),
+            Err(ConfigError::Validation(message))
+                if message.contains("REALTIME_TICKET_TTL_SECONDS")
         ));
     }
 

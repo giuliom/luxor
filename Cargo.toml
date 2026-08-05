@@ -8,7 +8,7 @@ rust-version = "1.85"
 anyhow = "1.0.100"
 argon2 = "0.5.3"
 async-trait = "0.1.89"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 axum-extra = { version = "0.10.3", features = ["cookie"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.42", features = ["serde"] }
@@ -39,9 +39,13 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 zxcvbn = { version = "3.1.1", default-features = false }
 
 [dev-dependencies]
+futures-util = { version = "0.3.31", default-features = false }
 http-body-util = "0.1.3"
 # test-util (paused-clock tests) stays out of release binaries.
 tokio = { version = "1.48.0", features = ["full", "test-util"] }
+# A WebSocket client for the end-to-end realtime test. Plain ws:// only, so
+# the TLS features stay off; the version tracks the one axum's ws feature uses.
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake"] }
 
 # The embedded development PostgreSQL server keeps local runs free of Docker.
 # Production images build with --no-default-features; their configuration

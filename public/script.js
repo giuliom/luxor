@@ -56,6 +56,10 @@ function setIdentity(user) {
     badge.classList.toggle("unlocked", signedIn);
   }
 
+  // A realtime connection outlives the session that authorized it, so signing
+  // out closes it here rather than leaving it pushing events.
+  if (!signedIn) disconnectRealtime();
+
   syncMatrixAccess();
 }
 
@@ -286,6 +290,199 @@ document.querySelector("#job-form").addEventListener("submit", (event) => {
     method: "POST",
     body: JSON.stringify({ kind: "audit_event", action: document.querySelector("#job-action").value }),
   }));
+});
+
+// --- Realtime -------------------------------------------------------------
+// A browser WebSocket handshake cannot carry an Authorization header, so the
+// page first spends an authenticated POST on a single-use ticket and redeems
+// it in the query string. The ticket is worthless once used and expires within
+// seconds, unlike the access token it stands in for.
+
+const realtimeBadge = document.querySelector("#realtime-badge");
+const realtimeState = document.querySelector("#realtime-state");
+const realtimeClients = document.querySelector("#realtime-clients");
+const realtimeEvents = document.querySelector("#realtime-events");
+const realtimeFeed = document.querySelector("#realtime-feed");
+const realtimeText = document.querySelector("#realtime-text");
+const realtimeSendButton = document.querySelector("#realtime-send-button");
+const realtimeConnectButton = document.querySelector("#realtime-connect-button");
+const realtimeDisconnectButton = document.querySelector("#realtime-disconnect-button");
+
+const FEED_LIMIT = 14;
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000];
+
+let socket = null;
+let connectionId = null;
+let eventCount = 0;
+let reconnectAttempt = 0;
+let reconnectTimer = null;
+// Set while the page is deliberately closing the socket, so the close handler
+// can tell a user action apart from a connection that dropped on its own.
+let closingDeliberately = false;
+
+function setRealtimeState(state, { online = false, connecting = false } = {}) {
+  realtimeState.textContent = state;
+  realtimeBadge.textContent = state;
+  realtimeBadge.classList.toggle("ok", online);
+  realtimeConnectButton.disabled = online || connecting;
+  realtimeDisconnectButton.disabled = !online && !connecting;
+  realtimeSendButton.disabled = !online;
+  realtimeText.disabled = !online;
+}
+
+function appendFeedEntry(kind, text) {
+  const label = document.createElement("span");
+  label.className = `feed-kind ${kind}`;
+  label.textContent = kind;
+
+  const body = document.createElement("span");
+  body.className = "feed-text";
+  body.textContent = text;
+
+  const time = document.createElement("time");
+  time.textContent = new Date().toLocaleTimeString();
+
+  const entry = document.createElement("li");
+  entry.append(label, body, time);
+  realtimeFeed.prepend(entry);
+  while (realtimeFeed.childElementCount > FEED_LIMIT) {
+    realtimeFeed.lastElementChild.remove();
+  }
+}
+
+// Events are fanned out to every connection, so they carry the opaque user id
+// and role rather than an email.
+function participantLabel(participant) {
+  const short = participant.user_id.slice(0, 8);
+  return `${participant.role} ${short}`;
+}
+
+function handleRealtimeEvent(event) {
+  eventCount += 1;
+  realtimeEvents.textContent = eventCount.toLocaleString();
+  if (typeof event.connections === "number") {
+    realtimeClients.textContent = event.connections.toLocaleString();
+  }
+
+  switch (event.type) {
+    case "welcome":
+      connectionId = event.connection_id;
+      appendFeedEntry("welcome", `connected as ${participantLabel(event.you)} · up to ${event.limits.max_text_characters} characters, ${event.limits.messages_per_window} messages per ${event.limits.message_window_seconds}s`);
+      break;
+    case "presence":
+      appendFeedEntry(
+        "presence",
+        `${participantLabel(event.participant)} ${event.change}${event.connection_id === connectionId ? " (this tab)" : ""}`,
+      );
+      break;
+    case "message":
+      appendFeedEntry("message", `#${event.sequence} ${participantLabel(event.from)}: ${event.text}`);
+      break;
+    case "tick":
+      appendFeedEntry("tick", `server tick #${event.sequence}`);
+      break;
+    case "notice":
+      appendFeedEntry("notice", `${event.code}: ${event.detail}`);
+      break;
+    default:
+      // Unknown event types are the forward-compatible case: the envelope is
+      // still readable, so show it rather than dropping it.
+      appendFeedEntry("event", event.type);
+  }
+}
+
+async function openRealtimeSocket() {
+  const { ticket } = await api("/api/realtime/ticket", { method: "POST" });
+  // Same-origin, which is what the server's origin check and the page's
+  // connect-src 'self' policy both allow.
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${scheme}//${location.host}/api/realtime/ws?ticket=${encodeURIComponent(ticket)}`;
+
+  closingDeliberately = false;
+  setRealtimeState("Connecting…", { connecting: true });
+  socket = new WebSocket(url);
+  socket.addEventListener("open", () => {
+    reconnectAttempt = 0;
+    setRealtimeState("Live", { online: true });
+  });
+  socket.addEventListener("message", (event) => handleRealtimeEvent(JSON.parse(event.data)));
+  socket.addEventListener("close", (event) => {
+    socket = null;
+    connectionId = null;
+    realtimeClients.textContent = "—";
+    if (closingDeliberately || !accessToken) {
+      setRealtimeState("Disconnected");
+      return;
+    }
+    appendFeedEntry("notice", `connection closed (${event.code}${event.reason ? `: ${event.reason}` : ""})`);
+    scheduleReconnect();
+  });
+  return `Ticket redeemed; the socket is open. Broadcasts reach every connection this instance serves.`;
+}
+
+// Reconnecting is the part of realtime that a demo usually skips: a dropped
+// socket needs a fresh ticket, and retries back off so a server that is down
+// is not hammered by every open tab.
+function scheduleReconnect() {
+  if (reconnectAttempt >= RECONNECT_DELAYS_MS.length) {
+    setRealtimeState("Disconnected");
+    appendFeedEntry("notice", "gave up reconnecting; press Connect to try again");
+    return;
+  }
+  const delay = RECONNECT_DELAYS_MS[reconnectAttempt];
+  reconnectAttempt += 1;
+  setRealtimeState(`Reconnecting in ${delay / 1000}s…`, { connecting: true });
+  reconnectTimer = setTimeout(() => {
+    run("Realtime reconnect", async () => {
+      try {
+        return await openRealtimeSocket();
+      } catch (error) {
+        // A failed attempt — an expired session, a server still restarting —
+        // is just another dropped connection, so it backs off again instead
+        // of leaving the card stuck on "Reconnecting".
+        scheduleReconnect();
+        throw error;
+      }
+    });
+  }, delay);
+}
+
+function disconnectRealtime() {
+  clearTimeout(reconnectTimer);
+  reconnectAttempt = 0;
+  closingDeliberately = true;
+  if (socket) {
+    socket.close(1000, "client disconnected");
+  } else {
+    setRealtimeState("Disconnected");
+  }
+}
+
+realtimeConnectButton.addEventListener("click", () => run("Realtime", async () => {
+  reconnectAttempt = 0;
+  try {
+    return await openRealtimeSocket();
+  } catch (error) {
+    setRealtimeState("Disconnected");
+    throw error;
+  }
+}));
+
+realtimeDisconnectButton.addEventListener("click", () => run("Realtime", () => {
+  disconnectRealtime();
+  return "Socket closed. The ticket it used was already spent on the handshake.";
+}));
+
+document.querySelector("#realtime-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  run("Realtime broadcast", () => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      throw new Error("Connect before broadcasting.");
+    }
+    const text = realtimeText.value;
+    socket.send(JSON.stringify({ type: "broadcast", text }));
+    return { sent: { type: "broadcast", text }, note: "Every connection receives it, this one included." };
+  });
 });
 
 document.querySelector("#telemetry-button").addEventListener("click", () => run("OpenTelemetry trace", async () => {

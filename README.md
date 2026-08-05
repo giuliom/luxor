@@ -2,7 +2,7 @@
 
 [![Build & Tests](https://github.com/giuliom/luxor/actions/workflows/CI.yml/badge.svg)](https://github.com/giuliom/luxor/actions/workflows/CI.yml)
 
-Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, JWT access tokens with rotating refresh sessions, role-based permissions with a fixed grant matrix, per-client rate limiting, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console with in-page trace and Rust-to-WebAssembly demos. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
+Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, JWT access tokens with rotating refresh sessions, role-based permissions with a fixed grant matrix, per-client rate limiting, ticket-authenticated realtime WebSockets, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console with live, in-page trace and Rust-to-WebAssembly demos. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
 
 ## Quick start
 
@@ -66,6 +66,8 @@ Every `/api` route is rate limited per client IP inside a fixed window, and the 
 | `DELETE` | `/api/demo/records` | Bearer JWT + `records.purge` | Permission-gated simulated purge |
 | `GET/PUT/DELETE` | `/api/cache/demo` | Bearer JWT | Read, cache, or invalidate a JSON value |
 | `POST` | `/api/jobs` | Bearer JWT | Enqueue an audit or email-contract job |
+| `POST` | `/api/realtime/ticket` | Bearer JWT | Mint a single-use ticket for one WebSocket handshake |
+| `GET` | `/api/realtime/ws` | Ticket query parameter | Upgrade to the realtime event stream |
 
 Registration and login accept `{"email":"...","password":"..."}`; registration additionally accepts an optional `"role"` of `"admin"` or `"user"` (the default). They return a short-lived access token in JSON and set an opaque refresh token as an HTTP-only, `SameSite=Strict` cookie. Production cookies are `Secure`. The browser demo keeps the access token in a JavaScript variable only—never local or session storage—and sends the refresh cookie only to `/api/auth`.
 
@@ -111,6 +113,8 @@ What a role may do is defined by a fixed role-permission matrix that is part of 
 | `RATE_LIMIT_API_MAX_REQUESTS`, `RATE_LIMIT_API_WINDOW_SECONDS` | `120` per `60` | Per-IP budget for all `/api` routes |
 | `RATE_LIMIT_NAMESPACE` | `luxor:ratelimit` | Redis key prefix for the distributed limiter |
 | `CLIENT_IP_SOURCE` | `socket`; `x-forwarded-for` in production | How clients are identified for rate limiting; only use `x-forwarded-for` behind a trusted proxy |
+| `REALTIME_MAX_CONNECTIONS` | `100` | WebSockets one instance serves at once; further handshakes answer `503` |
+| `REALTIME_TICKET_TTL_SECONDS` | `30` | Lifetime of a single-use connection ticket; capped at 300 |
 | `AUTO_MIGRATE` | true outside production | Must normally be false in production; the embedded development database always migrates itself |
 | `APP_OPEN_BROWSER` | `false` | Development-only opt-in that opens the frontend in the system-default browser after startup |
 | `CACHE_NAMESPACE`, `QUEUE_KEY` | `luxor:cache`, `luxor:queue:jobs` | Redis namespacing |
@@ -139,9 +143,35 @@ The checked-in migrations create normalized unique users, hashed refresh session
 
 ## Redis contracts
 
-Cache keys are validated, namespaced, JSON encoded, and always written with a positive TTL. A missing or expired key is a normal cache miss. Cache failures are surfaced as server errors rather than changing authoritative PostgreSQL data.
+Cache keys are validated, namespaced, JSON encoded, and always written with a positive TTL. A missing or expired key is a normal cache miss. Cache failures are surfaced as server errors rather than changing authoritative PostgreSQL data. Alongside the usual read, write, and invalidate, the cache exposes an atomic take (`GETDEL` on Redis 6.2+, the write lock held across read and removal in memory) so that single-use credentials such as the realtime connection ticket can be redeemed exactly once even when two callers race.
 
 The queue is enqueue-only. Producers `LPUSH` a version-stable JSON `JobEnvelope` to `QUEUE_KEY`; a separate future worker should use blocking `BRPOP`, which preserves FIFO order. The envelope contains an ID, explicit kind, tagged payload, enqueue time, `attempt`, and `max_attempts`. The worker owns acknowledgement semantics, retry backoff, idempotency, and dead-letter movement. `SendEmail` is only a provider-neutral job contract—this repository deliberately sends no email.
+
+## Realtime WebSockets
+
+The console's **Realtime** card opens a WebSocket, and everything it receives arrives without a request: a welcome frame, presence as connections come and go, broadcasts from other clients, and a server tick every five seconds. Open <http://localhost:8080> in two tabs, sign in on both, connect, and broadcast — each tab sees the other's arrival and messages. `cargo test --test realtime` drives the same paths through a real listener and a real WebSocket client, so none of it depends on a browser being present.
+
+Connections are opened in two steps, because a browser handshake cannot carry an `Authorization` header:
+
+1. `POST /api/realtime/ticket` with the access token mints a random 256-bit ticket, valid for `REALTIME_TICKET_TTL_SECONDS`. Only its SHA-256 hash is stored, exactly as refresh tokens are handled, so a cache dump yields no usable connection credential.
+2. `GET /api/realtime/ws?ticket=…` redeems it. Redemption is a single atomic take, so a replayed ticket — one lifted from an access log or a proxy trace — answers `401`. Putting the JWT itself in that query string is what this avoids: the ticket is spent by the time it could be read anywhere.
+
+Two more checks run before the upgrade. **CORS does not apply to WebSockets** — a page on any origin may open one, and the browser will send it, which is what makes cross-site WebSocket hijacking possible — so the endpoint compares `Origin` against `CORS_ORIGINS` and against the `Host` the request was sent to, and answers `403` otherwise. A handshake carrying no `Origin` at all is allowed, because browsers always send one and its absence marks a non-browser client that cannot be tricked into connecting on a user's behalf; the ticket, not the origin, is what authenticates a connection. The instance then admits the socket only if it is below `REALTIME_MAX_CONNECTIONS`, answering `503` with an `at_capacity` error when it is not. Both the ticket exchange and the upgrade sit under `/api`, so the per-IP rate limiter meters them.
+
+An established socket is metered by the connection itself, since the HTTP rate limiter never sees it again: at most 5 broadcasts per 5 seconds per connection, at most 280 characters each, and messages larger than 8 KiB fail the connection at the protocol level rather than being buffered. The server pings every five seconds and closes a connection that has answered nothing for 60 seconds, because a half-open TCP connection is not an error and would otherwise hold its slot until the process restarts. A client that falls more than 256 events behind is told what it missed instead of being served a silently truncated stream.
+
+Events are JSON with a `type` discriminator inside an envelope carrying the server timestamp and the live connection count, so clients switch on `type` and ignore what they do not recognize:
+
+```json
+{"at":"2026-01-01T12:00:00.123Z","connections":2,"type":"message","sequence":7,
+ "from":{"user_id":"3cfe10fc-…","role":"admin"},"text":"hello"}
+```
+
+The other types are `welcome` (the connection's own identity plus the limits above, so a client renders them rather than hardcoding a copy), `presence`, `tick`, and `notice` — the last being how a connection is told about itself, such as a rejected command or a dropped backlog, without being disconnected for it. Clients send one command, `{"type":"broadcast","text":"…"}`; an unknown one earns a notice rather than a close, so a newer client talking to an older server degrades instead of flapping. Events are fanned out to every connection, so they carry the opaque user id and role, never the account's email. The console reconnects with backoff when a socket drops — a fresh ticket per attempt — and closes it deliberately on sign-out.
+
+The site's Content-Security-Policy needs no WebSocket-specific directive: `connect-src 'self'` covers a same-origin `ws://`/`wss://` connection, and naming a scheme instead would have to allow every host.
+
+The fan-out is in-process. One instance serves its own connections, which is the right shape for this demo and for a single-instance deployment; a horizontally scaled one needs a shared bus (Redis pub/sub, or a dedicated realtime service) before a broadcast reaches clients attached to other instances. That boundary is deliberate, like the queue's missing worker: this is the socket lifecycle, not a distributed message broker.
 
 ## WebAssembly demo
 
@@ -243,6 +273,7 @@ The reference `DATABASE_URL`/`REDIS_URL` values above use Railway's private netw
 - Terminate HTTPS at a trusted proxy and preserve or generate `x-request-id`. Production then defaults to `HTTPS_ENFORCEMENT=proxy-header`, which redirects plaintext `GET`/`HEAD` to https and refuses every other plaintext method with `403 https_required`. It reads `x-forwarded-proto`, so the proxy must overwrite that header on every request instead of passing a client-supplied one through; a request that arrives without it is allowed, because failing closed would break health checks that bypass the proxy while buying nothing against a caller who can reach the container directly. Network rules, not this check, are what keep that caller out.
 - Production also refuses to start with a plaintext `CORS_ORIGINS` entry, and sends `Strict-Transport-Security: max-age=31536000; includeSubDomains`. Enable `HSTS_PRELOAD` only deliberately: preload-list submission is close to irreversible, and the config rejects the flag unless it also meets the list's own `includeSubDomains` and one-year max-age rules.
 - Review the rate-limit budgets for your traffic shape; production runs with `x-forwarded-for` client identification by default, which is only safe behind the platform proxy.
+- Size `REALTIME_MAX_CONNECTIONS` against the instance's memory and file-descriptor limits, and confirm the proxy's idle timeout exceeds the five-second server tick. Before scaling past one instance, put a shared bus behind the hub or expect broadcasts to reach only the clients attached to the same instance.
 - Set resource limits, health probes, alerting, retention, and sampling for logs/traces/errors.
 - Plan JWT-secret rotation, database restore tests, and queue dead-letter handling (expired refresh sessions are pruned automatically).
 

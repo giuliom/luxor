@@ -15,6 +15,11 @@ pub trait Cache: Send + Sync {
         ttl: Duration,
     ) -> Result<(), AppError>;
     async fn invalidate(&self, key: &str) -> Result<(), AppError>;
+    /// Reads a key and deletes it in one atomic step, so that at most one
+    /// caller ever observes the value. Separate `get` and `invalidate` calls
+    /// cannot promise that: two callers can both read before either deletes.
+    /// Single-use credentials — the realtime connection ticket — depend on it.
+    async fn take_json(&self, key: &str) -> Result<Option<serde_json::Value>, AppError>;
 }
 
 pub async fn get_typed<T: DeserializeOwned>(
@@ -91,6 +96,17 @@ impl Cache for RedisCache {
         let _: usize = manager.del(self.namespaced_key(key)?).await?;
         Ok(())
     }
+
+    // GETDEL is a single command, so the read and the delete cannot interleave
+    // with another instance's. It requires Redis 6.2 or newer.
+    async fn take_json(&self, key: &str) -> Result<Option<serde_json::Value>, AppError> {
+        let mut manager = self.manager.clone();
+        let value: Option<String> = manager.get_del(self.namespaced_key(key)?).await?;
+        value
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(AppError::from)
+    }
 }
 
 type MemoryEntry = (serde_json::Value, tokio::time::Instant);
@@ -136,6 +152,17 @@ impl Cache for MemoryCache {
         validate_key(key)?;
         self.values.write().await.remove(key);
         Ok(())
+    }
+
+    // The write lock is held across the read and the removal, which is this
+    // backend's equivalent of Redis GETDEL.
+    async fn take_json(&self, key: &str) -> Result<Option<serde_json::Value>, AppError> {
+        validate_key(key)?;
+        let mut values = self.values.write().await;
+        Ok(values
+            .remove(key)
+            .filter(|(_, expires_at)| *expires_at > tokio::time::Instant::now())
+            .map(|(value, _)| value))
     }
 }
 
@@ -187,6 +214,27 @@ mod tests {
             .unwrap();
         cache.invalidate("profile:1").await.unwrap();
         assert!(cache.get_json("profile:1").await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn memory_cache_take_returns_a_value_once() {
+        let cache = MemoryCache::default();
+        put_typed(&cache, "ticket:1", &"grant", Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache.take_json("ticket:1").await.unwrap(),
+            Some(serde_json::json!("grant"))
+        );
+        assert_eq!(cache.take_json("ticket:1").await.unwrap(), None);
+
+        // An expired entry is a miss, and taking it still clears the row.
+        put_typed(&cache, "ticket:2", &"grant", Duration::from_secs(30))
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(cache.take_json("ticket:2").await.unwrap(), None);
     }
 
     #[test]

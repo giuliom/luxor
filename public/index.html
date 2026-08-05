@@ -12,7 +12,7 @@
       <div class="page-content">
         <header class="hero">
         <div>
-          <p class="eyebrow">Rust · Axum · PostgreSQL · Redis · OpenTelemetry · WebAssembly</p>
+          <p class="eyebrow">Rust · Axum · PostgreSQL · Redis · WebSockets · OpenTelemetry · WebAssembly</p>
           <h1>Luxor backend console</h1>
           <p class="intro">A small same-origin client for exercising the reference API. Access tokens live only in this page’s memory.</p>
         </div>
@@ -127,9 +127,34 @@
           </form>
         </article>
 
+        <article class="card wide">
+          <div class="card-heading">
+            <div><span class="number">06</span><h2>Realtime</h2></div>
+            <div class="badge-group">
+              <span id="realtime-badge" class="badge">Disconnected</span>
+              <span class="badge protected">Protected</span>
+            </div>
+          </div>
+          <p>Exchange a short-lived, single-use ticket for a WebSocket, then watch the server push. Open this page in a second tab and broadcast: presence and messages fan out to every connection.</p>
+          <div class="actions">
+            <button id="realtime-connect-button" type="button">Connect</button>
+            <button id="realtime-disconnect-button" class="quiet" type="button" disabled>Disconnect</button>
+          </div>
+          <dl class="telemetry-result">
+            <div><dt>Connection</dt><dd id="realtime-state">Disconnected</dd></div>
+            <div><dt>Clients online</dt><dd id="realtime-clients">—</dd></div>
+            <div><dt>Events received</dt><dd id="realtime-events">0</dd></div>
+          </dl>
+          <form id="realtime-form" class="inline-form">
+            <label>Broadcast<input id="realtime-text" maxlength="280" value="Hello from this tab" required disabled></label>
+            <button id="realtime-send-button" type="submit" disabled>Send</button>
+          </form>
+          <ol id="realtime-feed" class="realtime-feed" aria-live="polite" aria-label="Realtime event feed"></ol>
+        </article>
+
         <article class="card wide telemetry-card">
           <div class="card-heading">
-            <div><span class="number">06</span><h2>OpenTelemetry</h2></div>
+            <div><span class="number">07</span><h2>OpenTelemetry</h2></div>
             <span id="telemetry-badge" class="badge">Not checked</span>
           </div>
           <p>Generate an HTTP trace with two concurrent child spans, then inspect the captured span waterfall without leaving the page.</p>
@@ -146,7 +171,7 @@
 
         <article class="card wide">
           <div class="card-heading">
-            <div><span class="number">07</span><h2>WebAssembly</h2></div>
+            <div><span class="number">08</span><h2>WebAssembly</h2></div>
             <span id="wasm-badge" class="badge">Not loaded</span>
           </div>
           <p>Stream-compile a Rust module with WebAssembly.instantiateStreaming, then count primes with the same sieve in WebAssembly and in JavaScript and compare their 10-run average timings.</p>

@@ -1,6 +1,6 @@
 use crate::{
     auth::JwtService, cache::Cache, config::Config, observability::TraceStore,
-    permissions::PermissionStore, queue::Queue, rate_limit::RateLimiter,
+    permissions::PermissionStore, queue::Queue, rate_limit::RateLimiter, realtime::RealtimeHub,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -15,6 +15,9 @@ pub struct AppState {
     pub jwt: JwtService,
     pub permissions: PermissionStore,
     pub trace_store: TraceStore,
+    /// In-process fan-out for the realtime WebSocket demo. Its connections
+    /// belong to this instance only.
+    pub realtime: RealtimeHub,
 }
 
 impl AppState {
@@ -27,6 +30,7 @@ impl AppState {
         trace_store: TraceStore,
     ) -> Self {
         let jwt = JwtService::from_config(&config);
+        let realtime = RealtimeHub::new(config.realtime.max_connections);
         Self {
             config,
             db,
@@ -36,6 +40,7 @@ impl AppState {
             jwt,
             permissions: PermissionStore,
             trace_store,
+            realtime,
         }
     }
 }

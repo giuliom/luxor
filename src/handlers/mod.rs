@@ -4,3 +4,4 @@ pub mod cache;
 pub mod demo;
 pub mod jobs;
 pub mod permissions;
+pub mod realtime;

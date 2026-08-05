@@ -27,6 +27,8 @@ pub enum AppError {
     RateLimited { retry_after_seconds: u64 },
     #[error("the request took too long to process")]
     RequestTimeout,
+    #[error("{0} is at capacity; try again shortly")]
+    AtCapacity(&'static str),
     #[error("method not allowed for this route")]
     MethodNotAllowed,
     #[error("{0} was not found")]
@@ -69,6 +71,10 @@ impl AppError {
             Self::HttpsRequired => StatusCode::FORBIDDEN,
             Self::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
+            // A resource limit this instance is already up against, not a
+            // fault in the request: the same call succeeds once one of the
+            // held resources is released.
+            Self::AtCapacity(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
@@ -90,6 +96,7 @@ impl AppError {
             Self::HttpsRequired => "https_required",
             Self::RateLimited { .. } => "rate_limited",
             Self::RequestTimeout => "request_timeout",
+            Self::AtCapacity(_) => "at_capacity",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",

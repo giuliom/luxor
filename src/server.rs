@@ -1,7 +1,7 @@
 use crate::{
     config::HttpsEnforcement,
     error::AppError,
-    handlers::{auth, basic, cache, demo, jobs, permissions},
+    handlers::{auth, basic, cache, demo, jobs, permissions, realtime},
     rate_limit::{self, RateLimitPolicy},
     state::AppState,
 };
@@ -81,6 +81,11 @@ pub fn app(state: AppState) -> Router {
                 .delete(cache::delete_demo),
         )
         .route("/jobs", post(jobs::enqueue))
+        // The ticket exchange is an ordinary authenticated POST; the upgrade
+        // that redeems it authenticates itself with that ticket, because a
+        // browser handshake cannot carry an Authorization header.
+        .route("/realtime/ticket", post(realtime::ticket))
+        .route("/realtime/ws", get(realtime::connect))
         .merge(auth_routes)
         .fallback(api_not_found)
         .method_not_allowed_fallback(api_method_not_allowed)
@@ -699,6 +704,7 @@ mod tests {
             ("DELETE", "/api/demo/records"),
             ("GET", "/api/cache/demo"),
             ("POST", "/api/jobs"),
+            ("POST", "/api/realtime/ticket"),
         ] {
             let response = test_app()
                 .oneshot(
@@ -835,6 +841,70 @@ mod tests {
         let authorization = bearer(Role::User).replace("Bearer", "bearer");
         let response = send(&app, "GET", "/api/demo/reports", Some(&authorization), None).await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn realtime_tickets_are_short_lived_and_name_their_endpoint() {
+        let app = test_app();
+        let response = send(
+            &app,
+            "POST",
+            "/api/realtime/ticket",
+            Some(&bearer(Role::User)),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("a JSON ticket");
+        assert_eq!(body["expires_in"], 30);
+        assert_eq!(body["websocket_path"], "/api/realtime/ws");
+        // Long enough to be a 256-bit random value, and not the access token.
+        assert!(body["ticket"].as_str().unwrap().len() >= 40);
+    }
+
+    /// CORS never runs for a WebSocket handshake, so the endpoint checks the
+    /// origin itself; this is the cross-site WebSocket hijacking case.
+    #[tokio::test]
+    async fn realtime_upgrades_are_refused_from_a_foreign_origin() {
+        let response = test_app_with_config(production_config())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/realtime/ws?ticket=stolen")
+                    .header(header::ORIGIN, "https://evil.test")
+                    .header(header::HOST, "app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(body_text(response).await.contains(r#""code":"forbidden""#));
+    }
+
+    /// A same-origin request gets past the origin check and is then turned
+    /// away by the upgrade extractor — in the JSON shape the rest of the API
+    /// uses, rather than axum's plain-text rejection.
+    #[tokio::test]
+    async fn realtime_upgrades_without_websocket_headers_follow_the_error_contract() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/realtime/ws")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response)
+            .await
+            .contains(r#""code":"bad_request""#));
     }
 
     #[tokio::test]
