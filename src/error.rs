@@ -137,14 +137,31 @@ where
     }
 }
 
+/// Turns a body that could not be read into the error contract.
+///
+/// axum's own description quotes the offending input back — an unknown enum
+/// variant, a mistyped value — and names the target type's fields. That is
+/// worth having while developing, so it is logged; it is not returned, because
+/// a response that echoes a request body reflects caller-controlled text to
+/// whoever reads it and describes the internal shape to whoever probes it.
+/// What the client gets instead names the class of problem, which is enough to
+/// tell a malformed body from one this endpoint simply does not accept.
 fn map_json_rejection(rejection: JsonRejection) -> AppError {
-    match rejection.status() {
-        StatusCode::PAYLOAD_TOO_LARGE => AppError::PayloadTooLarge,
-        StatusCode::UNSUPPORTED_MEDIA_TYPE => AppError::UnsupportedMediaType,
-        // Syntax and deserialization problems keep axum's description (which
-        // names the offending field and position) so clients can fix the
-        // request without guessing.
-        _ => AppError::BadRequest(rejection.body_text()),
+    tracing::debug!(detail = %rejection.body_text(), "rejected a JSON request body");
+    match rejection {
+        JsonRejection::JsonSyntaxError(_) => {
+            AppError::BadRequest("request body is not valid JSON".into())
+        }
+        JsonRejection::JsonDataError(_) => AppError::BadRequest(
+            "request body does not match the schema this endpoint accepts".into(),
+        ),
+        JsonRejection::MissingJsonContentType(_) => AppError::UnsupportedMediaType,
+        // Reading the body itself failed, which past the body limit is the
+        // shape an oversized request arrives in.
+        _ => match rejection.status() {
+            StatusCode::PAYLOAD_TOO_LARGE => AppError::PayloadTooLarge,
+            _ => AppError::BadRequest("request body could not be read".into()),
+        },
     }
 }
 

@@ -933,8 +933,9 @@ mod tests {
             .await
             .contains(r#""code":"unsupported_media_type""#));
 
-        // Deserialization failures name the problem instead of a generic
-        // "invalid JSON" message.
+        // A body that parses but does not match the target type is a 400 that
+        // names the class of problem — and never quotes the caller's own input
+        // back at it, which is what would make the response a reflection.
         let unknown_variant = send(
             &app,
             "POST",
@@ -944,7 +945,63 @@ mod tests {
         )
         .await;
         assert_eq!(unknown_variant.status(), StatusCode::BAD_REQUEST);
-        assert!(body_text(unknown_variant).await.contains("reboot_world"));
+        let body = body_text(unknown_variant).await;
+        assert!(body.contains(r#""code":"bad_request""#));
+        assert!(body.contains("does not match the schema"));
+        assert!(!body.contains("reboot_world"), "the body was echoed back");
+
+        // Malformed JSON is reported as such, and is likewise not echoed.
+        let malformed = send(
+            &app,
+            "POST",
+            "/api/jobs",
+            Some(&user),
+            Some(r#"{"kind":"audit_event","#),
+        )
+        .await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(malformed).await;
+        assert!(body.contains("not valid JSON"));
+        assert!(!body.contains("audit_event"), "the body was echoed back");
+    }
+
+    /// The queue is validated on the way in, because the worker that drains it
+    /// reads its payload back as trusted input. Each rejected body here is one
+    /// a worker would otherwise render into an SMTP header or a template path.
+    #[tokio::test]
+    async fn enqueueing_validates_the_job_payload() {
+        let app = test_app();
+        let user = bearer(Role::User);
+
+        let accepted = send(
+            &app,
+            "POST",
+            "/api/jobs",
+            Some(&user),
+            Some(r#"{"kind":"send_email","to":"person@example.com","template":"welcome"}"#),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        assert!(body_text(accepted).await.contains(r#""kind":"send_email""#));
+
+        for rejected in [
+            // A recipient smuggling a header past the address.
+            r#"{"kind":"send_email","to":"person\r\nBcc: attacker@example.com","template":"welcome"}"#,
+            r#"{"kind":"send_email","to":"not-an-address","template":"welcome"}"#,
+            // A template steering whatever resolves it.
+            r#"{"kind":"send_email","to":"person@example.com","template":"../../etc/passwd"}"#,
+            r#"{"kind":"send_email","to":"person@example.com","template":""}"#,
+        ] {
+            let response = send(&app, "POST", "/api/jobs", Some(&user), Some(rejected)).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{rejected} should be refused"
+            );
+            assert!(body_text(response)
+                .await
+                .contains(r#""code":"bad_request""#));
+        }
     }
 
     #[tokio::test]

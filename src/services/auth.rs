@@ -6,6 +6,7 @@ use crate::{
     db,
     error::AppError,
     models::{Role, UserRecord},
+    validation,
 };
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::PgPool;
@@ -36,7 +37,7 @@ pub async fn register(
     refresh_policy: RefreshPolicy,
 ) -> Result<(UserRecord, RefreshGrant), AppError> {
     let email = normalize_email(email);
-    validate_email(&email)?;
+    validation::email(&email)?;
     validate_password_length(&password)?;
     validate_password_strength(&email, &password).await?;
     let password_hash = hash_password(password).await?;
@@ -87,18 +88,6 @@ pub async fn login(
 
 fn normalize_email(email: &str) -> String {
     email.trim().to_ascii_lowercase()
-}
-
-fn validate_email(email: &str) -> Result<(), AppError> {
-    let looks_like_email = email.len() <= 320
-        && email
-            .split_once('@')
-            .is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.'));
-    if looks_like_email {
-        Ok(())
-    } else {
-        Err(AppError::BadRequest("a valid email is required".into()))
-    }
 }
 
 fn validate_password_length(password: &SecretString) -> Result<(), AppError> {
@@ -179,13 +168,7 @@ mod tests {
         SecretString::from(value.to_owned())
     }
 
-    #[test]
-    fn validates_email_shape() {
-        assert!(validate_email("person@example.com").is_ok());
-        assert!(validate_email("not-email").is_err());
-        assert!(validate_email("@example.com").is_err());
-        assert!(validate_email("person@localhost").is_err());
-    }
+    // Address shape is covered where the rule lives, in `crate::validation`.
 
     #[test]
     fn validates_password_length() {
