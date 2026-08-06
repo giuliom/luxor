@@ -189,6 +189,10 @@ pub struct Config {
     pub hsts: HstsSettings,
     pub https_enforcement: HttpsEnforcement,
     pub cors_origins: Vec<String>,
+    /// Absolute public origin used in canonical URLs, hreflang alternates,
+    /// and the sitemap. `None` selects a derived value; see
+    /// [`Config::public_base_url`].
+    pub public_base_url: Option<String>,
     pub body_limit_bytes: usize,
     pub request_timeout_seconds: u64,
     pub rate_limit: RateLimitSettings,
@@ -285,8 +289,20 @@ impl Config {
             ));
         }
         for origin in &cors_origins {
-            validate_origin(origin, production)?;
+            validate_origin("CORS_ORIGINS", origin, production)?;
         }
+
+        // The origin baked into canonical URLs, hreflang alternates, and the
+        // sitemap. Origin-only, because the localized routes live at the root
+        // of the site; a path prefix would produce URLs the router never
+        // serves.
+        let public_base_url = match get(&values, "PUBLIC_BASE_URL") {
+            Some(value) => {
+                validate_origin("PUBLIC_BASE_URL", value, production)?;
+                Some(value.trim_end_matches('/').to_owned())
+            }
+            None => None,
+        };
 
         let body_limit_bytes = parse(&values, "BODY_LIMIT_BYTES", 1_048_576_usize)?;
         if body_limit_bytes == 0 {
@@ -364,6 +380,7 @@ impl Config {
             hsts,
             https_enforcement,
             cors_origins,
+            public_base_url,
             body_limit_bytes,
             request_timeout_seconds,
             rate_limit,
@@ -382,6 +399,20 @@ impl Config {
 
     pub fn bind_address(&self) -> SocketAddr {
         self.bind_address
+    }
+
+    /// The absolute origin used in canonical URLs, hreflang alternates, and
+    /// the sitemap. An explicit `PUBLIC_BASE_URL` wins; production falls back
+    /// to the first CORS origin, which deployments already set to the public
+    /// URL; development falls back to the local listener address.
+    pub fn public_base_url(&self) -> String {
+        if let Some(base_url) = &self.public_base_url {
+            return base_url.clone();
+        }
+        if self.environment.is_production() {
+            return self.cors_origins[0].trim_end_matches('/').to_owned();
+        }
+        format!("http://{}:{}", self.app_host, self.app_port)
     }
 }
 
@@ -466,14 +497,14 @@ fn parse_url(key: &'static str, value: &str, schemes: &[&str]) -> Result<Url, Co
     }
 }
 
-fn validate_origin(origin: &str, production: bool) -> Result<(), ConfigError> {
-    let url = parse_url("CORS_ORIGINS", origin, &["http", "https"])?;
+fn validate_origin(key: &'static str, origin: &str, production: bool) -> Result<(), ConfigError> {
+    let url = parse_url(key, origin, &["http", "https"])?;
     // A plaintext origin in production means credentialed requests are
     // expected over a channel that cannot carry a `Secure` cookie, which is
     // a deployment mistake rather than a preference.
     if production && url.scheme() != "https" {
         return Err(ConfigError::Invalid(
-            "CORS_ORIGINS",
+            key,
             format!("{origin} must use https in production"),
         ));
     }
@@ -487,7 +518,7 @@ fn validate_origin(origin: &str, production: bool) -> Result<(), ConfigError> {
         Ok(())
     } else {
         Err(ConfigError::Invalid(
-            "CORS_ORIGINS",
+            key,
             format!("{origin} is not an HTTP(S) origin"),
         ))
     }
@@ -940,6 +971,44 @@ mod tests {
         assert!(matches!(
             Config::from_map(bad_origin),
             Err(ConfigError::Invalid("CORS_ORIGINS", _))
+        ));
+    }
+
+    #[test]
+    fn public_base_url_is_explicit_or_derived() {
+        // Development derives the listener address; production derives the
+        // deployment's public URL, already configured as the CORS origin.
+        let development = Config::from_map(HashMap::new()).unwrap();
+        assert_eq!(development.public_base_url(), "http://127.0.0.1:8080");
+
+        let production = Config::from_map(production_base()).unwrap();
+        assert_eq!(production.public_base_url(), "https://app.example.com");
+
+        let explicit = Config::from_map(HashMap::from([(
+            "PUBLIC_BASE_URL".into(),
+            "https://console.example.com/".into(),
+        )]))
+        .unwrap();
+        assert_eq!(explicit.public_base_url(), "https://console.example.com");
+
+        // The localized routes live at the site root, so a path prefix would
+        // produce canonical URLs the router never serves.
+        let with_path = HashMap::from([(
+            "PUBLIC_BASE_URL".into(),
+            "https://example.com/console".into(),
+        )]);
+        assert!(matches!(
+            Config::from_map(with_path),
+            Err(ConfigError::Invalid("PUBLIC_BASE_URL", _))
+        ));
+
+        // Canonical URLs advertise where credentials will be sent; plaintext
+        // in production is the same mistake as a plaintext CORS origin.
+        let mut plaintext = production_base();
+        plaintext.insert("PUBLIC_BASE_URL".into(), "http://app.example.com".into());
+        assert!(matches!(
+            Config::from_map(plaintext),
+            Err(ConfigError::Invalid("PUBLIC_BASE_URL", _))
         ));
     }
 

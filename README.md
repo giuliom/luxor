@@ -2,7 +2,7 @@
 
 [![Build & Tests](https://github.com/giuliom/luxor/actions/workflows/CI.yml/badge.svg)](https://github.com/giuliom/luxor/actions/workflows/CI.yml)
 
-Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, JWT access tokens with rotating refresh sessions, role-based permissions with a fixed grant matrix, per-client rate limiting, ticket-authenticated realtime WebSockets, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console with live, in-page trace and Rust-to-WebAssembly demos. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
+Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, JWT access tokens with rotating refresh sessions, role-based permissions with a fixed grant matrix, per-client rate limiting, ticket-authenticated realtime WebSockets, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console — statically generated in English and Italian at language-prefixed URLs — with live, in-page trace and Rust-to-WebAssembly demos. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
 
 ## Quick start
 
@@ -101,6 +101,7 @@ What a role may do is defined by a fixed role-permission matrix that is part of 
 | `REFRESH_FAMILY_TTL_SECONDS` | `7776000` | Absolute cap on refresh rotation (90 days); must be at least the refresh token lifetime |
 | `REFRESH_COOKIE_SECURE` | true only in production | Keep true behind production HTTPS |
 | `CORS_ORIGINS` | `https://localhost:8080` | Comma-separated exact origins; credentials are enabled. Must all be `https` in production |
+| `PUBLIC_BASE_URL` | Derived | Absolute public origin for canonical URLs, hreflang alternates, and the sitemap; development derives the listener address, production the first CORS origin |
 | `HSTS_ENABLED` | true only in production | Send `Strict-Transport-Security` |
 | `HSTS_MAX_AGE_SECONDS` | `31536000` | `0` releases browsers that cached a policy |
 | `HSTS_INCLUDE_SUBDOMAINS` | `true` | Adds `includeSubDomains` |
@@ -185,6 +186,18 @@ cargo test --manifest-path wasm/Cargo.toml
 cargo build --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown --release
 cp wasm/target/wasm32-unknown-unknown/release/luxor_wasm.wasm public/demo.wasm
 ```
+
+## Internationalisation
+
+The console is served in English at [`/en`](http://localhost:8080/en) and Italian at [`/it`](http://localhost:8080/it) — language-prefixed URLs are the source of truth, so every translation has a stable, shareable, indexable address. Each page is statically generated at startup from one HTML template ([`public/index.html`](public/index.html)) and a per-locale dictionary ([`locales/en/common.json`](locales/en/common.json), [`locales/it/common.json`](locales/it/common.json)), so the response is complete in its language before the first byte leaves the server — nothing is translated in the browser after the fact, and there is no wrong-language flash.
+
+`GET /` serves no content: it negotiates a language and answers a `302` with `Vary: Cookie, Accept-Language` and `Cache-Control: no-store`, so a shared cache can never pin every visitor to one visitor's language. The priority is the `lang` cookie the language selector sets (the persisted user choice — the server cannot know the signed-in account when serving a page, because the access token lives only in page memory and the refresh cookie is scoped to `/api/auth`), then the browser's weighted `Accept-Language`, then English. A language named in the URL is never overridden by any of these, and `it-IT`/`it-CH` resolve to Italian by primary subtag — regional variants earn their own locale only when content genuinely differs.
+
+Dictionary entries are stable semantic keys (`errors.code.not_found`, never the English sentence) holding whole messages with named `{placeholder}` slots — sentences are never concatenated from fragments, so word order is free to differ per language. Plural forms live under CLDR category keys (`telemetry.spans.one` / `.other`) selected client-side with `Intl.PluralRules`, and dates, numbers, and unit-tagged durations go through `Intl.DateTimeFormat`/`Intl.NumberFormat` rather than manual formatting. The page's dictionary is inlined as a non-executing JSON data block (allowed by the CSP, which continues to forbid inline scripts; translated values are HTML-escaped when rendered, and `</` is escaped in the block, so a translation can never inject markup or terminate its element), which keeps client-side strings to one language and zero extra requests. The API stays language-neutral: it returns stable error codes, and the console translates the code, keeping the server's request-specific detail visibly appended rather than passing it off as translated.
+
+Each rendered page carries its `<html lang>` and `dir`, a translated title and meta description, a self-referencing canonical URL, and reciprocal `hreflang` alternates (plus `x-default`); `/sitemap.xml` lists every language version, and the language selector is ordinary crawlable links, so search engines discover translations without executing JavaScript or guessing from headers. The absolute origin in those URLs comes from `PUBLIC_BASE_URL` or its documented derivation. Trailing-slash variants (`/en/`) redirect permanently to the canonical form, and language-prefixed URLs make locale part of any CDN cache key by construction.
+
+Unit tests in [`src/i18n.rs`](src/i18n.rs) gate CI on translation health: dictionaries must parse, carry identical key sets (missing and obsolete keys both fail), keep the same placeholders per key across languages, contain no markup, define every key the template and script look up, and define no key nothing uses; rendered pages must contain no unresolved placeholder and correct canonical/hreflang metadata. A client-side lookup that still misses renders its key on screen — a loud, diagnosable failure rather than a silent English fallback. To add a language: add a `Locale` variant and a `locales/<lang>/common.json` (the tests then enforce completeness), and translated slugs beyond the language prefix are unnecessary while the console is a single page.
 
 ## Adding an OAuth provider
 

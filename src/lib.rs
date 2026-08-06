@@ -5,6 +5,7 @@ pub mod db;
 pub mod dev_postgres;
 pub mod error;
 pub mod handlers;
+pub mod i18n;
 pub mod models;
 pub mod observability;
 pub mod permissions;

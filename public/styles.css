@@ -71,6 +71,36 @@ h1 {
   line-height: 1.6;
 }
 
+.hero-side {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.8rem;
+}
+
+.lang-switcher {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: #8a867e;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-align: start;
+  text-transform: uppercase;
+}
+
+.lang-switcher a {
+  padding-block: 0.15rem;
+  border-block-end: 2px solid transparent;
+  color: #6a6862;
+  text-decoration: none;
+}
+
+.lang-switcher a:hover { color: #232822; }
+.lang-switcher a[aria-current="page"] { border-block-end-color: #a84b2d; color: #a84b2d; }
+
 .identity {
   display: flex;
   flex: 0 0 auto;
@@ -353,6 +383,7 @@ html::-webkit-scrollbar-thumb:hover, .activity pre::-webkit-scrollbar-thumb:hove
 @media (max-width: 700px) {
   .page-shell { padding-top: 2rem; }
   .hero { align-items: flex-start; flex-direction: column; }
+  .hero-side { align-items: flex-start; }
   .grid { grid-template-columns: 1fr; }
   .card.wide { grid-column: auto; }
   .inline-form, .activity, .telemetry-result { grid-template-columns: 1fr; }

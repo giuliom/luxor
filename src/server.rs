@@ -2,18 +2,19 @@ use crate::{
     config::HttpsEnforcement,
     error::AppError,
     handlers::{auth, basic, cache, demo, jobs, permissions, realtime},
+    i18n,
     rate_limit::{self, RateLimitPolicy},
     state::AppState,
 };
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
     http::{
         header::{self, HeaderName},
         HeaderMap, HeaderValue, Method, Request, StatusCode,
     },
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{delete, get, post},
     Router,
 };
@@ -94,8 +95,47 @@ pub fn app(state: AppState) -> Router {
             rate_limit::enforce,
         ));
 
-    Router::new()
-        .route("/", get(index))
+    // The console is statically generated per language at startup: every
+    // localized page has its own stable URL and is complete in its language
+    // before the first byte is sent, so nothing is translated in the browser
+    // after the fact. `/` never serves content, only a negotiated redirect.
+    let base_url = state.config.public_base_url();
+    let sitemap = Bytes::from(i18n::render_sitemap(&base_url));
+    let mut localized = Router::new().route("/", get(localized_root));
+    for locale in i18n::SUPPORTED_LOCALES {
+        let page = Bytes::from(i18n::render_page(locale, &base_url));
+        localized = localized
+            .route(
+                locale.path(),
+                get(move || {
+                    let page = page.clone();
+                    async move { Html(page) }
+                }),
+            )
+            // One canonical URL per language: the slashed variant redirects
+            // rather than serving a duplicate.
+            .route(
+                &format!("{}/", locale.path()),
+                get(move || async move { Redirect::permanent(locale.path()) }),
+            );
+    }
+
+    localized
+        .route(
+            "/sitemap.xml",
+            get(move || {
+                let sitemap = sitemap.clone();
+                async move {
+                    (
+                        [(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/xml; charset=utf-8"),
+                        )],
+                        sitemap,
+                    )
+                }
+            }),
+        )
         .route("/favicon.svg", get(favicon))
         .route("/styles.css", get(styles))
         .route("/script.js", get(script))
@@ -330,8 +370,32 @@ fn cors_layer(state: &AppState) -> CorsLayer {
         .allow_credentials(true)
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("../public/index.html"))
+/// Sends `/` to the negotiated language version: the explicit cookie
+/// preference first, then `Accept-Language`, then the default. The redirect
+/// varies on what it read and is never cached, so a shared cache can never
+/// pin every visitor to one visitor's language; the language-prefixed URLs
+/// it points at are what caches and crawlers index.
+async fn localized_root(headers: HeaderMap) -> Response {
+    let locale = i18n::negotiate(
+        headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|value| value.to_str().ok()),
+    );
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, HeaderValue::from_static(locale.path())),
+            (
+                header::VARY,
+                HeaderValue::from_static("Cookie, Accept-Language"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+    )
+        .into_response()
 }
 
 async fn favicon() -> impl IntoResponse {
@@ -453,17 +517,159 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serves_index_html() {
+    async fn serves_a_complete_console_page_per_language() {
+        let dev_base = "http://127.0.0.1:8080";
+        for (path, lang, title) in [
+            ("/en", "en", "<title>Luxor backend console</title>"),
+            ("/it", "it", "<title>Console backend Luxor</title>"),
+        ] {
+            let response = test_app()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_header_starts_with(&response, header::CONTENT_TYPE.as_str(), "text/html");
+            let body = body_text(response).await;
+            assert!(body.contains(&format!(r#"<html lang="{lang}" dir="ltr">"#)));
+            assert!(body.contains(title));
+            assert!(body.contains(r#"rel="icon" href="/favicon.svg""#));
+            assert!(!body.contains("{{"), "unresolved template placeholder");
+            // Self-referencing canonical plus reciprocal hreflang alternates,
+            // including x-default; visible, crawlable selector links.
+            assert!(body.contains(&format!(
+                r#"<link rel="canonical" href="{dev_base}{path}">"#
+            )));
+            assert!(body.contains(&format!(
+                r#"<link rel="alternate" hreflang="en" href="{dev_base}/en">"#
+            )));
+            assert!(body.contains(&format!(
+                r#"<link rel="alternate" hreflang="it" href="{dev_base}/it">"#
+            )));
+            assert!(body.contains(&format!(
+                r#"<link rel="alternate" hreflang="x-default" href="{dev_base}/en">"#
+            )));
+            assert!(body.contains(r#"<a href="/it" hreflang="it" lang="it""#));
+        }
+    }
+
+    #[tokio::test]
+    async fn root_negotiates_a_language_and_redirects() {
+        let app = test_app();
+
+        // No signal at all falls back to the default language. The redirect
+        // names what it varies on and must never be cached.
+        let default = send(&app, "GET", "/", None, None).await;
+        assert_eq!(default.status(), StatusCode::FOUND);
+        assert_eq!(default.headers().get(header::LOCATION).unwrap(), "/en");
+        assert_eq!(
+            default.headers().get(header::VARY).unwrap(),
+            "Cookie, Accept-Language"
+        );
+        assert_eq!(
+            default.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+
+        // The browser's weighted preference is honored…
+        let from_header = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::ACCEPT_LANGUAGE, "it-IT,it;q=0.9,en;q=0.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(from_header.status(), StatusCode::FOUND);
+        assert_eq!(from_header.headers().get(header::LOCATION).unwrap(), "/it");
+
+        // …but an explicitly stored choice outranks it.
+        let from_cookie = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::COOKIE, "lang=en")
+                    .header(header::ACCEPT_LANGUAGE, "it")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(from_cookie.status(), StatusCode::FOUND);
+        assert_eq!(from_cookie.headers().get(header::LOCATION).unwrap(), "/en");
+    }
+
+    /// A language named in the URL is the strongest signal there is: browser
+    /// settings and stored preferences must never redirect away from it.
+    #[tokio::test]
+    async fn explicit_language_urls_are_never_overridden() {
         let response = test_app()
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/en")
+                    .header(header::COOKIE, "lang=it")
+                    .header(header::ACCEPT_LANGUAGE, "it-IT,it;q=0.9")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_header_starts_with(&response, header::CONTENT_TYPE.as_str(), "text/html");
+        assert!(body_text(response)
+            .await
+            .contains(r#"<html lang="en" dir="ltr">"#));
+    }
+
+    #[tokio::test]
+    async fn slashed_language_urls_redirect_to_the_canonical_form() {
+        for (slashed, canonical) in [("/en/", "/en"), ("/it/", "/it")] {
+            let response = test_app()
+                .oneshot(Request::builder().uri(slashed).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+            assert_eq!(response.headers().get(header::LOCATION).unwrap(), canonical);
+        }
+    }
+
+    #[tokio::test]
+    async fn sitemap_lists_every_language_version() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/sitemap.xml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_header_starts_with(&response, header::CONTENT_TYPE.as_str(), "application/xml");
         let body = body_text(response).await;
-        assert!(body.contains("Luxor backend console"));
-        assert!(body.contains(r#"rel="icon" href="/favicon.svg""#));
+        assert!(body.contains("<loc>http://127.0.0.1:8080/en</loc>"));
+        assert!(body.contains("<loc>http://127.0.0.1:8080/it</loc>"));
+        assert!(body.contains(r#"hreflang="x-default""#));
+    }
+
+    /// In production the SEO URLs must name the public origin, which the
+    /// deployment already provides as the first CORS origin unless an
+    /// explicit PUBLIC_BASE_URL is set.
+    #[tokio::test]
+    async fn production_seo_urls_use_the_public_origin() {
+        let response = test_app_with_config(production_config())
+            .oneshot(Request::builder().uri("/it").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = body_text(response).await;
+        assert!(body.contains(r#"<link rel="canonical" href="https://app.example.com/it">"#));
+        assert!(body
+            .contains(r#"<link rel="alternate" hreflang="en" href="https://app.example.com/en">"#));
     }
 
     #[tokio::test]
@@ -1048,7 +1254,7 @@ mod tests {
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
 
         // The embedded frontend assets stay reachable.
-        let index = send(&app, "GET", "/", None, None).await;
+        let index = send(&app, "GET", "/en", None, None).await;
         assert_eq!(index.status(), StatusCode::OK);
     }
 

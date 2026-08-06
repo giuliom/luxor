@@ -1,9 +1,18 @@
 <!doctype html>
-<html lang="en">
+<!-- Template, not a served page: rendered once per locale at startup by
+     src/i18n.rs. Double-brace placeholders resolve to locales/<lang>/common.json
+     entries (HTML-escaped) or to the template variables lang, dir, base_url,
+     canonical, aria_current_*, and i18n_json. -->
+<html lang="{{lang}}" dir="{{dir}}">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Luxor backend console</title>
+    <title>{{meta.title}}</title>
+    <meta name="description" content="{{meta.description}}">
+    <link rel="canonical" href="{{canonical}}">
+    <link rel="alternate" hreflang="en" href="{{base_url}}/en">
+    <link rel="alternate" hreflang="it" href="{{base_url}}/it">
+    <link rel="alternate" hreflang="x-default" href="{{base_url}}/en">
     <link rel="icon" href="/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/styles.css">
   </head>
@@ -12,187 +21,195 @@
       <div class="page-content">
         <header class="hero">
         <div>
-          <p class="eyebrow">Rust · Axum · PostgreSQL · Redis · WebSockets · OpenTelemetry · WebAssembly</p>
-          <h1>Luxor backend console</h1>
-          <p class="intro">A small same-origin client for exercising the reference API. Access tokens live only in this page’s memory.</p>
+          <p class="eyebrow">{{hero.eyebrow}}</p>
+          <h1>{{hero.title}}</h1>
+          <p class="intro">{{hero.intro}}</p>
         </div>
-        <div id="identity-pill" class="identity" aria-live="polite">
-          <span id="auth-dot" class="dot checking"></span>
-          <span id="identity">Checking session…</span>
+        <div class="hero-side">
+          <nav class="lang-switcher" aria-label="{{langSelector.label}}">
+            <a href="/en" hreflang="en" lang="en"{{aria_current_en}} data-lang-choice="en">English</a>
+            <span aria-hidden="true">·</span>
+            <a href="/it" hreflang="it" lang="it"{{aria_current_it}} data-lang-choice="it">Italiano</a>
+          </nav>
+          <div id="identity-pill" class="identity" aria-live="polite">
+            <span id="auth-dot" class="dot checking"></span>
+            <span id="identity">{{identity.checking}}</span>
+          </div>
         </div>
         </header>
 
         <section class="grid">
         <article class="card wide">
           <div class="card-heading">
-            <div><span class="number">01</span><h2>Service</h2></div>
+            <div><span class="number">01</span><h2>{{service.title}}</h2></div>
             <div class="badge-group">
-              <span id="runtime-badge" class="badge">Checking runtime…</span>
-              <span id="health-badge" class="badge">Unchecked</span>
+              <span id="runtime-badge" class="badge">{{service.checkingRuntime}}</span>
+              <span id="health-badge" class="badge">{{service.unchecked}}</span>
             </div>
           </div>
-          <p>Check the public health and clock endpoints.</p>
+          <p>{{service.body}}</p>
           <div class="actions">
-            <button id="health-button" type="button">Check health</button>
-            <button id="time-button" class="secondary" type="button">Server time</button>
+            <button id="health-button" type="button">{{service.checkHealth}}</button>
+            <button id="time-button" class="secondary" type="button">{{service.serverTime}}</button>
           </div>
         </article>
 
         <article class="card">
           <div class="card-heading">
-            <div><span class="number">02</span><h2>Authentication</h2></div>
-            <span id="auth-badge" class="badge">Checking…</span>
+            <div><span class="number">02</span><h2>{{auth.title}}</h2></div>
+            <span id="auth-badge" class="badge">{{auth.checking}}</span>
           </div>
-          <p id="auth-description">Register or sign in against PostgreSQL-backed sessions. New accounts take the selected role.</p>
+          <p id="auth-description">{{auth.description}}</p>
           <form id="auth-form" hidden>
-            <label>Email<input id="email" type="email" autocomplete="email" value="demo@example.com" required></label>
-            <label>Password<input id="password" type="password" autocomplete="current-password" minlength="12" value="change-this-password" required></label>
-            <label>Role · registration only<select id="role">
-              <option value="user" selected>User</option>
-              <option value="admin">Admin</option>
+            <label>{{auth.email}}<input id="email" type="email" autocomplete="email" value="demo@example.com" required></label>
+            <label>{{auth.password}}<input id="password" type="password" autocomplete="current-password" minlength="12" value="change-this-password" required></label>
+            <label>{{auth.roleLabel}}<select id="role">
+              <option value="user" selected>{{auth.roleUser}}</option>
+              <option value="admin">{{auth.roleAdmin}}</option>
             </select></label>
             <div class="actions">
-              <button id="login-button" type="submit">Log in</button>
-              <button id="register-button" class="secondary" type="button">Register</button>
+              <button id="login-button" type="submit">{{auth.logIn}}</button>
+              <button id="register-button" class="secondary" type="button">{{auth.register}}</button>
             </div>
           </form>
           <div id="session-panel" class="session-panel" hidden>
             <div class="session-identity">
               <span id="session-avatar" class="avatar" aria-hidden="true">?</span>
               <div>
-                <p class="session-label">Signed in as</p>
+                <p class="session-label">{{auth.signedInAs}}</p>
                 <p id="session-email" class="session-email">—</p>
               </div>
               <span id="session-role" class="badge role-chip">—</span>
             </div>
             <p id="session-meta" class="session-meta"></p>
             <div class="actions">
-              <button id="profile-button" class="secondary" type="button">Fetch profile</button>
-              <button id="logout-button" class="quiet danger" type="button">Log out</button>
+              <button id="profile-button" class="secondary" type="button">{{auth.fetchProfile}}</button>
+              <button id="logout-button" class="quiet danger" type="button">{{auth.logOut}}</button>
             </div>
           </div>
         </article>
 
         <article class="card">
-          <div class="card-heading"><div><span class="number">03</span><h2>Cache</h2></div><span class="badge protected">Protected</span></div>
+          <div class="card-heading"><div><span class="number">03</span><h2>{{cache.title}}</h2></div><span class="badge protected">{{badges.protected}}</span></div>
           <form id="cache-form">
-            <label>JSON value<input id="cache-value" value='{"theme":"sand"}' required></label>
-            <label>TTL in seconds<input id="cache-ttl" type="number" min="1" max="86400" value="300" required></label>
+            <label>{{cache.jsonValue}}<input id="cache-value" value='{"theme":"sand"}' required></label>
+            <label>{{cache.ttlSeconds}}<input id="cache-ttl" type="number" min="1" max="86400" value="300" required></label>
             <div class="actions">
-              <button type="submit">Cache value</button>
-              <button id="cache-get-button" class="secondary" type="button">Read</button>
-              <button id="cache-delete-button" class="quiet" type="button">Clear</button>
+              <button type="submit">{{cache.write}}</button>
+              <button id="cache-get-button" class="secondary" type="button">{{cache.read}}</button>
+              <button id="cache-delete-button" class="quiet" type="button">{{cache.clear}}</button>
             </div>
           </form>
         </article>
 
         <article class="card wide">
           <div class="card-heading">
-            <div><span class="number">04</span><h2>Permissions</h2></div>
+            <div><span class="number">04</span><h2>{{permissions.title}}</h2></div>
             <div class="badge-group">
-              <span id="permissions-role-badge" class="badge">Signed out</span>
-              <span class="badge protected">Protected</span>
+              <span id="permissions-role-badge" class="badge">{{permissions.signedOut}}</span>
+              <span class="badge protected">{{badges.protected}}</span>
             </div>
           </div>
-          <p>Each role carries a fixed set of grants — chosen at registration and enforced server-side. Call the endpoints below as each role to watch the same request succeed or fail.</p>
+          <p>{{permissions.body}}</p>
           <div class="matrix-scroll">
-            <table id="permissions-matrix" class="permissions-matrix" aria-label="Role permission matrix"></table>
+            <table id="permissions-matrix" class="permissions-matrix" aria-label="{{permissions.matrixLabel}}"></table>
           </div>
           <div class="endpoints">
             <div class="endpoint">
               <div>
                 <p class="endpoint-name"><code>GET /api/demo/reports</code></p>
-                <p class="endpoint-permission">Requires <code>reports.view</code></p>
+                <p class="endpoint-permission">{{permissions.requires}} <code>reports.view</code></p>
               </div>
-              <span id="reports-outcome" class="badge">Not called</span>
-              <button id="reports-button" class="secondary" type="button">Fetch report</button>
+              <span id="reports-outcome" class="badge">{{permissions.notCalled}}</span>
+              <button id="reports-button" class="secondary" type="button">{{permissions.fetchReport}}</button>
             </div>
             <div class="endpoint">
               <div>
                 <p class="endpoint-name"><code>DELETE /api/demo/records</code></p>
-                <p class="endpoint-permission">Requires <code>records.purge</code></p>
+                <p class="endpoint-permission">{{permissions.requires}} <code>records.purge</code></p>
               </div>
-              <span id="purge-outcome" class="badge">Not called</span>
-              <button id="purge-button" class="secondary" type="button">Purge records</button>
+              <span id="purge-outcome" class="badge">{{permissions.notCalled}}</span>
+              <button id="purge-button" class="secondary" type="button">{{permissions.purgeRecords}}</button>
             </div>
           </div>
         </article>
 
         <article class="card wide">
-          <div class="card-heading"><div><span class="number">05</span><h2>Queue</h2></div><span class="badge protected">Protected</span></div>
-          <p>Enqueue an audit event using the documented Redis list message contract.</p>
+          <div class="card-heading"><div><span class="number">05</span><h2>{{queue.title}}</h2></div><span class="badge protected">{{badges.protected}}</span></div>
+          <p>{{queue.body}}</p>
           <form id="job-form" class="inline-form">
-            <label>Action<input id="job-action" value="demo_button_clicked" maxlength="200" required></label>
-            <button type="submit">Enqueue event</button>
+            <label>{{queue.action}}<input id="job-action" value="demo_button_clicked" maxlength="200" required></label>
+            <button type="submit">{{queue.enqueue}}</button>
           </form>
         </article>
 
         <article class="card wide">
           <div class="card-heading">
-            <div><span class="number">06</span><h2>Realtime</h2></div>
+            <div><span class="number">06</span><h2>{{realtime.title}}</h2></div>
             <div class="badge-group">
-              <span id="realtime-badge" class="badge">Disconnected</span>
-              <span class="badge protected">Protected</span>
+              <span id="realtime-badge" class="badge">{{realtime.disconnected}}</span>
+              <span class="badge protected">{{badges.protected}}</span>
             </div>
           </div>
-          <p>Exchange a short-lived, single-use ticket for a WebSocket, then watch the server push. Open this page in a second tab and broadcast: presence and messages fan out to every connection.</p>
+          <p>{{realtime.body}}</p>
           <div class="actions">
-            <button id="realtime-connect-button" type="button">Connect</button>
-            <button id="realtime-disconnect-button" class="quiet" type="button" disabled>Disconnect</button>
+            <button id="realtime-connect-button" type="button">{{realtime.connect}}</button>
+            <button id="realtime-disconnect-button" class="quiet" type="button" disabled>{{realtime.disconnect}}</button>
           </div>
           <dl class="telemetry-result">
-            <div><dt>Connection</dt><dd id="realtime-state">Disconnected</dd></div>
-            <div><dt>Clients online</dt><dd id="realtime-clients">—</dd></div>
-            <div><dt>Events received</dt><dd id="realtime-events">0</dd></div>
+            <div><dt>{{realtime.connection}}</dt><dd id="realtime-state">{{realtime.disconnected}}</dd></div>
+            <div><dt>{{realtime.clientsOnline}}</dt><dd id="realtime-clients">—</dd></div>
+            <div><dt>{{realtime.eventsReceived}}</dt><dd id="realtime-events">0</dd></div>
           </dl>
           <form id="realtime-form" class="inline-form">
-            <label>Broadcast<input id="realtime-text" maxlength="280" value="Hello from this tab" required disabled></label>
-            <button id="realtime-send-button" type="submit" disabled>Send</button>
+            <label>{{realtime.broadcast}}<input id="realtime-text" maxlength="280" value="{{realtime.defaultMessage}}" required disabled></label>
+            <button id="realtime-send-button" type="submit" disabled>{{realtime.send}}</button>
           </form>
-          <ol id="realtime-feed" class="realtime-feed" aria-live="polite" aria-label="Realtime event feed"></ol>
+          <ol id="realtime-feed" class="realtime-feed" aria-live="polite" aria-label="{{realtime.feedLabel}}"></ol>
         </article>
 
         <article class="card wide telemetry-card">
           <div class="card-heading">
-            <div><span class="number">07</span><h2>OpenTelemetry</h2></div>
-            <span id="telemetry-badge" class="badge">Not checked</span>
+            <div><span class="number">07</span><h2>{{telemetry.title}}</h2></div>
+            <span id="telemetry-badge" class="badge">{{telemetry.notChecked}}</span>
           </div>
-          <p>Generate an HTTP trace with two concurrent child spans, then inspect the captured span waterfall without leaving the page.</p>
+          <p>{{telemetry.body}}</p>
           <div class="actions">
-            <button id="telemetry-button" type="button">Generate trace</button>
+            <button id="telemetry-button" type="button">{{telemetry.generate}}</button>
           </div>
           <dl id="telemetry-result" class="telemetry-result" hidden>
-            <div><dt>Service</dt><dd id="telemetry-service">—</dd></div>
-            <div><dt>Request ID</dt><dd id="telemetry-request-id">—</dd></div>
-            <div><dt>Trace ID</dt><dd id="telemetry-trace-id">—</dd></div>
+            <div><dt>{{telemetry.service}}</dt><dd id="telemetry-service">—</dd></div>
+            <div><dt>{{telemetry.requestId}}</dt><dd id="telemetry-request-id">—</dd></div>
+            <div><dt>{{telemetry.traceId}}</dt><dd id="telemetry-trace-id">—</dd></div>
           </dl>
-          <div id="trace-waterfall" class="trace-waterfall" role="img" aria-label="Trace span waterfall" hidden></div>
+          <div id="trace-waterfall" class="trace-waterfall" role="img" aria-label="{{telemetry.waterfallLabel}}" hidden></div>
         </article>
 
         <article class="card wide">
           <div class="card-heading">
-            <div><span class="number">08</span><h2>WebAssembly</h2></div>
-            <span id="wasm-badge" class="badge">Not loaded</span>
+            <div><span class="number">08</span><h2>{{wasm.title}}</h2></div>
+            <span id="wasm-badge" class="badge">{{wasm.notLoaded}}</span>
           </div>
-          <p>Stream-compile a Rust module with WebAssembly.instantiateStreaming, then count primes with the same sieve in WebAssembly and in JavaScript and compare their 10-run average timings.</p>
+          <p>{{wasm.body}}</p>
           <form id="wasm-form" class="inline-form">
-            <label>Sieve limit<input id="wasm-limit" type="number" min="2" max="10000000" step="1" value="1000000" required></label>
-            <button type="submit">Run benchmark</button>
+            <label>{{wasm.sieveLimit}}<input id="wasm-limit" type="number" min="2" max="10000000" step="1" value="1000000" required></label>
+            <button type="submit">{{wasm.run}}</button>
           </form>
           <dl id="wasm-result" class="telemetry-result" hidden>
-            <div><dt>Primes found</dt><dd id="wasm-count">—</dd></div>
-            <div><dt>WebAssembly avg.</dt><dd id="wasm-time">—</dd></div>
-            <div><dt>JavaScript avg.</dt><dd id="wasm-js-time">—</dd></div>
+            <div><dt>{{wasm.primesFound}}</dt><dd id="wasm-count">—</dd></div>
+            <div><dt>{{wasm.wasmAvg}}</dt><dd id="wasm-time">—</dd></div>
+            <div><dt>{{wasm.jsAvg}}</dt><dd id="wasm-js-time">—</dd></div>
           </dl>
         </article>
         </section>
       </div>
 
       <section class="activity" aria-labelledby="activity-title">
-        <div><p class="eyebrow">Latest response</p><h2 id="activity-title">Activity</h2></div>
-        <pre id="message" aria-live="polite">Ready.</pre>
+        <div><p class="eyebrow">{{activity.eyebrow}}</p><h2 id="activity-title">{{activity.title}}</h2></div>
+        <pre id="message" aria-live="polite">{{activity.ready}}</pre>
       </section>
     </main>
+    <script id="i18n-data" type="application/json">{{i18n_json}}</script>
     <script src="/script.js"></script>
   </body>
 </html>

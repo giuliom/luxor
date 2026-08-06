@@ -1,3 +1,49 @@
+// --- Internationalisation ---------------------------------------------------
+// The server renders each page in exactly one language (/en, /it) and inlines
+// that language's dictionary as a non-executing JSON data block, so the page
+// never flashes English and never fetches a second locale's resources. All
+// dynamic strings resolve through t()/tp() against whole messages with named
+// placeholders — sentences are never assembled from concatenated fragments —
+// and dates, numbers, and durations go through the locale-aware Intl APIs.
+
+const locale = document.documentElement.lang || "en";
+const i18n = JSON.parse(document.querySelector("#i18n-data").textContent);
+
+const pluralRules = new Intl.PluralRules(locale);
+const numberFormat = new Intl.NumberFormat(locale);
+const dateTimeFormat = new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" });
+const timeFormat = new Intl.DateTimeFormat(locale, { timeStyle: "medium" });
+const secondsFormat = new Intl.NumberFormat(locale, { style: "unit", unit: "second", unitDisplay: "narrow", maximumFractionDigits: 2 });
+const millisFormat = new Intl.NumberFormat(locale, { style: "unit", unit: "millisecond", unitDisplay: "narrow", maximumFractionDigits: 1 });
+const microsFormat = new Intl.NumberFormat(locale, { style: "unit", unit: "microsecond", unitDisplay: "narrow", maximumFractionDigits: 0 });
+
+function formatMessage(message, params) {
+  return message.replace(/\{(\w+)\}/g, (token, name) => (name in params ? String(params[name]) : token));
+}
+
+// Falls back to the key itself: a visible `some.key` on screen is a loud,
+// diagnosable failure, unlike silently presenting another language.
+function t(key, params = {}) {
+  return formatMessage(i18n[key] ?? key, params);
+}
+
+// Pluralized lookup: `<key>.<CLDR category>` via Intl.PluralRules, with
+// `other` as the category every language defines. The count is provided to
+// the message pre-formatted for the locale.
+function tp(key, count, params = {}) {
+  const message = i18n[`${key}.${pluralRules.select(count)}`] ?? i18n[`${key}.other`] ?? key;
+  return formatMessage(message, { count: numberFormat.format(count), ...params });
+}
+
+// The selector links are ordinary crawlable anchors; scripting only persists
+// the explicit choice so the `/` redirect can honor it on the next visit. A
+// language named in the URL always wins over this cookie.
+for (const link of document.querySelectorAll("[data-lang-choice]")) {
+  link.addEventListener("click", () => {
+    document.cookie = `lang=${link.dataset.langChoice}; path=/; max-age=31536000; samesite=lax`;
+  });
+}
+
 let accessToken = null;
 let currentRole = null;
 
@@ -32,12 +78,14 @@ function setIdentity(user) {
   const signedIn = Boolean(user);
   currentRole = signedIn ? user.role : null;
 
-  identity.textContent = signedIn ? `Signed in as ${user.email} · ${user.role}` : "Signed out";
+  identity.textContent = signedIn
+    ? t("identity.signedIn", { email: user.email, role: user.role })
+    : t("identity.signedOut");
   authDot.classList.remove("checking");
   authDot.classList.toggle("online", signedIn);
   identityPill.classList.toggle("online", signedIn);
 
-  authBadge.textContent = signedIn ? "Signed in" : "Signed out";
+  authBadge.textContent = signedIn ? t("auth.badgeSignedIn") : t("auth.badgeSignedOut");
   authBadge.classList.toggle("ok", signedIn);
 
   authForm.hidden = signedIn;
@@ -47,12 +95,12 @@ function setIdentity(user) {
     sessionAvatar.textContent = user.email.charAt(0).toUpperCase();
     sessionRole.textContent = user.role;
     sessionMeta.textContent = user.created_at
-      ? `Account created ${new Date(user.created_at).toLocaleString()}`
+      ? t("session.created", { date: dateTimeFormat.format(new Date(user.created_at)) })
       : "";
   }
 
   for (const badge of document.querySelectorAll(".badge.protected")) {
-    badge.textContent = signedIn ? "Unlocked" : "Log in required";
+    badge.textContent = signedIn ? t("badges.unlocked") : t("badges.loginRequired");
     badge.classList.toggle("unlocked", signedIn);
   }
 
@@ -66,15 +114,31 @@ function setIdentity(user) {
 function setRuntime(runtime) {
   const runtimeBadge = document.querySelector("#runtime-badge");
   runtimeBadge.textContent =
-    runtime.database === "embedded-postgresql" ? "Embedded database" : "Full stack";
+    runtime.database === "embedded-postgresql" ? t("runtime.embedded") : t("runtime.fullStack");
   runtimeBadge.classList.add("ok");
+}
+
+// The API deliberately answers with stable error codes; the code is what gets
+// translated here, so backend messages never need to know the page language.
+// Codes whose server message carries request-specific detail (which field
+// failed, which permission is missing) keep that detail visibly appended
+// rather than silently dropped or passed off as translated.
+function describeError(payload, status) {
+  const code = payload?.error?.code;
+  const serverMessage = payload?.error?.message;
+  const translated = code && i18n[`errors.code.${code}`];
+  if (!translated) {
+    return serverMessage || t("errors.serverStatus", { status });
+  }
+  const detailed = ["bad_request", "forbidden", "conflict"].includes(code);
+  return detailed && serverMessage ? `${translated} — ${serverMessage}` : translated;
 }
 
 async function parseResponse(response) {
   if (response.status === 204) return null;
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const error = new Error(data?.error?.message || `Server returned ${response.status}`);
+    const error = new Error(describeError(data, response.status));
     error.status = response.status;
     throw error;
   }
@@ -116,11 +180,11 @@ async function run(label, operation) {
   try {
     show(label, await operation());
   } catch (error) {
-    show(`${label} failed`, error.message);
+    show(t("labels.failed", { label }), error.message);
   }
 }
 
-document.querySelector("#health-button").addEventListener("click", () => run("Health", async () => {
+document.querySelector("#health-button").addEventListener("click", () => run(t("labels.health"), async () => {
   const data = await api("/api/health");
   const badge = document.querySelector("#health-badge");
   badge.textContent = data.status;
@@ -128,7 +192,7 @@ document.querySelector("#health-button").addEventListener("click", () => run("He
   return data;
 }));
 
-document.querySelector("#time-button").addEventListener("click", () => run("Server time", () => api("/api/time")));
+document.querySelector("#time-button").addEventListener("click", () => run(t("service.serverTime"), () => api("/api/time")));
 
 async function authenticate(endpoint) {
   const payload = {
@@ -149,17 +213,17 @@ async function authenticate(endpoint) {
 
 document.querySelector("#auth-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  run("Login", () => authenticate("/api/auth/login"));
+  run(t("labels.login"), () => authenticate("/api/auth/login"));
 });
 
-document.querySelector("#register-button").addEventListener("click", () => run("Registration", () => authenticate("/api/auth/register")));
+document.querySelector("#register-button").addEventListener("click", () => run(t("labels.registration"), () => authenticate("/api/auth/register")));
 
-document.querySelector("#profile-button").addEventListener("click", () => run("Profile", () => api("/api/me")));
-document.querySelector("#logout-button").addEventListener("click", () => run("Logout", async () => {
+document.querySelector("#profile-button").addEventListener("click", () => run(t("labels.profile"), () => api("/api/me")));
+document.querySelector("#logout-button").addEventListener("click", () => run(t("labels.logout"), async () => {
   await api("/api/auth/logout", { method: "POST" }, false);
   accessToken = null;
   setIdentity(null);
-  return "Refresh session revoked and cookie removed.";
+  return t("auth.logoutResult");
 }));
 
 // --- Permissions ---------------------------------------------------------
@@ -177,7 +241,7 @@ function renderMatrix(matrix) {
   const headRow = document.createElement("tr");
   const lead = document.createElement("th");
   lead.scope = "col";
-  lead.textContent = "Permission";
+  lead.textContent = t("permissions.columnPermission");
   headRow.append(lead);
   for (const role of roles) {
     const th = document.createElement("th");
@@ -211,7 +275,7 @@ function renderMatrix(matrix) {
       mark.setAttribute("role", "img");
       mark.setAttribute(
         "aria-label",
-        `${role} ${granted ? "may" : "may not"}: ${permission.description}`,
+        t(granted ? "permissions.may" : "permissions.mayNot", { role, description: permission.description }),
       );
       const grant = document.createElement("td");
       grant.className = "grant";
@@ -231,27 +295,29 @@ function syncMatrixAccess() {
   for (const element of matrixTable.querySelectorAll("[data-role]")) {
     element.classList.toggle("current", element.dataset.role === currentRole);
   }
-  permissionsRoleBadge.textContent = signedIn ? `Acting as ${currentRole}` : "Signed out";
+  permissionsRoleBadge.textContent = signedIn
+    ? t("permissions.actingAs", { role: currentRole })
+    : t("permissions.signedOut");
   permissionsRoleBadge.classList.toggle("ok", signedIn);
 }
 
-function bindDemoEndpoint(buttonId, badgeId, label, path, options) {
+function bindDemoEndpoint(buttonId, badgeId, labelKey, path, options) {
   const badge = document.querySelector(badgeId);
-  document.querySelector(buttonId).addEventListener("click", () => run(label, async () => {
+  document.querySelector(buttonId).addEventListener("click", () => run(t(labelKey), async () => {
     try {
       const data = await api(path, options);
-      badge.textContent = "200 OK";
+      badge.textContent = t("status.ok");
       badge.className = "badge ok";
       return data;
     } catch (error) {
       if (error.status === 403) {
-        badge.textContent = "403 Forbidden";
+        badge.textContent = t("status.forbidden");
         badge.className = "badge denied";
       } else if (error.status === 401) {
-        badge.textContent = "401 Unauthorized";
+        badge.textContent = t("status.unauthorized");
         badge.className = "badge";
       } else {
-        badge.textContent = "Error";
+        badge.textContent = t("status.error");
         badge.className = "badge";
       }
       throw error;
@@ -259,17 +325,17 @@ function bindDemoEndpoint(buttonId, badgeId, label, path, options) {
   }));
 }
 
-bindDemoEndpoint("#reports-button", "#reports-outcome", "Demo report", "/api/demo/reports", {});
-bindDemoEndpoint("#purge-button", "#purge-outcome", "Record purge", "/api/demo/records", { method: "DELETE" });
+bindDemoEndpoint("#reports-button", "#reports-outcome", "labels.demoReport", "/api/demo/reports", {});
+bindDemoEndpoint("#purge-button", "#purge-outcome", "labels.recordPurge", "/api/demo/records", { method: "DELETE" });
 
 document.querySelector("#cache-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  run("Cache write", () => {
+  run(t("labels.cacheWrite"), () => {
     let value;
     try {
       value = JSON.parse(document.querySelector("#cache-value").value);
     } catch {
-      throw new Error("Cache value must be valid JSON.");
+      throw new Error(t("cache.invalidJson"));
     }
     return api("/api/cache/demo", {
       method: "PUT",
@@ -278,15 +344,15 @@ document.querySelector("#cache-form").addEventListener("submit", (event) => {
   });
 });
 
-document.querySelector("#cache-get-button").addEventListener("click", () => run("Cache read", () => api("/api/cache/demo")));
-document.querySelector("#cache-delete-button").addEventListener("click", () => run("Cache clear", async () => {
+document.querySelector("#cache-get-button").addEventListener("click", () => run(t("labels.cacheRead"), () => api("/api/cache/demo")));
+document.querySelector("#cache-delete-button").addEventListener("click", () => run(t("labels.cacheClear"), async () => {
   await api("/api/cache/demo", { method: "DELETE" });
-  return "Cache key invalidated.";
+  return t("cache.invalidated");
 }));
 
 document.querySelector("#job-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  run("Queue", () => api("/api/jobs", {
+  run(t("labels.queue"), () => api("/api/jobs", {
     method: "POST",
     body: JSON.stringify({ kind: "audit_event", action: document.querySelector("#job-action").value }),
   }));
@@ -340,7 +406,7 @@ function appendFeedEntry(kind, text) {
   body.textContent = text;
 
   const time = document.createElement("time");
-  time.textContent = new Date().toLocaleTimeString();
+  time.textContent = timeFormat.format(new Date());
 
   const entry = document.createElement("li");
   entry.append(label, body, time);
@@ -359,27 +425,42 @@ function participantLabel(participant) {
 
 function handleRealtimeEvent(event) {
   eventCount += 1;
-  realtimeEvents.textContent = eventCount.toLocaleString();
+  realtimeEvents.textContent = numberFormat.format(eventCount);
   if (typeof event.connections === "number") {
-    realtimeClients.textContent = event.connections.toLocaleString();
+    realtimeClients.textContent = numberFormat.format(event.connections);
   }
 
   switch (event.type) {
     case "welcome":
       connectionId = event.connection_id;
-      appendFeedEntry("welcome", `connected as ${participantLabel(event.you)} · up to ${event.limits.max_text_characters} characters, ${event.limits.messages_per_window} messages per ${event.limits.message_window_seconds}s`);
+      appendFeedEntry("welcome", t("realtime.welcome", {
+        participant: participantLabel(event.you),
+        max: numberFormat.format(event.limits.max_text_characters),
+        messages: numberFormat.format(event.limits.messages_per_window),
+        window: secondsFormat.format(event.limits.message_window_seconds),
+      }));
       break;
-    case "presence":
-      appendFeedEntry(
-        "presence",
-        `${participantLabel(event.participant)} ${event.change}${event.connection_id === connectionId ? " (this tab)" : ""}`,
-      );
+    case "presence": {
+      // The server reports the change as a stable code, translated here like
+      // the API error codes; an unrecognized one falls back to the generic
+      // message with the raw code visible.
+      const family = event.connection_id === connectionId ? "realtime.presenceSelf" : "realtime.presence";
+      const variant = event.change === "connected" || event.change === "disconnected" ? event.change : "changed";
+      appendFeedEntry("presence", t(`${family}.${variant}`, {
+        participant: participantLabel(event.participant),
+        change: event.change,
+      }));
       break;
+    }
     case "message":
-      appendFeedEntry("message", `#${event.sequence} ${participantLabel(event.from)}: ${event.text}`);
+      appendFeedEntry("message", t("realtime.messageEntry", {
+        sequence: event.sequence,
+        participant: participantLabel(event.from),
+        text: event.text,
+      }));
       break;
     case "tick":
-      appendFeedEntry("tick", `server tick #${event.sequence}`);
+      appendFeedEntry("tick", t("realtime.tickEntry", { sequence: event.sequence }));
       break;
     case "notice":
       appendFeedEntry("notice", `${event.code}: ${event.detail}`);
@@ -399,11 +480,11 @@ async function openRealtimeSocket() {
   const url = `${scheme}//${location.host}/api/realtime/ws?ticket=${encodeURIComponent(ticket)}`;
 
   closingDeliberately = false;
-  setRealtimeState("Connecting…", { connecting: true });
+  setRealtimeState(t("realtime.connecting"), { connecting: true });
   socket = new WebSocket(url);
   socket.addEventListener("open", () => {
     reconnectAttempt = 0;
-    setRealtimeState("Live", { online: true });
+    setRealtimeState(t("realtime.live"), { online: true });
   });
   socket.addEventListener("message", (event) => handleRealtimeEvent(JSON.parse(event.data)));
   socket.addEventListener("close", (event) => {
@@ -411,13 +492,14 @@ async function openRealtimeSocket() {
     connectionId = null;
     realtimeClients.textContent = "—";
     if (closingDeliberately || !accessToken) {
-      setRealtimeState("Disconnected");
+      setRealtimeState(t("realtime.disconnected"));
       return;
     }
-    appendFeedEntry("notice", `connection closed (${event.code}${event.reason ? `: ${event.reason}` : ""})`);
+    const detail = `${event.code}${event.reason ? `: ${event.reason}` : ""}`;
+    appendFeedEntry("notice", t("realtime.closed", { detail }));
     scheduleReconnect();
   });
-  return `Ticket redeemed; the socket is open. Broadcasts reach every connection this instance serves.`;
+  return t("realtime.ticketRedeemed");
 }
 
 // Reconnecting is the part of realtime that a demo usually skips: a dropped
@@ -425,15 +507,15 @@ async function openRealtimeSocket() {
 // is not hammered by every open tab.
 function scheduleReconnect() {
   if (reconnectAttempt >= RECONNECT_DELAYS_MS.length) {
-    setRealtimeState("Disconnected");
-    appendFeedEntry("notice", "gave up reconnecting; press Connect to try again");
+    setRealtimeState(t("realtime.disconnected"));
+    appendFeedEntry("notice", t("realtime.gaveUp"));
     return;
   }
   const delay = RECONNECT_DELAYS_MS[reconnectAttempt];
   reconnectAttempt += 1;
-  setRealtimeState(`Reconnecting in ${delay / 1000}s…`, { connecting: true });
+  setRealtimeState(t("realtime.reconnectingIn", { delay: secondsFormat.format(delay / 1000) }), { connecting: true });
   reconnectTimer = setTimeout(() => {
-    run("Realtime reconnect", async () => {
+    run(t("labels.realtimeReconnect"), async () => {
       try {
         return await openRealtimeSocket();
       } catch (error) {
@@ -454,63 +536,61 @@ function disconnectRealtime() {
   if (socket) {
     socket.close(1000, "client disconnected");
   } else {
-    setRealtimeState("Disconnected");
+    setRealtimeState(t("realtime.disconnected"));
   }
 }
 
-realtimeConnectButton.addEventListener("click", () => run("Realtime", async () => {
+realtimeConnectButton.addEventListener("click", () => run(t("labels.realtime"), async () => {
   reconnectAttempt = 0;
   try {
     return await openRealtimeSocket();
   } catch (error) {
-    setRealtimeState("Disconnected");
+    setRealtimeState(t("realtime.disconnected"));
     throw error;
   }
 }));
 
-realtimeDisconnectButton.addEventListener("click", () => run("Realtime", () => {
+realtimeDisconnectButton.addEventListener("click", () => run(t("labels.realtime"), () => {
   disconnectRealtime();
-  return "Socket closed. The ticket it used was already spent on the handshake.";
+  return t("realtime.socketClosed");
 }));
 
 document.querySelector("#realtime-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  run("Realtime broadcast", () => {
+  run(t("labels.realtimeBroadcast"), () => {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      throw new Error("Connect before broadcasting.");
+      throw new Error(t("realtime.connectFirst"));
     }
     const text = realtimeText.value;
     socket.send(JSON.stringify({ type: "broadcast", text }));
-    return { sent: { type: "broadcast", text }, note: "Every connection receives it, this one included." };
+    return { sent: { type: "broadcast", text }, note: t("realtime.sentNote") };
   });
 });
 
-document.querySelector("#telemetry-button").addEventListener("click", () => run("OpenTelemetry trace", async () => {
+document.querySelector("#telemetry-button").addEventListener("click", () => run(t("labels.telemetryTrace"), async () => {
   const data = await api("/api/telemetry/demo");
   const badge = document.querySelector("#telemetry-badge");
 
   document.querySelector("#telemetry-service").textContent = data.service_name;
-  document.querySelector("#telemetry-request-id").textContent = data.request_id || "Unavailable";
-  document.querySelector("#telemetry-trace-id").textContent = data.trace_id || "Unavailable";
+  document.querySelector("#telemetry-request-id").textContent = data.request_id || t("telemetry.unavailable");
+  document.querySelector("#telemetry-trace-id").textContent = data.trace_id || t("telemetry.unavailable");
   document.querySelector("#telemetry-result").hidden = false;
 
   if (!data.trace_id) {
-    badge.textContent = "No trace";
+    badge.textContent = t("telemetry.noTrace");
     badge.classList.remove("ok");
     return data;
   }
 
   const trace = await fetchTrace(data.trace_id);
   renderWaterfall(trace.spans);
-  badge.textContent = `${trace.spans.length} spans`;
+  badge.textContent = tp("telemetry.spans", trace.spans.length);
   badge.classList.add("ok");
 
   return {
     ...data,
     span_count: trace.spans.length,
-    hint: data.otlp_enabled
-      ? "Spans are captured in-process for the waterfall below and batch-exported to the configured OTLP endpoint."
-      : "Spans are captured in-process. Set OTEL_EXPORTER_OTLP_ENDPOINT to also export them over OTLP.",
+    hint: data.otlp_enabled ? t("telemetry.hintExporting") : t("telemetry.hintInProcess"),
   };
 }));
 
@@ -546,7 +626,7 @@ function renderWaterfall(spans) {
   for (const span of spans) {
     const label = document.createElement("span");
     label.className = "trace-label";
-    label.style.paddingLeft = `${depthOf(span) * 0.9}rem`;
+    label.style.paddingInlineStart = `${depthOf(span) * 0.9}rem`;
     label.textContent = span.name;
     label.title = `${span.name} · ${span.kind}`;
 
@@ -569,10 +649,12 @@ function renderWaterfall(spans) {
   }
 }
 
+// Durations use Intl's unit formatting, so both the number (decimal
+// separator, grouping) and the unit symbol follow the page locale.
 function formatDuration(ms) {
-  if (ms >= 1000) return `${(ms / 1000).toFixed(2)} s`;
-  if (ms >= 1) return `${ms.toFixed(1)} ms`;
-  return `${(ms * 1000).toFixed(0)} µs`;
+  if (ms >= 1000) return secondsFormat.format(ms / 1000);
+  if (ms >= 1) return millisFormat.format(ms);
+  return microsFormat.format(ms * 1000);
 }
 
 let wasmExports = null;
@@ -607,7 +689,7 @@ function countPrimesJs(limit) {
 
 document.querySelector("#wasm-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  run("WebAssembly benchmark", async () => {
+  run(t("labels.wasmBenchmark"), async () => {
     const badge = document.querySelector("#wasm-badge");
     const limit = Math.min(Math.max(Math.trunc(Number(document.querySelector("#wasm-limit").value) || 0), 2), 10_000_000);
 
@@ -615,11 +697,11 @@ document.querySelector("#wasm-form").addEventListener("submit", (event) => {
     try {
       exports = await loadWasmDemo();
     } catch (error) {
-      badge.textContent = "Unavailable";
+      badge.textContent = t("wasm.unavailable");
       badge.classList.remove("ok");
       throw error;
     }
-    badge.textContent = "Instantiated";
+    badge.textContent = t("wasm.instantiated");
     badge.classList.add("ok");
 
     // Run both implementations once outside the timed section so the
@@ -627,7 +709,10 @@ document.querySelector("#wasm-form").addEventListener("submit", (event) => {
     const wasmWarmupCount = exports.count_primes(limit) >>> 0;
     const jsWarmupCount = countPrimesJs(limit);
     if (wasmWarmupCount !== jsWarmupCount) {
-      throw new Error(`WebAssembly and JavaScript disagree during warmup: ${wasmWarmupCount} vs ${jsWarmupCount}`);
+      throw new Error(t("wasm.warmupMismatch", {
+        wasm: numberFormat.format(wasmWarmupCount),
+        js: numberFormat.format(jsWarmupCount),
+      }));
     }
 
     let wasmTotalMs = 0;
@@ -642,15 +727,19 @@ document.querySelector("#wasm-form").addEventListener("submit", (event) => {
       jsTotalMs += performance.now() - jsStart;
 
       if (wasmCount !== jsCount) {
-        throw new Error(`WebAssembly and JavaScript disagree on iteration ${iteration + 1}: ${wasmCount} vs ${jsCount}`);
+        throw new Error(t("wasm.iterationMismatch", {
+          iteration: numberFormat.format(iteration + 1),
+          wasm: numberFormat.format(wasmCount),
+          js: numberFormat.format(jsCount),
+        }));
       }
     }
     const wasmMs = wasmTotalMs / WASM_BENCHMARK_ITERATIONS;
     const jsMs = jsTotalMs / WASM_BENCHMARK_ITERATIONS;
 
-    document.querySelector("#wasm-count").textContent = wasmWarmupCount.toLocaleString();
-    document.querySelector("#wasm-time").textContent = `${wasmMs.toFixed(1)} ms`;
-    document.querySelector("#wasm-js-time").textContent = `${jsMs.toFixed(1)} ms`;
+    document.querySelector("#wasm-count").textContent = numberFormat.format(wasmWarmupCount);
+    document.querySelector("#wasm-time").textContent = millisFormat.format(wasmMs);
+    document.querySelector("#wasm-js-time").textContent = millisFormat.format(jsMs);
     document.querySelector("#wasm-result").hidden = false;
 
     return {
@@ -659,7 +748,7 @@ document.querySelector("#wasm-form").addEventListener("submit", (event) => {
       iterations: WASM_BENCHMARK_ITERATIONS,
       wasm_ms: Number(wasmMs.toFixed(2)),
       js_ms: Number(jsMs.toFixed(2)),
-      note: "10-run averages after one untimed warmup; identical byte-array sieves must return matching counts. Timings vary by device.",
+      note: t("wasm.note"),
     };
   });
 });
@@ -672,15 +761,10 @@ async function initialize() {
 
     // A surviving HTTP-only refresh cookie may restore the session after a reload.
     const restored = await refreshAccessToken();
-    show(
-      "Session",
-      restored
-        ? "Restored from the refresh cookie."
-        : "No active session. Log in or register to use the protected endpoints.",
-    );
+    show(t("labels.session"), restored ? t("session.restored") : t("session.none"));
   } catch (error) {
     setIdentity(null);
-    show("Startup check failed", error.message);
+    show(t("labels.startupFailed"), error.message);
   }
 }
 
