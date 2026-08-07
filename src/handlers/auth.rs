@@ -2,6 +2,7 @@ use crate::{
     auth::{hash_refresh_token, rotate_refresh_token, AuthUser, RefreshGrant, RefreshPolicy},
     db,
     error::{ApiJson, AppError},
+    events::{self, DomainEvent},
     models::{PublicUser, Role},
     services,
     state::AppState,
@@ -61,6 +62,17 @@ pub async fn register(
     .await?;
     let access_token = state.jwt.issue(user.id, user.role)?;
     let jar = jar.add(refresh_cookie(&state, &grant));
+    // Announced after the account exists, and never allowed to fail the
+    // registration that produced it; the event carries no email, because a
+    // topic is read by more consumers than the account holder.
+    events::publish_or_log(
+        state.events.as_ref(),
+        DomainEvent::UserRegistered {
+            user_id: user.id,
+            role: user.role,
+        },
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         jar,

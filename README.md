@@ -2,7 +2,7 @@
 
 [![Build & Tests](https://github.com/giuliom/luxor/actions/workflows/CI.yml/badge.svg)](https://github.com/giuliom/luxor/actions/workflows/CI.yml)
 
-Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, JWT access tokens with rotating refresh sessions, role-based permissions with a fixed grant matrix, per-client rate limiting, ticket-authenticated realtime WebSockets, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console — statically generated in English and Italian at language-prefixed URLs — with live, in-page trace and Rust-to-WebAssembly demos. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
+Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, Kafka domain events with an in-process consumer, JWT access tokens with rotating refresh sessions, role-based permissions with a fixed grant matrix, per-client rate limiting, ticket-authenticated realtime WebSockets, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console — statically generated in English and Italian at language-prefixed URLs — with live, in-page trace and Rust-to-WebAssembly demos. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
 
 ## Quick start
 
@@ -12,29 +12,29 @@ Prerequisites: a current stable Rust toolchain. No Docker is required.
 cargo run
 ```
 
-Open <http://localhost:8080>. When `DATABASE_URL` is not set outside production, Luxor starts an embedded development PostgreSQL server: the first run downloads the server binaries once into `~/.theseus/postgresql`, and cluster data persists in the gitignored `.luxor/` directory, so accounts and sessions survive restarts. When `REDIS_URL` is not set, the cache and queue use in-memory backends. The embedded database always applies the checked-in migrations at startup; an external `DATABASE_URL` migrates when `AUTO_MIGRATE=true`. Production requires both URLs, and should set `AUTO_MIGRATE=false` and run `luxor migrate` (or `cargo sqlx migrate run`) as a separate, controlled deployment step.
+Open <http://localhost:8080>. When `DATABASE_URL` is not set outside production, Luxor starts an embedded development PostgreSQL server: the first run downloads the server binaries once into `~/.theseus/postgresql`, and cluster data persists in the gitignored `.luxor/` directory, so accounts and sessions survive restarts. When `REDIS_URL` is not set, the cache and queue use in-memory backends, and when `KAFKA_BROKERS` is not set, domain events run over an in-process bus. The embedded database always applies the checked-in migrations at startup; an external `DATABASE_URL` migrates when `AUTO_MIGRATE=true`. Production requires both URLs, and should set `AUTO_MIGRATE=false` and run `luxor migrate` (or `cargo sqlx migrate run`) as a separate, controlled deployment step.
 
-### Running against Docker PostgreSQL and Redis
+### Running against Docker PostgreSQL, Redis, and Kafka
 
-To exercise the Redis-backed cache and queue, or to develop against the same services production uses, point the URLs at real instances — the Compose file provides both:
+To exercise the Redis-backed cache and queue and a real Kafka topic, or to develop against the same services production uses, point the URLs at real instances — the Compose file provides all three:
 
 ```sh
 cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,postgres --locked
-cp .env.example .env   # then set DATABASE_URL and REDIS_URL to the Compose URLs
+cp .env.example .env   # then set DATABASE_URL, REDIS_URL, and KAFKA_BROKERS to the Compose values
 docker compose up -d
 cargo sqlx migrate run
 cargo run
 ```
 
-Compose reads `POSTGRES_PORT` and `REDIS_PORT` for its host mappings. If either default port is occupied, change that value and the corresponding URL in `.env` before starting the services. `sqlx-cli` 0.8 is used for creating, applying, and reverting migrations.
+Compose reads `POSTGRES_PORT`, `REDIS_PORT`, and `KAFKA_PORT` for its host mappings. If a default port is occupied, change that value and the corresponding URL in `.env` before starting the services. `sqlx-cli` 0.8 is used for creating, applying, and reverting migrations.
 
 To stop local infrastructure, use `docker compose down`. Add `--volumes` only when you intentionally want to delete local database and Redis data.
 
 ### Debugging in VS Code
 
-With the CodeLLDB extension installed, choose **Debug luxor** and press F5. This default configuration needs no Docker: it runs the embedded development PostgreSQL server with the in-memory cache and queue, so the complete authentication and persistence flow works out of the box. It pins `DATABASE_URL` and `REDIS_URL` to empty values so a local `.env` cannot re-point it at external services.
+With the CodeLLDB extension installed, choose **Debug luxor** and press F5. This default configuration needs no Docker: it runs the embedded development PostgreSQL server with the in-memory cache, queue, and event bus, so the complete authentication and persistence flow works out of the box. It pins `DATABASE_URL`, `REDIS_URL`, and `KAFKA_BROKERS` to empty values so a local `.env` cannot re-point it at external services.
 
-Choose **Debug luxor (Docker PostgreSQL + Redis)** to run against real Redis and an external PostgreSQL. Its pre-launch task requires Docker Desktop, starts PostgreSQL and Redis, and waits for both health checks before launching Luxor. Both configurations set `APP_OPEN_BROWSER=true`, so Luxor opens <http://127.0.0.1:8080/> in the system-default browser immediately after binding its listener. An external browser is intentional because Luxor's security headers prevent the frontend from being embedded in VS Code's Simple Browser.
+Choose **Debug luxor (Docker PostgreSQL + Redis + Kafka)** to run against real Redis, a real Kafka broker, and an external PostgreSQL. Its pre-launch task requires Docker Desktop, starts all three, and waits for their health checks before launching Luxor. Both configurations set `APP_OPEN_BROWSER=true`, so Luxor opens <http://127.0.0.1:8080/> in the system-default browser immediately after binding its listener. An external browser is intentional because Luxor's security headers prevent the frontend from being embedded in VS Code's Simple Browser.
 
 ## HTTP API
 
@@ -66,6 +66,8 @@ Every `/api` route is rate limited per client IP inside a fixed window, and the 
 | `DELETE` | `/api/demo/records` | Bearer JWT + `records.purge` | Permission-gated simulated purge |
 | `GET/PUT/DELETE` | `/api/cache/demo` | Bearer JWT | Read, cache, or invalidate a JSON value |
 | `POST` | `/api/jobs` | Bearer JWT | Enqueue an audit or email-contract job |
+| `POST` | `/api/events` | Bearer JWT | Publish a note to the event topic and return its partition and offset |
+| `GET` | `/api/events?limit=20` | Bearer JWT | Read the events this instance has consumed back off the topic |
 | `POST` | `/api/realtime/ticket` | Bearer JWT | Mint a single-use ticket for one WebSocket handshake |
 | `GET` | `/api/realtime/ws` | Ticket query parameter | Upgrade to the realtime event stream |
 
@@ -114,6 +116,13 @@ What a role may do is defined by a fixed role-permission matrix that is part of 
 | `RATE_LIMIT_API_MAX_REQUESTS`, `RATE_LIMIT_API_WINDOW_SECONDS` | `120` per `60` | Per-IP budget for all `/api` routes |
 | `RATE_LIMIT_NAMESPACE` | `luxor:ratelimit` | Redis key prefix for the distributed limiter |
 | `CLIENT_IP_SOURCE` | `socket`; `x-forwarded-for` in production | How clients are identified for rate limiting; only use `x-forwarded-for` behind a trusted proxy |
+| `KAFKA_BROKERS` | In-process event bus | `host:port` list; unset or empty selects the in-process bus. Every other `KAFKA_*` setting requires it, and startup fails rather than ignoring one |
+| `KAFKA_TOPIC` | `luxor.events` | Topic domain events are published to and consumed from |
+| `KAFKA_CONSUMER_GROUP` | `luxor-console` | Instances sharing a group split the partitions; different groups each get every event |
+| `KAFKA_CLIENT_ID` | `luxor` | Identifies the application in broker logs and metrics |
+| `KAFKA_SECURITY_PROTOCOL` | `plaintext` | `plaintext`, `ssl`, `sasl_plaintext`, or `sasl_ssl` |
+| `KAFKA_SASL_MECHANISM`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD` | Empty | Required together by the SASL protocols and refused by the others; `PLAIN`, `SCRAM-SHA-256`, or `SCRAM-SHA-512` |
+| `KAFKA_DELIVERY_TIMEOUT_SECONDS` | `10` | Deadline for one publish including acknowledgement; keep it inside the request timeout |
 | `REALTIME_MAX_CONNECTIONS` | `100` | WebSockets one instance serves at once; further handshakes answer `503` |
 | `REALTIME_TICKET_TTL_SECONDS` | `30` | Lifetime of a single-use connection ticket; capped at 300 |
 | `AUTO_MIGRATE` | true outside production | Must normally be false in production; the embedded development database always migrates itself |
@@ -147,6 +156,29 @@ The checked-in migrations create normalized unique users, hashed refresh session
 Cache keys are validated, namespaced, JSON encoded, and always written with a positive TTL. A missing or expired key is a normal cache miss. Cache failures are surfaced as server errors rather than changing authoritative PostgreSQL data. Alongside the usual read, write, and invalidate, the cache exposes an atomic take (`GETDEL` on Redis 6.2+, the write lock held across read and removal in memory) so that single-use credentials such as the realtime connection ticket can be redeemed exactly once even when two callers race.
 
 The queue is enqueue-only. Producers `LPUSH` a version-stable JSON `JobEnvelope` to `QUEUE_KEY`; a separate future worker should use blocking `BRPOP`, which preserves FIFO order. The envelope contains an ID, explicit kind, tagged payload, enqueue time, `attempt`, and `max_attempts`. The worker owns acknowledgement semantics, retry backoff, idempotency, and dead-letter movement. `SendEmail` is only a provider-neutral job contract—this repository deliberately sends no email.
+
+## Kafka event stream
+
+One topic carries what the application announces about itself. Registering an account publishes `user.registered`, enqueueing a job publishes `job.enqueued`, and the console's **Event stream** card publishes `note.published` on demand. A consumer in the same process reads the topic back into a bounded in-memory window that `GET /api/events` serves, so the feed the console renders has genuinely been through the broker — each entry shows the partition and offset the record was written at, which is what distinguishes it from an echo of the publish response.
+
+Records are JSON, keyed, and versioned:
+
+```json
+{"id":"9f1c…","schema_version":1,"key":"3cfe10fc-…","occurred_at":"2026-01-01T12:00:00.123Z",
+ "kind":"user.registered","payload":{"user_id":"3cfe10fc-…","role":"admin"}}
+```
+
+The key is the identifier the event is about — the user, the job, the note's author. Kafka orders records only within a partition and picks the partition from the key, so keying this way is what keeps all events about one entity in order regardless of partition count or how many instances publish. Consumers switch on `kind` and ignore payloads they do not recognize; `schema_version` is what lets a consumer refuse a shape it was never written for. Each record also carries `content-type`, `event-id`, `event-kind`, and `schema-version` headers plus the W3C `traceparent` of the publishing request, so a consumer — this one or someone else's — continues the same trace instead of starting an unrelated one. The producer span is a `producer` span and the consume span a `consumer` span, which is how they appear in Jaeger and in the console's own trace waterfall.
+
+Three delivery decisions are worth naming:
+
+- **The producer is idempotent.** `enable.idempotence` pins `acks=all` and lets librdkafka retry a publish without risking a duplicate or a reordering, so a receipt means every in-sync replica holds the record.
+- **This application commits offsets, after handling an event**, rather than letting librdkafka's auto-commit timer acknowledge records that were merely read. Delivery is therefore at-least-once: a crash between handling and committing replays the event, which is a failure a consumer can defend against, unlike the silent loss auto-commit produces. A record that cannot be decoded is committed anyway and logged, because it will never decode later and the alternative is a projection that stops advancing forever; a deployment that must keep such records routes them to a dead-letter topic at that point.
+- **Publishing never fails the request that triggered it.** The account already exists and the job is already queued by the time the event is published, so a broker that is briefly unreachable costs the event, logged as lost, rather than the operation. Closing that gap means the transactional outbox pattern — writing the event to PostgreSQL inside the same transaction as the state change and relaying it from there — which is a larger commitment than this boundary makes, and the point at which "at-most-once announcement" stops being acceptable is a per-event decision.
+
+Without `KAFKA_BROKERS` the same publish and consume paths run over an in-process bus, so the card works with nothing installed. It is a stand-in, not a broker: nothing is persisted, there is one partition because there is one process, and no event reaches another instance. `GET /api/runtime` reports which of the two is live, and the console badge follows it.
+
+The client is [rust-rdkafka](https://github.com/fede1024/rust-rdkafka) over librdkafka, compiled from vendored sources together with the OpenSSL it needs for TLS and SASL SCRAM, and statically linked. That keeps `cargo run` working with no system packages installed and leaves the runtime image unchanged; the builder stage of the `Dockerfile` carries the `g++`, `make`, and `perl` those vendored builds need. Kerberos (`GSSAPI`) is deliberately not linked, so managed Kafka is reached with `sasl_ssl` and a SCRAM or PLAIN mechanism.
 
 ## Realtime WebSockets
 
@@ -236,16 +268,17 @@ Fast tests require no services:
 cargo test --lib
 ```
 
-The complete suite automatically enables PostgreSQL and Redis integration tests when their URLs exist:
+The complete suite automatically enables the PostgreSQL, Redis, and Kafka integration tests when their addresses exist:
 
 ```sh
 docker compose up -d
 DATABASE_URL=postgres://luxor:luxor@localhost:5432/luxor \
 REDIS_URL=redis://127.0.0.1:6379/ \
+KAFKA_BROKERS=localhost:9092 \
 cargo test --all-targets --all-features
 ```
 
-Integration tests use random users and Redis namespaces, run migrations idempotently, and clean up their records. CI starts ephemeral PostgreSQL and Redis services and runs:
+Integration tests use random users, Redis namespaces, and Kafka topics and consumer groups, run migrations idempotently, and clean up their records. The Kafka test publishes through a real producer and waits for the record to come back through a real consumer group, so it exercises the round trip rather than the client's API surface. CI starts ephemeral PostgreSQL, Redis, and Kafka services and runs:
 
 ```sh
 cargo fmt --all -- --check
@@ -279,13 +312,14 @@ The reference `DATABASE_URL`/`REDIS_URL` values above use Railway's private netw
 
 ## Production checklist
 
-- Supply production-only database, Redis, JWT, and optional telemetry secrets through a managed store.
+- Supply production-only database, Redis, Kafka, JWT, and optional telemetry secrets through a managed store.
 - Set `APP_ENV=production`, `AUTO_MIGRATE=false`, `REFRESH_COOKIE_SECURE=true`, and exact HTTPS CORS origins.
 - Run migrations as an explicit release step before shifting traffic.
 - Use managed PostgreSQL/Redis with TLS, authentication, backups, and least-privilege network rules.
 - Terminate HTTPS at a trusted proxy and preserve or generate `x-request-id`. Production then defaults to `HTTPS_ENFORCEMENT=proxy-header`, which redirects plaintext `GET`/`HEAD` to https and refuses every other plaintext method with `403 https_required`. It reads `x-forwarded-proto`, so the proxy must overwrite that header on every request instead of passing a client-supplied one through; a request that arrives without it is allowed, because failing closed would break health checks that bypass the proxy while buying nothing against a caller who can reach the container directly. Network rules, not this check, are what keep that caller out.
 - Production also refuses to start with a plaintext `CORS_ORIGINS` entry, and sends `Strict-Transport-Security: max-age=31536000; includeSubDomains`. Enable `HSTS_PRELOAD` only deliberately: preload-list submission is close to irreversible, and the config rejects the flag unless it also meets the list's own `includeSubDomains` and one-year max-age rules.
 - Review the rate-limit budgets for your traffic shape; production runs with `x-forwarded-for` client identification by default, which is only safe behind the platform proxy.
+- Reach managed Kafka over `sasl_ssl` with a SCRAM mechanism, and give the deployment its own `KAFKA_CONSUMER_GROUP`: instances sharing one split the topic's partitions, which is what you want for scale and not what you want for a second environment reading the same topic. Create the topic with the partition count and retention the workload needs — the app publishes to it and does not create it — and decide before launch which events cannot tolerate the at-most-once announcement described above.
 - Size `REALTIME_MAX_CONNECTIONS` against the instance's memory and file-descriptor limits, and confirm the proxy's idle timeout exceeds the five-second server tick. Before scaling past one instance, put a shared bus behind the hub or expect broadcasts to reach only the clients attached to the same instance.
 - Set resource limits, health probes, alerting, retention, and sampling for logs/traces/errors.
 - Plan JWT-secret rotation, database restore tests, and queue dead-letter handling (expired refresh sessions are pruned automatically).

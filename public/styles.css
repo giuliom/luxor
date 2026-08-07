@@ -350,6 +350,15 @@ button.danger { color: #933a29; }
 .realtime-feed .feed-text { overflow-wrap: anywhere; font-size: 0.82rem; line-height: 1.45; }
 .realtime-feed time { color: #8a867e; font: 650 0.68rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; }
 
+/* The event feed shows each record's position on the topic next to its clock
+   time: the coordinates are what make the entry a read of the stream rather
+   than an echo of the publish that produced it. */
+.feed-meta { display: grid; justify-items: end; gap: 0.2rem; }
+.feed-coordinates { color: #6d6b65; font: 650 0.68rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+.feed-kind.note { color: #7f482e; background: #edddd3; }
+.feed-kind.user { color: #285f3a; background: #d7e6da; }
+.feed-kind.job { color: #3c4f7c; background: #d8dfef; }
+
 .inline-form { grid-template-columns: minmax(12rem, 1fr) auto; align-items: end; }
 .activity { position: fixed; right: 0; bottom: 0; left: 0; z-index: 10; display: grid; grid-template-columns: 10rem minmax(0, 1fr); width: min(100% - 2rem, 76rem); gap: 2rem; max-height: 40dvh; margin: 0 auto; overflow: hidden; background: #273129; color: #f2eee3; border-color: #273129; }
 .activity .eyebrow { color: #df9672; }
@@ -391,5 +400,6 @@ html::-webkit-scrollbar-thumb:hover, .activity pre::-webkit-scrollbar-thumb:hove
   .activity pre { min-height: 3.5rem; max-height: calc(45dvh - 7rem); }
   .trace-row { grid-template-columns: minmax(6rem, 8rem) 1fr 3.6rem; }
   .realtime-feed li { grid-template-columns: 4.6rem minmax(0, 1fr); }
-  .realtime-feed time { grid-column: 2; }
+  .realtime-feed time, .feed-meta { grid-column: 2; }
+  .feed-meta { grid-auto-flow: column; justify-content: start; gap: 0.5rem; }
 }

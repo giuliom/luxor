@@ -11,7 +11,8 @@
         "--detach",
         "--wait",
         "postgres",
-        "redis"
+        "redis",
+        "kafka"
       ],
       "options": {
         "cwd": "${workspaceFolder}"

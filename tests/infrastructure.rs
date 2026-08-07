@@ -8,11 +8,20 @@ use luxor::{
     cache::{Cache, MemoryCache, RedisCache},
     config::{Config, RateLimitQuota},
     db,
+    events::{
+        spawn_consumer, DomainEvent, EventLog, EventPublisher, EventSource, KafkaPublisher,
+        MemoryEventBus,
+    },
     observability::TraceStore,
     queue::{Job, MemoryQueue, Queue, RedisQueue},
     rate_limit::{MemoryRateLimiter, RateLimiter, RedisRateLimiter},
     server,
     state::AppState,
+};
+use rdkafka::{
+    producer::{FutureProducer, FutureRecord},
+    util::Timeout,
+    ClientConfig,
 };
 use redis::AsyncCommands;
 use secrecy::SecretString;
@@ -56,6 +65,7 @@ async fn migrations_and_authentication_flow_work_against_postgres() {
         pool.clone(),
         Arc::new(MemoryCache::default()),
         Arc::new(MemoryQueue::default()),
+        Arc::new(MemoryEventBus::default()),
         Arc::new(MemoryRateLimiter::default()),
         TraceStore::default(),
     ));
@@ -307,6 +317,173 @@ async fn cache_and_queue_contracts_work_against_redis() {
         format!("{limiter_namespace}:{limiter_key}"),
     ];
     let _: usize = connection.del(&keys).await.unwrap();
+}
+
+/// The full round trip against a real broker: an event published through the
+/// producer comes back through a consumer group, decoded, with the coordinates
+/// the broker assigned it. Nothing here is simulated, which is why it is the
+/// one test that needs Kafka running.
+#[tokio::test]
+async fn events_round_trip_through_kafka() {
+    let Some(brokers) = env::var("KAFKA_BROKERS").ok() else {
+        eprintln!("skipping Kafka integration test: KAFKA_BROKERS is not set");
+        return;
+    };
+    // A topic and a group per run, so a rerun is never served another run's
+    // offsets and the assertions can count exactly.
+    let suffix = Uuid::new_v4();
+    let config = Config::from_map(HashMap::from([
+        ("KAFKA_BROKERS".into(), brokers),
+        ("KAFKA_TOPIC".into(), format!("luxor.test.{suffix}")),
+        (
+            "KAFKA_CONSUMER_GROUP".into(),
+            format!("luxor-test-{suffix}"),
+        ),
+    ]))
+    .unwrap();
+    let settings = config.kafka.as_ref().unwrap();
+
+    let publisher = KafkaPublisher::connect(settings).unwrap();
+    let log = EventLog::default();
+    let consumer = spawn_consumer(EventSource::kafka(settings).unwrap(), log.clone());
+
+    let author_id = Uuid::new_v4();
+    let receipt = publisher
+        .publish(DomainEvent::Note {
+            author_id,
+            text: "integration".into(),
+        })
+        .await
+        .expect("the broker acknowledges the publish");
+    // A receipt names the position the record occupies, not merely that it was
+    // sent: the topic was created on demand, so this is its first record.
+    assert_eq!(receipt.offset, 0);
+    assert_eq!(receipt.envelope.key, author_id.to_string());
+
+    // Joining a consumer group takes a rebalance, so the event arrives shortly
+    // after it was published rather than immediately.
+    let consumed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(event) = log.recent(1).into_iter().next() {
+                return event;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the published event comes back off the topic");
+
+    assert_eq!(consumed.envelope, receipt.envelope);
+    assert_eq!(consumed.partition, receipt.partition);
+    assert_eq!(consumed.offset, receipt.offset);
+    assert_eq!(consumed.envelope.kind(), "note.published");
+
+    // Stopping commits what was handled, so the same consumer group started
+    // again resumes rather than replaying. The proof has two halves, because
+    // "received nothing" is also what a consumer that never joined looks like:
+    // a new event published afterwards must arrive, and it must be the only
+    // thing that does.
+    consumer.stop().await;
+    let after_restart = EventLog::default();
+    let restarted = spawn_consumer(EventSource::kafka(settings).unwrap(), after_restart.clone());
+    let published_after_restart = publisher
+        .publish(DomainEvent::Note {
+            author_id,
+            text: "published after the restart".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(published_after_restart.offset, 1);
+
+    let resumed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(event) = after_restart.recent(1).into_iter().next() {
+                return event;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the restarted consumer receives events published after it");
+
+    assert_eq!(resumed.envelope.id, published_after_restart.envelope.id);
+    assert_eq!(
+        after_restart.consumed(),
+        1,
+        "the event consumed before the restart was replayed"
+    );
+
+    restarted.stop().await;
+}
+
+/// A record the application could never have written must not wedge the
+/// projection. It is skipped and acknowledged, so everything published behind
+/// it still arrives; the alternative is one malformed record stopping the
+/// stream at that offset forever.
+#[tokio::test]
+async fn a_record_that_is_not_an_event_is_skipped_rather_than_retried_forever() {
+    let Some(brokers) = env::var("KAFKA_BROKERS").ok() else {
+        eprintln!("skipping Kafka integration test: KAFKA_BROKERS is not set");
+        return;
+    };
+    let suffix = Uuid::new_v4();
+    let topic = format!("luxor.test.poison.{suffix}");
+    let config = Config::from_map(HashMap::from([
+        ("KAFKA_BROKERS".into(), brokers.clone()),
+        ("KAFKA_TOPIC".into(), topic.clone()),
+        (
+            "KAFKA_CONSUMER_GROUP".into(),
+            format!("luxor-test-{suffix}"),
+        ),
+    ]))
+    .unwrap();
+    let settings = config.kafka.as_ref().unwrap();
+
+    // Written with a bare producer, because this application's publisher is
+    // incapable of producing the record this test needs.
+    let raw: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .create()
+        .unwrap();
+    raw.send(
+        FutureRecord::to(&topic)
+            .key("not-an-event")
+            .payload(r#"{"totally":"unexpected"}"#),
+        Timeout::After(Duration::from_secs(10)),
+    )
+    .await
+    .expect("the broker accepts the record regardless of its shape");
+
+    let log = EventLog::default();
+    let consumer = spawn_consumer(EventSource::kafka(settings).unwrap(), log.clone());
+    let receipt = KafkaPublisher::connect(settings)
+        .unwrap()
+        .publish(DomainEvent::Note {
+            author_id: Uuid::new_v4(),
+            text: "published behind a poison record".into(),
+        })
+        .await
+        .unwrap();
+    // The undecodable record holds the offset before it.
+    assert_eq!(receipt.offset, 1);
+
+    let consumed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(event) = log.recent(1).into_iter().next() {
+                return event;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the consumer moves past the record it cannot decode");
+
+    assert_eq!(consumed.envelope.id, receipt.envelope.id);
+    assert_eq!(consumed.offset, 1);
+    // Skipped, not projected: only the record that decoded is in the log.
+    assert_eq!(log.consumed(), 1);
+
+    consumer.stop().await;
 }
 
 async fn request_json(

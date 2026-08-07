@@ -21,6 +21,17 @@ opentelemetry-otlp = { version = "0.17.0", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.24.1", features = ["rt-tokio"] }
 postgresql_embedded = { version = "0.20.4", default-features = false, features = ["rustls", "theseus", "tokio"], optional = true }
 rand = "0.8.6"
+# librdkafka bindings, built from the vendored C sources. "tracing" routes the
+# library's own log output through this application's subscriber instead of the
+# `log` facade. "ssl-vendored" compiles and statically links OpenSSL, which
+# librdkafka needs for TLS and for SASL SCRAM: the alternative, linking the
+# system OpenSSL, would make `cargo run` depend on a pkg-config and libssl-dev
+# installation on every developer machine. It is the only OpenSSL in the
+# process — everything else here speaks TLS through rustls — and it is updated
+# by bumping openssl-src rather than the base image. The Cyrus SASL ("gssapi")
+# feature stays off, so SASL PLAIN, SCRAM, and OAUTHBEARER are available and
+# Kerberos is not.
+rdkafka = { version = "0.39.0", features = ["ssl-vendored", "tracing"] }
 redis = { version = "0.27.6", features = ["aio", "connection-manager", "tokio-comp"] }
 # Depended on only to fix the process-level crypto provider at startup; every
 # actual TLS connection is made by sqlx, sentry, or reqwest. Default features

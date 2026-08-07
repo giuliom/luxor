@@ -13,7 +13,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use luxor::{
-    auth::JwtService, cache::MemoryCache, config::Config, db, models::Role,
+    auth::JwtService, cache::MemoryCache, config::Config, db, events::MemoryEventBus, models::Role,
     observability::TraceStore, queue::MemoryQueue, rate_limit::MemoryRateLimiter, server,
     state::AppState,
 };
@@ -54,6 +54,7 @@ impl TestServer {
             db::connect_lazy("postgres://luxor:luxor@localhost/luxor").unwrap(),
             Arc::new(MemoryCache::default()),
             Arc::new(MemoryQueue::default()),
+            Arc::new(MemoryEventBus::default()),
             Arc::new(MemoryRateLimiter::default()),
             TraceStore::default(),
         );

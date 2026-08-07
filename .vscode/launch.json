@@ -21,18 +21,20 @@
         "APP_OPEN_BROWSER": "true",
         // Explicitly empty so a .env file cannot re-point this Docker-free
         // configuration at external services: empty means "use the embedded
-        // PostgreSQL server and the in-memory cache and queue".
+        // PostgreSQL server, the in-memory cache and queue, and the in-process
+        // event bus".
         "DATABASE_URL": "",
         "REDIS_URL": "",
+        "KAFKA_BROKERS": "",
         "REFRESH_COOKIE_SECURE": "false",
         "RUST_BACKTRACE": "1",
-        "RUST_LOG": "luxor=info,tower_http=info,sqlx=warn,redis=warn",
+        "RUST_LOG": "luxor=info,tower_http=info,sqlx=warn,redis=warn,librdkafka=warn",
         "PORT": "8080"
       },
       "sourceLanguages": ["rust"]
     },
     {
-      "name": "Debug luxor (Docker PostgreSQL + Redis)",
+      "name": "Debug luxor (Docker PostgreSQL + Redis + Kafka)",
       "type": "lldb",
       "request": "launch",
       "cargo": {
@@ -52,10 +54,11 @@
         "APP_OPEN_BROWSER": "true",
         "DATABASE_URL": "postgres://luxor:luxor@localhost:5432/luxor",
         "REDIS_URL": "redis://127.0.0.1:6379/",
+        "KAFKA_BROKERS": "localhost:9092",
         "AUTO_MIGRATE": "true",
         "REFRESH_COOKIE_SECURE": "false",
         "RUST_BACKTRACE": "1",
-        "RUST_LOG": "luxor=info,tower_http=info,sqlx=warn,redis=warn",
+        "RUST_LOG": "luxor=info,tower_http=info,sqlx=warn,redis=warn,librdkafka=warn",
         "PORT": "8080"
       },
       "sourceLanguages": ["rust"]
@@ -94,7 +97,8 @@
       "env": {
         "RUST_BACKTRACE": "1",
         "DATABASE_URL": "postgres://luxor:luxor@localhost:5432/luxor",
-        "REDIS_URL": "redis://127.0.0.1:6379/"
+        "REDIS_URL": "redis://127.0.0.1:6379/",
+        "KAFKA_BROKERS": "localhost:9092"
       },
       "sourceLanguages": ["rust"]
     }

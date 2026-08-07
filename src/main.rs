@@ -4,6 +4,7 @@ use luxor::{
     config::Config,
     db,
     dev_postgres::DevPostgres,
+    events::{EventPublisher, EventSource, KafkaPublisher, MemoryEventBus},
     observability,
     queue::{MemoryQueue, Queue, RedisQueue},
     rate_limit::{MemoryRateLimiter, RateLimiter, RedisRateLimiter},
@@ -127,13 +128,44 @@ async fn serve() -> Result<()> {
                 )
             }
         };
+    // The publisher and the consumer are built from the same settings, so the
+    // events this instance emits are the events it reads back.
+    let (events, event_source): (Arc<dyn EventPublisher>, EventSource) = match &config.kafka {
+        Some(settings) => {
+            let publisher =
+                KafkaPublisher::connect(settings).context("Kafka producer setup failed")?;
+            let source = EventSource::kafka(settings).context("Kafka consumer setup failed")?;
+            tracing::info!(
+                topic = %settings.topic,
+                consumer_group = %settings.consumer_group,
+                "publishing domain events to Kafka"
+            );
+            (Arc::new(publisher), source)
+        }
+        None => {
+            tracing::info!("KAFKA_BROKERS is not set; using the in-process event bus");
+            let bus = MemoryEventBus::default();
+            let source = bus.source();
+            (Arc::new(bus), source)
+        }
+    };
+
     // Compute the login timing-equalizer hash before traffic arrives so the
     // first unknown-email login is not measurably slower than later ones.
     tokio::task::spawn_blocking(luxor::auth::prewarm_login_timing_equalizer);
 
     spawn_session_pruner(db.clone());
 
-    let state = AppState::new(config.clone(), db, cache, queue, rate_limiter, trace_store);
+    let state = AppState::new(
+        config.clone(),
+        db,
+        cache,
+        queue,
+        events,
+        rate_limiter,
+        trace_store,
+    );
+    let consumer = luxor::events::spawn_consumer(event_source, state.event_log.clone());
     let app = server::app(state);
 
     let address = listener.local_addr()?;
@@ -155,6 +187,10 @@ async fn serve() -> Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .context("HTTP server failed")?;
+
+    // Once no request can publish anything, the consumer is given its chance
+    // to drain and commit what is already on the stream.
+    consumer.stop().await;
 
     if let Some(server) = dev_postgres {
         server.stop().await;

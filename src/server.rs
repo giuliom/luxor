@@ -1,7 +1,7 @@
 use crate::{
     config::HttpsEnforcement,
     error::AppError,
-    handlers::{auth, basic, cache, demo, jobs, permissions, realtime},
+    handlers::{auth, basic, cache, demo, events, jobs, permissions, realtime},
     i18n,
     rate_limit::{self, RateLimitPolicy},
     state::AppState,
@@ -82,6 +82,9 @@ pub fn app(state: AppState) -> Router {
                 .delete(cache::delete_demo),
         )
         .route("/jobs", post(jobs::enqueue))
+        // Publishing goes to the broker; the listing comes back from it, by
+        // way of the consumer that feeds this instance's event log.
+        .route("/events", get(events::stream).post(events::publish))
         // The ticket exchange is an ordinary authenticated POST; the upgrade
         // that redeems it authenticates itself with that ticket, because a
         // browser handshake cannot carry an Authorization header.
@@ -453,6 +456,7 @@ mod tests {
         cache::MemoryCache,
         config::Config,
         db,
+        events::MemoryEventBus,
         models::Role,
         observability::{StoredSpan, TraceStore},
         queue::MemoryQueue,
@@ -511,6 +515,7 @@ mod tests {
             pool,
             Arc::new(MemoryCache::default()),
             Arc::new(MemoryQueue::default()),
+            Arc::new(MemoryEventBus::default()),
             Arc::new(MemoryRateLimiter::default()),
             trace_store,
         ))
@@ -910,6 +915,8 @@ mod tests {
             ("DELETE", "/api/demo/records"),
             ("GET", "/api/cache/demo"),
             ("POST", "/api/jobs"),
+            ("GET", "/api/events"),
+            ("POST", "/api/events"),
             ("POST", "/api/realtime/ticket"),
         ] {
             let response = test_app()
@@ -1210,6 +1217,68 @@ mod tests {
         }
     }
 
+    /// A publish answers with the broker's receipt, and the payload is
+    /// validated on the way in — the topic is read back by this application
+    /// and by anyone else subscribed to it.
+    #[tokio::test]
+    async fn publishing_an_event_returns_its_position_on_the_stream() {
+        let app = test_app();
+        let user = bearer(Role::User);
+
+        for expected_offset in 0..2 {
+            let response = send(
+                &app,
+                "POST",
+                "/api/events",
+                Some(&user),
+                Some(r#"{"text":"deployed to staging"}"#),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let body: serde_json::Value =
+                serde_json::from_str(&body_text(response).await).expect("a JSON receipt");
+            assert_eq!(body["status"], "published");
+            assert_eq!(body["kind"], "note.published");
+            assert_eq!(body["schema_version"], 1);
+            assert_eq!(body["offset"], expected_offset);
+            assert_eq!(body["payload"]["text"], "deployed to staging");
+        }
+
+        for rejected in [
+            r#"{"text":""}"#,
+            r#"{"text":"   "}"#,
+            r#"{"text":"two\nlines"}"#,
+        ] {
+            let response = send(&app, "POST", "/api/events", Some(&user), Some(rejected)).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{rejected} should be refused"
+            );
+        }
+    }
+
+    /// The listing is filled by the consumer task, which the binary starts and
+    /// these tests do not, so it reports the stream's identity and an empty
+    /// window rather than echoing what was just published.
+    #[tokio::test]
+    async fn the_event_listing_describes_the_stream_and_bounds_its_window() {
+        let app = test_app();
+        let user = bearer(Role::User);
+
+        let response = send(&app, "GET", "/api/events", Some(&user), None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("a JSON listing");
+        assert_eq!(body["backend"], "memory");
+        assert_eq!(body["topic"], serde_json::Value::Null);
+        assert_eq!(body["consumed"], 0);
+        assert!(body["events"].as_array().unwrap().is_empty());
+
+        let oversized = send(&app, "GET", "/api/events?limit=500", Some(&user), None).await;
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn auth_rate_limit_rejects_excess_attempts_with_retry_headers() {
         let config = Config::from_map(HashMap::from([(
@@ -1469,7 +1538,7 @@ mod tests {
         assert_eq!(development.status(), StatusCode::OK);
         assert_eq!(
             body_text(development).await,
-            r#"{"database":"embedded-postgresql","cache":"memory","queue":"memory"}"#
+            r#"{"database":"embedded-postgresql","cache":"memory","queue":"memory","events":"memory"}"#
         );
 
         let production = test_app_with_config(production_config())
@@ -1482,9 +1551,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(production.status(), StatusCode::OK);
+        // The event backend is reported by the publisher this instance was
+        // built with, not inferred from configuration, and these fixtures name
+        // no brokers.
         assert_eq!(
             body_text(production).await,
-            r#"{"database":"postgresql","cache":"redis","queue":"redis"}"#
+            r#"{"database":"postgresql","cache":"redis","queue":"redis","events":"memory"}"#
         );
     }
 

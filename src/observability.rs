@@ -132,8 +132,9 @@ impl ObservabilityGuard {
 
 pub fn init(config: &Config) -> Result<(ObservabilityGuard, TraceStore)> {
     let sentry = init_sentry(config);
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("luxor=info,tower_http=info,sqlx=warn,redis=warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("luxor=info,tower_http=info,sqlx=warn,redis=warn,librdkafka=warn")
+    });
     let trace_store = TraceStore::default();
     let tracer = build_tracer(config, &trace_store)?;
 

@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod dev_postgres;
 pub mod error;
+pub mod events;
 pub mod handlers;
 pub mod i18n;
 pub mod models;

@@ -145,7 +145,28 @@
 
         <article class="card wide">
           <div class="card-heading">
-            <div><span class="number">06</span><h2>{{realtime.title}}</h2></div>
+            <div><span class="number">06</span><h2>{{events.title}}</h2></div>
+            <div class="badge-group">
+              <span id="events-backend-badge" class="badge">{{events.notLoaded}}</span>
+              <span class="badge protected">{{badges.protected}}</span>
+            </div>
+          </div>
+          <p>{{events.body}}</p>
+          <form id="event-form" class="inline-form">
+            <label>{{events.note}}<input id="event-text" maxlength="280" value="{{events.defaultNote}}" required></label>
+            <button type="submit">{{events.publish}}</button>
+          </form>
+          <dl class="telemetry-result">
+            <div><dt>{{events.topic}}</dt><dd id="events-topic">—</dd></div>
+            <div><dt>{{events.consumerGroup}}</dt><dd id="events-consumerGroup">—</dd></div>
+            <div><dt>{{events.consumed}}</dt><dd id="events-consumed">0</dd></div>
+          </dl>
+          <ol id="events-feed" class="realtime-feed" aria-live="polite" aria-label="{{events.feedLabel}}"></ol>
+        </article>
+
+        <article class="card wide">
+          <div class="card-heading">
+            <div><span class="number">07</span><h2>{{realtime.title}}</h2></div>
             <div class="badge-group">
               <span id="realtime-badge" class="badge">{{realtime.disconnected}}</span>
               <span class="badge protected">{{badges.protected}}</span>
@@ -170,7 +191,7 @@
 
         <article class="card wide telemetry-card">
           <div class="card-heading">
-            <div><span class="number">07</span><h2>{{telemetry.title}}</h2></div>
+            <div><span class="number">08</span><h2>{{telemetry.title}}</h2></div>
             <span id="telemetry-badge" class="badge">{{telemetry.notChecked}}</span>
           </div>
           <p>{{telemetry.body}}</p>
@@ -187,7 +208,7 @@
 
         <article class="card wide">
           <div class="card-heading">
-            <div><span class="number">08</span><h2>{{wasm.title}}</h2></div>
+            <div><span class="number">09</span><h2>{{wasm.title}}</h2></div>
             <span id="wasm-badge" class="badge">{{wasm.notLoaded}}</span>
           </div>
           <p>{{wasm.body}}</p>

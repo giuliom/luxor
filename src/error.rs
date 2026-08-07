@@ -39,6 +39,8 @@ pub enum AppError {
     Database(#[from] sqlx::Error),
     #[error("cache operation failed")]
     Cache(#[from] redis::RedisError),
+    #[error("event stream operation failed")]
+    EventStream(#[from] rdkafka::error::KafkaError),
     #[error("serialization failed")]
     Serialization(#[from] serde_json::Error),
     #[error("authentication operation failed")]
@@ -80,6 +82,7 @@ impl AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Database(_)
             | Self::Cache(_)
+            | Self::EventStream(_)
             | Self::Serialization(_)
             | Self::Authentication
             | Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -102,6 +105,7 @@ impl AppError {
             Self::Conflict(_) => "conflict",
             Self::Database(_)
             | Self::Cache(_)
+            | Self::EventStream(_)
             | Self::Serialization(_)
             | Self::Authentication
             | Self::Internal => "internal_error",
@@ -112,6 +116,7 @@ impl AppError {
         match self {
             Self::Database(_)
             | Self::Cache(_)
+            | Self::EventStream(_)
             | Self::Serialization(_)
             | Self::Authentication
             | Self::Internal => "an internal error occurred".into(),
@@ -212,6 +217,24 @@ mod tests {
         assert_eq!(
             String::from_utf8(bytes.to_vec()).unwrap(),
             r#"{"error":{"code":"bad_request","message":"invalid email"}}"#
+        );
+    }
+
+    /// Infrastructure failures answer alike and say nothing about the
+    /// infrastructure: a broker address or a topic name in an error body tells
+    /// a caller about the deployment's internals.
+    #[tokio::test]
+    async fn event_stream_failures_answer_as_internal_errors() {
+        let response = AppError::EventStream(rdkafka::error::KafkaError::MessageProduction(
+            rdkafka::error::RDKafkaErrorCode::UnknownTopicOrPartition,
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            String::from_utf8(bytes.to_vec()).unwrap(),
+            r#"{"error":{"code":"internal_error","message":"an internal error occurred"}}"#
         );
     }
 

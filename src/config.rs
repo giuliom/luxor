@@ -97,6 +97,119 @@ pub struct RealtimeSettings {
     pub ticket_ttl_seconds: u64,
 }
 
+/// How a Kafka client authenticates and encrypts its connection, named exactly
+/// as librdkafka's `security.protocol` spells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KafkaSecurityProtocol {
+    Plaintext,
+    Ssl,
+    SaslPlaintext,
+    SaslSsl,
+}
+
+impl KafkaSecurityProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plaintext => "plaintext",
+            Self::Ssl => "ssl",
+            Self::SaslPlaintext => "sasl_plaintext",
+            Self::SaslSsl => "sasl_ssl",
+        }
+    }
+
+    fn is_sasl(self) -> bool {
+        matches!(self, Self::SaslPlaintext | Self::SaslSsl)
+    }
+}
+
+impl FromStr for KafkaSecurityProtocol {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "plaintext" => Ok(Self::Plaintext),
+            "ssl" => Ok(Self::Ssl),
+            "sasl_plaintext" => Ok(Self::SaslPlaintext),
+            "sasl_ssl" => Ok(Self::SaslSsl),
+            _ => Err(ConfigError::Invalid(
+                "KAFKA_SECURITY_PROTOCOL",
+                value.to_owned(),
+            )),
+        }
+    }
+}
+
+/// The SASL mechanisms librdkafka implements itself. Kerberos (`GSSAPI`) is
+/// deliberately absent: it needs the Cyrus SASL library, which this build does
+/// not link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KafkaSaslMechanism {
+    Plain,
+    ScramSha256,
+    ScramSha512,
+}
+
+impl KafkaSaslMechanism {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "PLAIN",
+            Self::ScramSha256 => "SCRAM-SHA-256",
+            Self::ScramSha512 => "SCRAM-SHA-512",
+        }
+    }
+}
+
+impl FromStr for KafkaSaslMechanism {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_uppercase().as_str() {
+            "PLAIN" => Ok(Self::Plain),
+            "SCRAM-SHA-256" => Ok(Self::ScramSha256),
+            "SCRAM-SHA-512" => Ok(Self::ScramSha512),
+            "GSSAPI" => Err(ConfigError::Invalid(
+                "KAFKA_SASL_MECHANISM",
+                "GSSAPI needs the Cyrus SASL library, which this build does not link".to_owned(),
+            )),
+            _ => Err(ConfigError::Invalid(
+                "KAFKA_SASL_MECHANISM",
+                value.to_owned(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct KafkaSasl {
+    pub mechanism: KafkaSaslMechanism,
+    pub username: String,
+    pub password: SecretString,
+}
+
+/// Connection and topic settings for the event stream. `None` selects the
+/// in-process event bus; a configuration that names brokers always carries a
+/// complete, validated set.
+#[derive(Clone, Debug)]
+pub struct KafkaSettings {
+    /// `host:port[,host:port…]`, as librdkafka's `bootstrap.servers` takes it,
+    /// normalized so the library never sees stray whitespace.
+    pub brokers: String,
+    pub topic: String,
+    /// The consumer group this instance joins. Instances sharing a group share
+    /// the topic's partitions between them; instances given different groups
+    /// each receive every event.
+    pub consumer_group: String,
+    /// Identifies this application to the broker, in its logs and metrics.
+    pub client_id: String,
+    pub security_protocol: KafkaSecurityProtocol,
+    /// Present exactly when `security_protocol` names a SASL one.
+    pub sasl: Option<KafkaSasl>,
+    /// How long a publish may take — including the broker acknowledging it —
+    /// before it is reported as failed. It bounds a request that publishes an
+    /// event, so it belongs well inside `REQUEST_TIMEOUT_SECONDS`.
+    pub delivery_timeout_seconds: u64,
+}
+
 /// How the app decides a request reached it over TLS. TLS is terminated by
 /// the platform proxy, never in-process, so the only available signal is what
 /// that proxy reports.
@@ -197,6 +310,8 @@ pub struct Config {
     pub request_timeout_seconds: u64,
     pub rate_limit: RateLimitSettings,
     pub realtime: RealtimeSettings,
+    /// `None` selects the in-process event bus; see [`KafkaSettings`].
+    pub kafka: Option<KafkaSettings>,
     pub auto_migrate: bool,
     pub open_browser: bool,
     pub otlp_endpoint: Option<String>,
@@ -318,6 +433,7 @@ impl Config {
         }
         let rate_limit = parse_rate_limit(&values, production)?;
         let realtime = parse_realtime(&values)?;
+        let kafka = parse_kafka(&values)?;
         let hsts = parse_hsts(&values, production)?;
         // Production sits behind a platform proxy that terminates TLS and
         // reports the original scheme; local development is reached directly
@@ -385,6 +501,7 @@ impl Config {
             request_timeout_seconds,
             rate_limit,
             realtime,
+            kafka,
             auto_migrate,
             open_browser,
             otlp_endpoint,
@@ -631,6 +748,159 @@ fn parse_realtime(values: &HashMap<String, String>) -> Result<RealtimeSettings, 
     })
 }
 
+/// Kafka's own limit on a topic name.
+const KAFKA_TOPIC_MAX_LENGTH: usize = 249;
+
+/// Every Kafka setting other than the broker list. Each has a working default,
+/// so the presence of one is not what enables Kafka — `KAFKA_BROKERS` is.
+const KAFKA_DEPENDENT_KEYS: [&str; 8] = [
+    "KAFKA_TOPIC",
+    "KAFKA_CONSUMER_GROUP",
+    "KAFKA_CLIENT_ID",
+    "KAFKA_SECURITY_PROTOCOL",
+    "KAFKA_SASL_MECHANISM",
+    "KAFKA_SASL_USERNAME",
+    "KAFKA_SASL_PASSWORD",
+    "KAFKA_DELIVERY_TIMEOUT_SECONDS",
+];
+
+fn parse_kafka(values: &HashMap<String, String>) -> Result<Option<KafkaSettings>, ConfigError> {
+    let Some(brokers) = get(values, "KAFKA_BROKERS") else {
+        // A configured broker credential that would never be sent anywhere is
+        // a mistake worth naming, not a value to quietly discard.
+        if let Some(key) = KAFKA_DEPENDENT_KEYS
+            .iter()
+            .find(|key| get(values, key).is_some())
+        {
+            return Err(ConfigError::Validation(format!(
+                "{key} has no effect unless KAFKA_BROKERS is set"
+            )));
+        }
+        return Ok(None);
+    };
+
+    let security_protocol = match get(values, "KAFKA_SECURITY_PROTOCOL") {
+        Some(value) => value.parse()?,
+        None => KafkaSecurityProtocol::Plaintext,
+    };
+    let credentials = [
+        get(values, "KAFKA_SASL_MECHANISM"),
+        get(values, "KAFKA_SASL_USERNAME"),
+        get(values, "KAFKA_SASL_PASSWORD"),
+    ];
+    let sasl = match (security_protocol.is_sasl(), credentials) {
+        (true, [Some(mechanism), Some(username), Some(password)]) => Some(KafkaSasl {
+            mechanism: mechanism.parse()?,
+            username: username.to_owned(),
+            password: SecretString::from(password.to_owned()),
+        }),
+        (true, _) => {
+            return Err(ConfigError::Validation(format!(
+                "KAFKA_SECURITY_PROTOCOL={} requires KAFKA_SASL_MECHANISM, KAFKA_SASL_USERNAME, and KAFKA_SASL_PASSWORD",
+                security_protocol.as_str()
+            )))
+        }
+        // Credentials under a non-SASL protocol would never be sent, so the
+        // deployment believes it is authenticating when it is not.
+        (false, [None, None, None]) => None,
+        (false, _) => {
+            return Err(ConfigError::Validation(format!(
+                "the KAFKA_SASL_* settings need a SASL KAFKA_SECURITY_PROTOCOL, not {}",
+                security_protocol.as_str()
+            )))
+        }
+    };
+
+    let delivery_timeout_seconds = parse(values, "KAFKA_DELIVERY_TIMEOUT_SECONDS", 10_u64)?;
+    if !(1..=300).contains(&delivery_timeout_seconds) {
+        return Err(ConfigError::Validation(
+            "KAFKA_DELIVERY_TIMEOUT_SECONDS must be between 1 and 300 seconds".into(),
+        ));
+    }
+
+    Ok(Some(KafkaSettings {
+        brokers: parse_broker_list(brokers)?,
+        topic: parse_topic(get(values, "KAFKA_TOPIC").unwrap_or("luxor.events"))?,
+        consumer_group: parse_kafka_identifier(
+            "KAFKA_CONSUMER_GROUP",
+            get(values, "KAFKA_CONSUMER_GROUP").unwrap_or("luxor-console"),
+        )?,
+        client_id: parse_kafka_identifier(
+            "KAFKA_CLIENT_ID",
+            get(values, "KAFKA_CLIENT_ID").unwrap_or("luxor"),
+        )?,
+        security_protocol,
+        sasl,
+        delivery_timeout_seconds,
+    }))
+}
+
+/// Normalizes `host:port[,host:port…]`. librdkafka reports an unusable entry
+/// only once a connection is attempted, in a background thread, so the shape is
+/// checked here instead — a typo should fail startup, not surface as events
+/// that silently never arrive.
+fn parse_broker_list(brokers: &str) -> Result<String, ConfigError> {
+    let mut normalized = Vec::new();
+    for entry in brokers.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // rsplit keeps a bracketed IPv6 literal (`[::1]:9092`) intact.
+        let valid = entry.rsplit_once(':').is_some_and(|(host, port)| {
+            !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port > 0)
+        });
+        if !valid {
+            return Err(ConfigError::Invalid(
+                "KAFKA_BROKERS",
+                format!("{entry} is not a host:port address"),
+            ));
+        }
+        normalized.push(entry);
+    }
+    if normalized.is_empty() {
+        return Err(ConfigError::Invalid(
+            "KAFKA_BROKERS",
+            "expected at least one host:port address".to_owned(),
+        ));
+    }
+    Ok(normalized.join(","))
+}
+
+/// Applies Kafka's own topic-name rule. A name the broker would refuse is
+/// better refused here, where the message says which setting is wrong.
+fn parse_topic(topic: &str) -> Result<String, ConfigError> {
+    let named = (1..=KAFKA_TOPIC_MAX_LENGTH).contains(&topic.len())
+        && topic != "."
+        && topic != ".."
+        && topic.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        });
+    named.then(|| topic.to_owned()).ok_or_else(|| {
+        ConfigError::Invalid(
+            "KAFKA_TOPIC",
+            format!(
+                "expected 1-{KAFKA_TOPIC_MAX_LENGTH} characters of letters, digits, dots, underscores, or hyphens"
+            ),
+        )
+    })
+}
+
+/// A group or client identifier. Both are echoed into broker logs and metric
+/// names, so they stay printable ASCII without whitespace.
+fn parse_kafka_identifier(key: &'static str, value: &str) -> Result<String, ConfigError> {
+    let named = (1..=255).contains(&value.len())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_graphic() && character != ',');
+    named.then(|| value.to_owned()).ok_or_else(|| {
+        ConfigError::Invalid(
+            key,
+            "expected 1-255 printable ASCII characters without whitespace or commas".to_owned(),
+        )
+    })
+}
+
 fn parse_quota(
     values: &HashMap<String, String>,
     (max_key, default_max): (&'static str, u32),
@@ -840,6 +1110,129 @@ mod tests {
             Config::from_map(long_lived_ticket),
             Err(ConfigError::Validation(message))
                 if message.contains("REALTIME_TICKET_TTL_SECONDS")
+        ));
+    }
+
+    #[test]
+    fn kafka_is_off_until_brokers_are_named() {
+        assert!(Config::from_map(HashMap::new()).unwrap().kafka.is_none());
+
+        // Settings that would silently never be used are reported rather than
+        // discarded: this is the deployment that believes it configured Kafka.
+        let orphaned = HashMap::from([("KAFKA_TOPIC".into(), "orders.events".into())]);
+        assert!(matches!(
+            Config::from_map(orphaned),
+            Err(ConfigError::Validation(message)) if message.contains("KAFKA_BROKERS")
+        ));
+    }
+
+    #[test]
+    fn kafka_defaults_apply_once_brokers_are_named() {
+        let kafka = Config::from_map(HashMap::from([(
+            "KAFKA_BROKERS".into(),
+            " localhost:9092 , [::1]:9093 ".into(),
+        )]))
+        .unwrap()
+        .kafka
+        .expect("naming brokers enables Kafka");
+
+        // The normalized list is what librdkafka receives, whitespace included
+        // in neither entry.
+        assert_eq!(kafka.brokers, "localhost:9092,[::1]:9093");
+        assert_eq!(kafka.topic, "luxor.events");
+        assert_eq!(kafka.consumer_group, "luxor-console");
+        assert_eq!(kafka.client_id, "luxor");
+        assert_eq!(kafka.security_protocol, KafkaSecurityProtocol::Plaintext);
+        assert!(kafka.sasl.is_none());
+        assert_eq!(kafka.delivery_timeout_seconds, 10);
+    }
+
+    #[test]
+    fn kafka_broker_addresses_and_topics_are_validated() {
+        for brokers in ["localhost", "localhost:0", "localhost:not-a-port", ":9092"] {
+            let values = HashMap::from([("KAFKA_BROKERS".into(), brokers.to_string())]);
+            assert!(
+                matches!(
+                    Config::from_map(values),
+                    Err(ConfigError::Invalid("KAFKA_BROKERS", _))
+                ),
+                "{brokers:?} should be refused"
+            );
+        }
+
+        for topic in ["", "..", "orders events", "orders/events", &"a".repeat(250)] {
+            let values = HashMap::from([
+                ("KAFKA_BROKERS".into(), "localhost:9092".into()),
+                ("KAFKA_TOPIC".into(), topic.to_string()),
+            ]);
+            // An empty value reads as unset, which leaves the default in place.
+            let outcome = Config::from_map(values);
+            if topic.is_empty() {
+                assert_eq!(outcome.unwrap().kafka.unwrap().topic, "luxor.events");
+            } else {
+                assert!(
+                    matches!(outcome, Err(ConfigError::Invalid("KAFKA_TOPIC", _))),
+                    "{topic:?} should be refused"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kafka_sasl_credentials_and_protocol_must_agree() {
+        let mut values = HashMap::from([
+            ("KAFKA_BROKERS".into(), "broker.example.com:9093".into()),
+            ("KAFKA_SECURITY_PROTOCOL".into(), "sasl_ssl".into()),
+        ]);
+        // A SASL protocol without credentials authenticates with nothing.
+        assert!(matches!(
+            Config::from_map(values.clone()),
+            Err(ConfigError::Validation(message)) if message.contains("KAFKA_SASL_MECHANISM")
+        ));
+
+        values.insert("KAFKA_SASL_MECHANISM".into(), "scram-sha-512".into());
+        values.insert("KAFKA_SASL_USERNAME".into(), "luxor".into());
+        values.insert("KAFKA_SASL_PASSWORD".into(), "streaming-secret".into());
+        let sasl = Config::from_map(values.clone())
+            .unwrap()
+            .kafka
+            .unwrap()
+            .sasl
+            .expect("a SASL protocol carries credentials");
+        assert_eq!(sasl.mechanism.as_str(), "SCRAM-SHA-512");
+        assert_eq!(sasl.username, "luxor");
+
+        // The mirror image: credentials that would never leave the process,
+        // because the protocol does not authenticate at all.
+        values.insert("KAFKA_SECURITY_PROTOCOL".into(), "ssl".into());
+        assert!(matches!(
+            Config::from_map(values.clone()),
+            Err(ConfigError::Validation(message)) if message.contains("SASL")
+        ));
+
+        // Kerberos needs a library this build does not link, so it is refused
+        // with the reason rather than passed to librdkafka to fail on.
+        values.insert("KAFKA_SECURITY_PROTOCOL".into(), "sasl_ssl".into());
+        values.insert("KAFKA_SASL_MECHANISM".into(), "GSSAPI".into());
+        assert!(matches!(
+            Config::from_map(values),
+            Err(ConfigError::Invalid("KAFKA_SASL_MECHANISM", message))
+                if message.contains("Cyrus SASL")
+        ));
+    }
+
+    /// A publish happens inside a request, so its deadline has to stay well
+    /// inside the request timeout rather than outlive it.
+    #[test]
+    fn kafka_delivery_timeout_is_bounded() {
+        let values = HashMap::from([
+            ("KAFKA_BROKERS".into(), "localhost:9092".into()),
+            ("KAFKA_DELIVERY_TIMEOUT_SECONDS".into(), "600".into()),
+        ]);
+        assert!(matches!(
+            Config::from_map(values),
+            Err(ConfigError::Validation(message))
+                if message.contains("KAFKA_DELIVERY_TIMEOUT_SECONDS")
         ));
     }
 

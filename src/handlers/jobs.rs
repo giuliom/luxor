@@ -1,6 +1,7 @@
 use crate::{
     auth::AuthUser,
     error::{ApiJson, AppError},
+    events::{self, DomainEvent},
     queue::Job,
     state::AppState,
     validation,
@@ -56,6 +57,17 @@ pub async fn enqueue(
         }
     };
     let envelope = state.queue.enqueue(job).await?;
+    // The queue moves work to a worker; the event tells everyone else that the
+    // work exists. Losing the announcement must not un-queue the job, so it is
+    // published on the best-effort path.
+    events::publish_or_log(
+        state.events.as_ref(),
+        DomainEvent::JobEnqueued {
+            job_id: envelope.id,
+            job_kind: envelope.kind.clone(),
+        },
+    )
+    .await;
     Ok((
         StatusCode::ACCEPTED,
         Json(EnqueueResponse {

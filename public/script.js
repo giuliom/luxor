@@ -105,8 +105,15 @@ function setIdentity(user) {
   }
 
   // A realtime connection outlives the session that authorized it, so signing
-  // out closes it here rather than leaving it pushing events.
-  if (!signedIn) disconnectRealtime();
+  // out closes it here rather than leaving it pushing events. The event feed
+  // follows the same rule: it polls an authenticated endpoint, so it runs for
+  // exactly as long as the session does.
+  if (signedIn) {
+    startEventPolling();
+  } else {
+    disconnectRealtime();
+    stopEventPolling();
+  }
 
   syncMatrixAccess();
 }
@@ -356,6 +363,125 @@ document.querySelector("#job-form").addEventListener("submit", (event) => {
     method: "POST",
     body: JSON.stringify({ kind: "audit_event", action: document.querySelector("#job-action").value }),
   }));
+});
+
+// --- Event stream ---------------------------------------------------------
+// Publishing and reading back are two separate round trips, deliberately. The
+// form hands one event to the broker and shows the receipt — the partition and
+// offset it was written at — while the feed below polls what the server's own
+// consumer has read off the topic. An entry appearing there means the record
+// made the whole trip; nothing here is echoed from the publish response.
+
+const eventsBackendBadge = document.querySelector("#events-backend-badge");
+const eventsTopic = document.querySelector("#events-topic");
+const eventsConsumerGroup = document.querySelector("#events-consumerGroup");
+const eventsConsumed = document.querySelector("#events-consumed");
+const eventsFeed = document.querySelector("#events-feed");
+
+// Consumption is asynchronous, so the feed follows the topic on a timer rather
+// than after each publish. It runs only while signed in: the endpoint is
+// authenticated, and polling a signed-out page would be a 401 every few
+// seconds.
+const EVENT_POLL_INTERVAL_MS = 3000;
+let eventPollTimer = null;
+
+// A consumer switches on `kind` and ignores what it does not recognize, which
+// is what lets the server add an event this page has never heard of.
+function describeEvent(event) {
+  const short = event.key.slice(0, 8);
+  switch (event.kind) {
+    case "note.published":
+      return { tone: "note", label: t("events.kindNote"), text: event.payload.text };
+    case "user.registered":
+      return { tone: "user", label: t("events.kindUser"), text: t("events.userRegistered", { role: event.payload.role, id: short }) };
+    case "job.enqueued":
+      return { tone: "job", label: t("events.kindJob"), text: t("events.jobEnqueued", { kind: event.payload.job_kind, id: short }) };
+    default:
+      return { tone: "", label: event.kind, text: t("events.unknownKind", { id: short }) };
+  }
+}
+
+function renderEventStream(stream) {
+  const live = stream.backend === "kafka";
+  eventsBackendBadge.textContent = live ? t("events.backendKafka") : t("events.backendMemory");
+  eventsBackendBadge.classList.toggle("ok", live);
+  eventsTopic.textContent = stream.topic || t("events.inProcess");
+  eventsConsumerGroup.textContent = stream.consumer_group || t("events.inProcess");
+  eventsConsumed.textContent = numberFormat.format(stream.consumed);
+
+  // The listing arrives newest first and is the whole retained window, so the
+  // feed is rebuilt rather than appended to: it cannot drift from the server's
+  // view of the topic.
+  eventsFeed.replaceChildren();
+  for (const event of stream.events) {
+    const { tone, label, text } = describeEvent(event);
+
+    const kind = document.createElement("span");
+    kind.className = `feed-kind ${tone}`;
+    kind.textContent = label;
+
+    const body = document.createElement("span");
+    body.className = "feed-text";
+    body.textContent = text;
+
+    const coordinates = document.createElement("span");
+    coordinates.className = "feed-coordinates";
+    coordinates.textContent = t("events.coordinates", { partition: event.partition, offset: event.offset });
+
+    const time = document.createElement("time");
+    time.textContent = timeFormat.format(new Date(event.consumed_at));
+
+    const meta = document.createElement("div");
+    meta.className = "feed-meta";
+    meta.append(coordinates, time);
+
+    const entry = document.createElement("li");
+    entry.append(kind, body, meta);
+    eventsFeed.append(entry);
+  }
+}
+
+// Polling failures stay inside the panel: a broker that is briefly unreachable
+// should mark this card unavailable and recover on the next tick, not fill the
+// activity log with the same line every three seconds.
+async function refreshEventStream() {
+  try {
+    renderEventStream(await api(`/api/events?limit=${FEED_LIMIT}`));
+  } catch {
+    eventsBackendBadge.textContent = t("events.unavailable");
+    eventsBackendBadge.classList.remove("ok");
+  }
+}
+
+function startEventPolling() {
+  if (eventPollTimer) return;
+  refreshEventStream();
+  eventPollTimer = setInterval(refreshEventStream, EVENT_POLL_INTERVAL_MS);
+}
+
+function stopEventPolling() {
+  clearInterval(eventPollTimer);
+  eventPollTimer = null;
+  eventsFeed.replaceChildren();
+  eventsBackendBadge.textContent = t("events.notLoaded");
+  eventsBackendBadge.classList.remove("ok");
+  eventsTopic.textContent = "—";
+  eventsConsumerGroup.textContent = "—";
+  eventsConsumed.textContent = numberFormat.format(0);
+}
+
+document.querySelector("#event-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  run(t("labels.eventPublish"), async () => {
+    const receipt = await api("/api/events", {
+      method: "POST",
+      body: JSON.stringify({ text: document.querySelector("#event-text").value }),
+    });
+    // The event is on the topic; whether this instance has consumed it yet is
+    // a separate question, which the next poll answers.
+    await refreshEventStream();
+    return receipt;
+  });
 });
 
 // --- Realtime -------------------------------------------------------------

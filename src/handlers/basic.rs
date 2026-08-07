@@ -29,6 +29,7 @@ pub struct RuntimeResponse {
     database: &'static str,
     cache: &'static str,
     queue: &'static str,
+    events: &'static str,
 }
 
 pub async fn runtime(State(state): State<AppState>) -> Json<RuntimeResponse> {
@@ -46,6 +47,9 @@ pub async fn runtime(State(state): State<AppState>) -> Json<RuntimeResponse> {
         database,
         cache,
         queue,
+        // The publisher answers for itself rather than being inferred from
+        // configuration, so this reports the backend actually in use.
+        events: state.events.backend(),
     })
 }
 

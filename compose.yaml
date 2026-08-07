@@ -28,6 +28,48 @@ services:
       timeout: 3s
       retries: 10
 
+  # A single-node KRaft cluster: one container is both the controller quorum
+  # and the only broker, so there is no ZooKeeper and nothing to coordinate.
+  # The replication factors below are the only ones a single node can satisfy;
+  # a real cluster raises them and stops being expressible in this file.
+  kafka:
+    image: apache/kafka:4.3.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      # A client is told where to reconnect by the advertised listener, not by
+      # the address it bootstrapped from, so the broker has to listen on the
+      # same port it is published on. Changing KAFKA_PORT therefore moves all
+      # three together, and KAFKA_BROKERS in .env follows.
+      KAFKA_LISTENERS: PLAINTEXT://:${KAFKA_PORT:-9092},CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:${KAFKA_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # A consumer group forms immediately instead of waiting out the default
+      # rebalance delay, which is three seconds of nothing on every restart.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "${KAFKA_PORT:-9092}:${KAFKA_PORT:-9092}"
+    volumes:
+      - luxor-kafka:/var/lib/kafka/data
+    healthcheck:
+      # Listing topics needs a broker that has finished electing itself, which
+      # a TCP probe would report as ready far too early.
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:${KAFKA_PORT:-9092} --list",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
   jaeger:
     image: cr.jaegertracing.io/jaegertracing/jaeger:2.19.0
     profiles: ["observability"]
@@ -38,3 +80,4 @@ services:
 volumes:
   luxor-postgres:
   luxor-redis:
+  luxor-kafka:

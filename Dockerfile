@@ -3,6 +3,14 @@
 FROM rust:1.97-slim-bookworm AS builder
 WORKDIR /app
 
+# librdkafka and the OpenSSL it uses are compiled from vendored sources by
+# rdkafka-sys, which needs make, a C++ compiler, and perl on top of the C
+# toolchain this image already carries. Both end up statically linked into the
+# binary, so the runtime stage below needs none of it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends g++ make perl \
+    && rm -rf /var/lib/apt/lists/*
+
 # Static assets and migrations are embedded into the binary at compile time
 # (include_str! and sqlx::migrate!), so the build needs the full source tree.
 # Default features are disabled to exclude the embedded development

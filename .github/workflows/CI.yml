@@ -12,6 +12,7 @@ env:
   APP_ENV: test
   DATABASE_URL: postgres://luxor:luxor@localhost:5432/luxor_test
   REDIS_URL: redis://127.0.0.1:6379/
+  KAFKA_BROKERS: localhost:9092
   JWT_SECRET: ci-only-secret-with-at-least-32-characters
   AUTO_MIGRATE: "false"
   REFRESH_COOKIE_SECURE: "false"
@@ -45,6 +46,31 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      # Single-node KRaft, matching compose.yaml. The health check lists topics
+      # rather than probing the port, because a broker accepts connections
+      # before it has finished electing itself.
+      kafka:
+        image: apache/kafka:4.3.1@sha256:77e3df9054047a88b520d0cc46e16696d3b22022e1d580aeccd2632df6532837
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 20
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
