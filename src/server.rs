@@ -1,4 +1,5 @@
 use crate::{
+    assets::{self, Asset, CachePolicy},
     config::HttpsEnforcement,
     error::AppError,
     handlers::{auth, basic, cache, demo, events, jobs, permissions, realtime},
@@ -7,19 +8,19 @@ use crate::{
     state::AppState,
 };
 use axum::{
-    body::{Body, Bytes},
+    body::Body,
     extract::{DefaultBodyLimit, State},
     http::{
         header::{self, HeaderName},
         HeaderMap, HeaderValue, Method, Request, StatusCode,
     },
     middleware::{self, Next},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{delete, get, post},
     Router,
 };
 use opentelemetry::{global, propagation::Extractor};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
@@ -98,22 +99,35 @@ pub fn app(state: AppState) -> Router {
             rate_limit::enforce,
         ));
 
-    // The console is statically generated per language at startup: every
-    // localized page has its own stable URL and is complete in its language
-    // before the first byte is sent, so nothing is translated in the browser
-    // after the fact. `/` never serves content, only a negotiated redirect.
+    // The console is rendered once per language at startup: every localized
+    // page has its own stable URL and is complete — translated, with the
+    // permission matrix and runtime badge filled in — before the first byte
+    // is sent, so the browser neither translates nor fetches anything to
+    // finish it. `/` never serves content, only a negotiated redirect. Pages,
+    // sitemap, and robots.txt are revalidated on every use: their content
+    // changes with a deployment, and the ETag makes an unchanged one a 304.
     let base_url = state.config.public_base_url();
-    let sitemap = Bytes::from(i18n::render_sitemap(&base_url));
-    let mut localized = Router::new().route("/", get(localized_root));
+    let files = assets::embedded();
+    let context = i18n::PageContext {
+        base_url: &base_url,
+        embedded_database: state.config.database_url.is_none(),
+        grants: state.permissions.grants(),
+        styles_url: &files.styles.fingerprinted_path,
+        script_url: &files.script.fingerprinted_path,
+        favicon_url: &files.favicon.fingerprinted_path,
+        wasm_url: &files.wasm.fingerprinted_path,
+    };
+    let mut site = Router::new().route("/", get(localized_root));
     for locale in i18n::SUPPORTED_LOCALES {
-        let page = Bytes::from(i18n::render_page(locale, &base_url));
-        localized = localized
+        let page = Asset::new(
+            "text/html; charset=utf-8",
+            i18n::render_page(locale, &context),
+        )
+        .with_content_language(locale.as_str());
+        site = site
             .route(
                 locale.path(),
-                get(move || {
-                    let page = page.clone();
-                    async move { Html(page) }
-                }),
+                assets::serve(Arc::new(page), CachePolicy::Revalidate),
             )
             // One canonical URL per language: the slashed variant redirects
             // rather than serving a duplicate.
@@ -122,28 +136,39 @@ pub fn app(state: AppState) -> Router {
                 get(move || async move { Redirect::permanent(locale.path()) }),
             );
     }
-
-    localized
+    let sitemap = Asset::new(
+        "application/xml; charset=utf-8",
+        i18n::render_sitemap(&base_url),
+    );
+    let robots = Asset::new("text/plain; charset=utf-8", render_robots(&base_url));
+    site = site
         .route(
             "/sitemap.xml",
-            get(move || {
-                let sitemap = sitemap.clone();
-                async move {
-                    (
-                        [(
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("application/xml; charset=utf-8"),
-                        )],
-                        sitemap,
-                    )
-                }
-            }),
+            assets::serve(Arc::new(sitemap), CachePolicy::Revalidate),
         )
-        .route("/favicon.svg", get(favicon))
-        .route("/styles.css", get(styles))
-        .route("/script.js", get(script))
-        .route("/demo.wasm", get(wasm_demo))
-        .nest("/api", api)
+        .route(
+            "/robots.txt",
+            assets::serve(Arc::new(robots), CachePolicy::Revalidate),
+        );
+
+    // Every embedded file answers at its content-addressed URL, which is all
+    // the pages reference and is cached for a year, and at its stable name,
+    // revalidated, for whatever addresses it directly. An outdated
+    // fingerprint is a 404 rather than today's bytes under yesterday's
+    // immutable URL.
+    for file in files.all() {
+        site = site
+            .route(
+                &file.fingerprinted_path,
+                assets::serve(file.asset.clone(), CachePolicy::Immutable),
+            )
+            .route(
+                file.path,
+                assets::serve(file.asset.clone(), CachePolicy::Revalidate),
+            );
+    }
+
+    site.nest("/api", api)
         .with_state(state)
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(middleware::from_fn_with_state(
@@ -401,43 +426,12 @@ async fn localized_root(headers: HeaderMap) -> Response {
         .into_response()
 }
 
-async fn favicon() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("image/svg+xml; charset=utf-8"),
-        )],
-        include_str!("../public/favicon.svg"),
-    )
-}
-
-async fn styles() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, HeaderValue::from_static("text/css"))],
-        include_str!("../public/styles.css"),
-    )
-}
-
-async fn script() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/javascript; charset=utf-8"),
-        )],
-        include_str!("../public/script.js"),
-    )
-}
-
-// The application/wasm content type is required for
-// WebAssembly.instantiateStreaming.
-async fn wasm_demo() -> impl IntoResponse {
-    (
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/wasm"),
-        )],
-        include_bytes!("../public/demo.wasm").as_slice(),
-    )
+/// Points crawlers at the sitemap, whose URL robots.txt requires to be
+/// absolute, and keeps them off the API: its JSON is not content, and crawler
+/// traffic would spend the per-IP rate-limit budgets. Nothing the pages show
+/// depends on it, because they arrive fully rendered.
+fn render_robots(base_url: &str) -> String {
+    format!("User-agent: *\nDisallow: /api/\n\nSitemap: {base_url}/sitemap.xml\n")
 }
 
 async fn api_not_found() -> AppError {
@@ -472,7 +466,7 @@ mod tests {
         trace::{TraceContextExt, TracerProvider as _},
     };
     use opentelemetry_sdk::propagation::TraceContextPropagator;
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, io::Read, sync::Arc};
     use tower::ServiceExt;
     use tracing_subscriber::prelude::*;
     use uuid::Uuid;
@@ -535,10 +529,17 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK);
             assert_header_starts_with(&response, header::CONTENT_TYPE.as_str(), "text/html");
+            assert_eq!(
+                response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
+                lang
+            );
             let body = body_text(response).await;
             assert!(body.contains(&format!(r#"<html lang="{lang}" dir="ltr">"#)));
             assert!(body.contains(title));
-            assert!(body.contains(r#"rel="icon" href="/favicon.svg""#));
+            assert!(body.contains(&format!(
+                r#"rel="icon" href="{}""#,
+                assets::embedded().favicon.fingerprinted_path
+            )));
             assert!(!body.contains("{{"), "unresolved template placeholder");
             // Self-referencing canonical plus reciprocal hreflang alternates,
             // including x-default; visible, crawlable selector links.
@@ -675,6 +676,274 @@ mod tests {
         assert!(body.contains(r#"<link rel="canonical" href="https://app.example.com/it">"#));
         assert!(body
             .contains(r#"<link rel="alternate" hreflang="en" href="https://app.example.com/en">"#));
+    }
+
+    /// The content a script used to fetch after load — the runtime badge and
+    /// the permission matrix — is in the first response, drawn from this
+    /// instance's configuration and the grants it enforces.
+    #[tokio::test]
+    async fn pages_arrive_with_runtime_and_permissions_rendered() {
+        let development = body_text(send(&test_app(), "GET", "/en", None, None).await).await;
+        assert!(development
+            .contains(r#"<span id="runtime-badge" class="badge ok">Embedded database</span>"#));
+        assert!(
+            development.contains(r#"<th scope="col" class="grant" data-role="admin">Admin</th>"#)
+        );
+        assert!(development
+            .contains(r#"aria-label="User may not: Run the simulated record purge">—</span>"#));
+
+        let production = body_text(
+            send(
+                &test_app_with_config(production_config()),
+                "GET",
+                "/it",
+                None,
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert!(production
+            .contains(r#"<span id="runtime-badge" class="badge ok">Stack completo</span>"#));
+        assert!(production.contains(
+            r#"<span class="permission-hint">Leggere il report operativo dimostrativo</span>"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn robots_txt_points_crawlers_at_the_sitemap_and_off_the_api() {
+        let response = send(&test_app(), "GET", "/robots.txt", None, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            body_text(response).await,
+            "User-agent: *\nDisallow: /api/\n\nSitemap: http://127.0.0.1:8080/sitemap.xml\n"
+        );
+
+        let production = send(
+            &test_app_with_config(production_config()),
+            "GET",
+            "/robots.txt",
+            None,
+            None,
+        )
+        .await;
+        assert!(body_text(production)
+            .await
+            .contains("Sitemap: https://app.example.com/sitemap.xml\n"));
+    }
+
+    /// The pages reference only content-addressed asset URLs, which may be
+    /// cached for a year because new content means a new URL; the stable
+    /// names still answer, revalidated, with the same bytes.
+    #[tokio::test]
+    async fn pages_load_content_addressed_assets_cached_for_a_year() {
+        let app = test_app();
+        let page = body_text(send(&app, "GET", "/en", None, None).await).await;
+
+        let files = assets::embedded();
+        for (file, content_type, bytes) in [
+            (
+                &files.styles,
+                "text/css; charset=utf-8",
+                include_bytes!("../public/styles.css").as_slice(),
+            ),
+            (
+                &files.script,
+                "text/javascript; charset=utf-8",
+                include_bytes!("../public/script.js").as_slice(),
+            ),
+            (
+                &files.favicon,
+                "image/svg+xml; charset=utf-8",
+                include_bytes!("../public/favicon.svg").as_slice(),
+            ),
+            (
+                &files.wasm,
+                "application/wasm",
+                include_bytes!("../public/demo.wasm").as_slice(),
+            ),
+        ] {
+            assert!(
+                page.contains(&format!(r#""{}""#, file.fingerprinted_path)),
+                "the page does not reference {}",
+                file.fingerprinted_path
+            );
+            assert!(
+                !page.contains(&format!(r#""{}""#, file.path)),
+                "the page references the revalidated name {}",
+                file.path
+            );
+
+            let fingerprinted = send(&app, "GET", &file.fingerprinted_path, None, None).await;
+            assert_eq!(fingerprinted.status(), StatusCode::OK);
+            assert_eq!(
+                fingerprinted.headers().get(header::CACHE_CONTROL).unwrap(),
+                "public, max-age=31536000, immutable"
+            );
+            assert_eq!(
+                fingerprinted.headers().get(header::CONTENT_TYPE).unwrap(),
+                content_type
+            );
+            let etag = fingerprinted.headers().get(header::ETAG).unwrap().clone();
+            let body = to_bytes(fingerprinted.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), bytes);
+
+            let stable = send(&app, "GET", file.path, None, None).await;
+            assert_eq!(stable.status(), StatusCode::OK);
+            assert_eq!(
+                stable.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-cache"
+            );
+            assert_eq!(stable.headers().get(header::ETAG).unwrap(), &etag);
+        }
+    }
+
+    #[tokio::test]
+    async fn outdated_asset_fingerprints_are_not_found() {
+        let response = send(
+            &test_app(),
+            "GET",
+            "/assets/styles.0000000000000000.css",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pages_and_assets_answer_revalidation_with_not_modified() {
+        let app = test_app();
+        let styles = assets::embedded().styles.fingerprinted_path.as_str();
+        for path in [
+            "/en",
+            "/it",
+            "/sitemap.xml",
+            "/robots.txt",
+            "/demo.wasm",
+            styles,
+        ] {
+            let first = send(&app, "GET", path, None, None).await;
+            assert_eq!(first.status(), StatusCode::OK, "{path}");
+            let etag = first
+                .headers()
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                etag.starts_with('"') && etag.ends_with('"'),
+                "{path}: {etag}"
+            );
+
+            for condition in [
+                etag.clone(),
+                format!("W/{etag}"),
+                format!("\"stale\", {etag}"),
+                "*".to_owned(),
+            ] {
+                let response =
+                    send_with(&app, "GET", path, &[(header::IF_NONE_MATCH, &condition)]).await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_MODIFIED,
+                    "{path} with If-None-Match: {condition}"
+                );
+                assert_eq!(response.headers().get(header::ETAG).unwrap(), etag.as_str());
+                assert!(response.headers().contains_key(header::CACHE_CONTROL));
+                assert!(!response.headers().contains_key(header::CONTENT_LANGUAGE));
+                assert!(body_text(response).await.is_empty());
+            }
+
+            let changed =
+                send_with(&app, "GET", path, &[(header::IF_NONE_MATCH, "\"stale\"")]).await;
+            assert_eq!(changed.status(), StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn text_and_wasm_are_served_gzip_to_clients_that_accept_it() {
+        let app = test_app();
+        let script = assets::embedded().script.fingerprinted_path.as_str();
+        for path in ["/en", "/it", "/sitemap.xml", "/demo.wasm", script] {
+            let plain = send(&app, "GET", path, None, None).await;
+            assert!(!plain.headers().contains_key(header::CONTENT_ENCODING));
+            assert!(varies_on_accept_encoding(&plain), "{path}");
+            let plain_etag = plain.headers().get(header::ETAG).unwrap().clone();
+            let plain_type = plain.headers().get(header::CONTENT_TYPE).unwrap().clone();
+            let plain_body = to_bytes(plain.into_body(), usize::MAX).await.unwrap();
+
+            let compressed = send_with(
+                &app,
+                "GET",
+                path,
+                &[(header::ACCEPT_ENCODING, "gzip, deflate, br, zstd")],
+            )
+            .await;
+            assert_eq!(compressed.status(), StatusCode::OK);
+            assert_eq!(
+                compressed.headers().get(header::CONTENT_ENCODING).unwrap(),
+                "gzip",
+                "{path}"
+            );
+            assert!(varies_on_accept_encoding(&compressed), "{path}");
+            assert_eq!(
+                compressed.headers().get(header::CONTENT_TYPE).unwrap(),
+                &plain_type
+            );
+            assert_ne!(compressed.headers().get(header::ETAG).unwrap(), &plain_etag);
+            let compressed_body = to_bytes(compressed.into_body(), usize::MAX).await.unwrap();
+            assert!(compressed_body.len() < plain_body.len(), "{path}");
+
+            let mut decoded = Vec::new();
+            flate2::read::GzDecoder::new(compressed_body.as_ref())
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert_eq!(decoded, plain_body.as_ref(), "{path}");
+
+            let refused =
+                send_with(&app, "GET", path, &[(header::ACCEPT_ENCODING, "gzip;q=0")]).await;
+            assert!(!refused.headers().contains_key(header::CONTENT_ENCODING));
+        }
+    }
+
+    /// API responses carry credentials next to request-influenced content, so
+    /// they are never compressed (the BREACH precondition).
+    #[tokio::test]
+    async fn api_responses_are_not_compressed() {
+        let response = send_with(
+            &test_app(),
+            "GET",
+            "/api/permissions",
+            &[(header::ACCEPT_ENCODING, "gzip")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+    }
+
+    #[tokio::test]
+    async fn head_requests_describe_the_page_without_sending_it() {
+        let app = test_app();
+        let get = send(&app, "GET", "/en", None, None).await;
+        let etag = get.headers().get(header::ETAG).unwrap().clone();
+        let length = body_text(get).await.len();
+
+        let head = send(&app, "HEAD", "/en", None, None).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers().get(header::ETAG).unwrap(), &etag);
+        assert_eq!(
+            head.headers().get(header::CONTENT_LENGTH).unwrap(),
+            length.to_string().as_str()
+        );
+        assert!(body_text(head).await.is_empty());
     }
 
     #[tokio::test]
@@ -1597,6 +1866,33 @@ mod tests {
     async fn body_text(response: axum::response::Response) -> String {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn send_with(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        headers: &[(header::HeaderName, &str)],
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(name, *value);
+        }
+        app.clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// Other layers (CORS) add their own `Vary` lines, so look through all.
+    fn varies_on_accept_encoding(response: &axum::response::Response) -> bool {
+        response
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|name| name.trim().eq_ignore_ascii_case("accept-encoding"))
     }
 
     fn assert_header_starts_with(

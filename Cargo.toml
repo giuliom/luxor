@@ -15,6 +15,9 @@ axum-extra = { version = "0.10.3", features = ["cookie"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 dotenvy = "0.15.7"
+# Precompresses the rendered pages and embedded static files once at startup.
+# The default backend is miniz_oxide, pure Rust, so no C toolchain is added.
+flate2 = "1.1.9"
 jsonwebtoken = "9.3.1"
 opentelemetry = "0.24.0"
 opentelemetry-otlp = { version = "0.17.0", features = ["grpc-tonic"] }

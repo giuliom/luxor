@@ -1611,6 +1611,7 @@ dependencies = [
  "base64",
  "chrono",
  "dotenvy",
+ "flate2",
  "futures-util",
  "http-body-util",
  "jsonwebtoken",

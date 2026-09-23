@@ -1,8 +1,11 @@
 <!doctype html>
 <!-- Template, not a served page: rendered once per locale at startup by
      src/i18n.rs. Double-brace placeholders resolve to locales/<lang>/common.json
-     entries (HTML-escaped) or to the template variables lang, dir, base_url,
-     canonical, aria_current_*, and i18n_json. -->
+     entries (HTML-escaped) or to the template variables lang, dir, canonical,
+     alternate_links, language_links, the content-addressed *_url asset paths,
+     runtime_badge, permissions_matrix, and i18n_json. Nothing here names a
+     particular language: per-language markup is generated from the supported
+     locales, so adding one never means editing this file. -->
 <html lang="{{lang}}" dir="{{dir}}">
   <head>
     <meta charset="utf-8">
@@ -10,11 +13,14 @@
     <title>{{meta.title}}</title>
     <meta name="description" content="{{meta.description}}">
     <link rel="canonical" href="{{canonical}}">
-    <link rel="alternate" hreflang="en" href="{{base_url}}/en">
-    <link rel="alternate" hreflang="it" href="{{base_url}}/it">
-    <link rel="alternate" hreflang="x-default" href="{{base_url}}/en">
-    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="/styles.css">
+    {{alternate_links}}
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="Luxor">
+    <meta property="og:url" content="{{canonical}}">
+    <meta property="og:title" content="{{meta.title}}">
+    <meta property="og:description" content="{{meta.description}}">
+    <link rel="icon" href="{{favicon_url}}" type="image/svg+xml">
+    <link rel="stylesheet" href="{{styles_url}}">
   </head>
   <body>
     <main class="page-shell">
@@ -27,9 +33,7 @@
         </div>
         <div class="hero-side">
           <nav class="lang-switcher" aria-label="{{langSelector.label}}">
-            <a href="/en" hreflang="en" lang="en"{{aria_current_en}} data-lang-choice="en">English</a>
-            <span aria-hidden="true">·</span>
-            <a href="/it" hreflang="it" lang="it"{{aria_current_it}} data-lang-choice="it">Italiano</a>
+            {{language_links}}
           </nav>
           <div id="identity-pill" class="identity" aria-live="polite">
             <span id="auth-dot" class="dot checking"></span>
@@ -43,7 +47,7 @@
           <div class="card-heading">
             <div><span class="number">01</span><h2>{{service.title}}</h2></div>
             <div class="badge-group">
-              <span id="runtime-badge" class="badge">{{service.checkingRuntime}}</span>
+              <span id="runtime-badge" class="badge ok">{{runtime_badge}}</span>
               <span id="health-badge" class="badge">{{service.unchecked}}</span>
             </div>
           </div>
@@ -64,8 +68,8 @@
             <label>{{auth.email}}<input id="email" type="email" autocomplete="email" value="demo@example.com" required></label>
             <label>{{auth.password}}<input id="password" type="password" autocomplete="current-password" minlength="12" value="change-this-password" required></label>
             <label>{{auth.roleLabel}}<select id="role">
-              <option value="user" selected>{{auth.roleUser}}</option>
-              <option value="admin">{{auth.roleAdmin}}</option>
+              <option value="user" selected>{{roles.user}}</option>
+              <option value="admin">{{roles.admin}}</option>
             </select></label>
             <div class="actions">
               <button id="login-button" type="submit">{{auth.logIn}}</button>
@@ -112,7 +116,7 @@
           </div>
           <p>{{permissions.body}}</p>
           <div class="matrix-scroll">
-            <table id="permissions-matrix" class="permissions-matrix" aria-label="{{permissions.matrixLabel}}"></table>
+            <table id="permissions-matrix" class="permissions-matrix" aria-label="{{permissions.matrixLabel}}">{{permissions_matrix}}</table>
           </div>
           <div class="endpoints">
             <div class="endpoint">
@@ -212,7 +216,7 @@
             <span id="wasm-badge" class="badge">{{wasm.notLoaded}}</span>
           </div>
           <p>{{wasm.body}}</p>
-          <form id="wasm-form" class="inline-form">
+          <form id="wasm-form" class="inline-form" data-module="{{wasm_url}}">
             <label>{{wasm.sieveLimit}}<input id="wasm-limit" type="number" min="2" max="10000000" step="1" value="1000000" required></label>
             <button type="submit">{{wasm.run}}</button>
           </form>
@@ -231,6 +235,6 @@
       </section>
     </main>
     <script id="i18n-data" type="application/json">{{i18n_json}}</script>
-    <script src="/script.js"></script>
+    <script src="{{script_url}}"></script>
   </body>
 </html>

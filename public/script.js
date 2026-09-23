@@ -35,6 +35,14 @@ function tp(key, count, params = {}) {
   return formatMessage(message, { count: numberFormat.format(count), ...params });
 }
 
+// Roles travel as wire names (`admin`, `user`) and are shown by their
+// translated name, as the server-rendered matrix and form show them. A role
+// this page does not know yet shows its wire name, like any other value the
+// server supplies.
+function roleLabel(role) {
+  return i18n[`roles.${role}`] ?? role;
+}
+
 // The selector links are ordinary crawlable anchors; scripting only persists
 // the explicit choice so the `/` redirect can honor it on the next visit. A
 // language named in the URL always wins over this cookie.
@@ -79,7 +87,7 @@ function setIdentity(user) {
   currentRole = signedIn ? user.role : null;
 
   identity.textContent = signedIn
-    ? t("identity.signedIn", { email: user.email, role: user.role })
+    ? t("identity.signedIn", { email: user.email, role: roleLabel(user.role) })
     : t("identity.signedOut");
   authDot.classList.remove("checking");
   authDot.classList.toggle("online", signedIn);
@@ -93,7 +101,7 @@ function setIdentity(user) {
   if (signedIn) {
     sessionEmail.textContent = user.email;
     sessionAvatar.textContent = user.email.charAt(0).toUpperCase();
-    sessionRole.textContent = user.role;
+    sessionRole.textContent = roleLabel(user.role);
     sessionMeta.textContent = user.created_at
       ? t("session.created", { date: dateTimeFormat.format(new Date(user.created_at)) })
       : "";
@@ -116,13 +124,6 @@ function setIdentity(user) {
   }
 
   syncMatrixAccess();
-}
-
-function setRuntime(runtime) {
-  const runtimeBadge = document.querySelector("#runtime-badge");
-  runtimeBadge.textContent =
-    runtime.database === "embedded-postgresql" ? t("runtime.embedded") : t("runtime.fullStack");
-  runtimeBadge.classList.add("ok");
 }
 
 // The API deliberately answers with stable error codes; the code is what gets
@@ -234,68 +235,9 @@ document.querySelector("#logout-button").addEventListener("click", () => run(t("
 }));
 
 // --- Permissions ---------------------------------------------------------
-// The matrix is rendered from the server's catalog so the page never
-// hardcodes permission names. The grants are fixed server-side; this view is
-// read-only.
-
-async function loadPermissions() {
-  renderMatrix(await api("/api/permissions", {}, false));
-}
-
-function renderMatrix(matrix) {
-  const roles = Object.keys(matrix.roles);
-
-  const headRow = document.createElement("tr");
-  const lead = document.createElement("th");
-  lead.scope = "col";
-  lead.textContent = t("permissions.columnPermission");
-  headRow.append(lead);
-  for (const role of roles) {
-    const th = document.createElement("th");
-    th.scope = "col";
-    th.className = "grant";
-    th.dataset.role = role;
-    th.textContent = role;
-    headRow.append(th);
-  }
-  const thead = document.createElement("thead");
-  thead.append(headRow);
-
-  const tbody = document.createElement("tbody");
-  for (const permission of matrix.catalog) {
-    const name = document.createElement("th");
-    name.scope = "row";
-    const label = document.createElement("code");
-    label.textContent = permission.name;
-    const hint = document.createElement("span");
-    hint.className = "permission-hint";
-    hint.textContent = permission.description;
-    name.append(label, hint);
-
-    const row = document.createElement("tr");
-    row.append(name);
-    for (const role of roles) {
-      const granted = matrix.roles[role].includes(permission.name);
-      const mark = document.createElement("span");
-      mark.className = granted ? "grant-mark" : "grant-mark denied";
-      mark.textContent = granted ? "✓" : "—";
-      mark.setAttribute("role", "img");
-      mark.setAttribute(
-        "aria-label",
-        t(granted ? "permissions.may" : "permissions.mayNot", { role, description: permission.description }),
-      );
-      const grant = document.createElement("td");
-      grant.className = "grant";
-      grant.dataset.role = role;
-      grant.append(mark);
-      row.append(grant);
-    }
-    tbody.append(row);
-  }
-
-  matrixTable.replaceChildren(thead, tbody);
-  syncMatrixAccess();
-}
+// The server renders the matrix into the page from the same fixed grants the
+// endpoints enforce, so it is complete before this script runs. The script
+// only marks the signed-in role's column; the view is read-only.
 
 function syncMatrixAccess() {
   const signedIn = Boolean(currentRole);
@@ -303,7 +245,7 @@ function syncMatrixAccess() {
     element.classList.toggle("current", element.dataset.role === currentRole);
   }
   permissionsRoleBadge.textContent = signedIn
-    ? t("permissions.actingAs", { role: currentRole })
+    ? t("permissions.actingAs", { role: roleLabel(currentRole) })
     : t("permissions.signedOut");
   permissionsRoleBadge.classList.toggle("ok", signedIn);
 }
@@ -393,7 +335,7 @@ function describeEvent(event) {
     case "note.published":
       return { tone: "note", label: t("events.kindNote"), text: event.payload.text };
     case "user.registered":
-      return { tone: "user", label: t("events.kindUser"), text: t("events.userRegistered", { role: event.payload.role, id: short }) };
+      return { tone: "user", label: t("events.kindUser"), text: t("events.userRegistered", { role: roleLabel(event.payload.role), id: short }) };
     case "job.enqueued":
       return { tone: "job", label: t("events.kindJob"), text: t("events.jobEnqueued", { kind: event.payload.job_kind, id: short }) };
     default:
@@ -546,7 +488,7 @@ function appendFeedEntry(kind, text) {
 // and role rather than an email.
 function participantLabel(participant) {
   const short = participant.user_id.slice(0, 8);
-  return `${participant.role} ${short}`;
+  return `${roleLabel(participant.role)} ${short}`;
 }
 
 function handleRealtimeEvent(event) {
@@ -785,10 +727,13 @@ function formatDuration(ms) {
 
 let wasmExports = null;
 const WASM_BENCHMARK_ITERATIONS = 10;
+// The page names the module by its content-addressed URL, which the browser
+// may cache indefinitely because a new build is a new URL.
+const wasmModuleUrl = document.querySelector("#wasm-form").dataset.module;
 
 async function loadWasmDemo() {
   if (wasmExports) return wasmExports;
-  const source = fetch("/demo.wasm");
+  const source = fetch(wasmModuleUrl);
   // Streaming compilation is the standard path; the ArrayBuffer fallback
   // covers engines without instantiateStreaming.
   const { instance } = "instantiateStreaming" in WebAssembly
@@ -879,12 +824,12 @@ document.querySelector("#wasm-form").addEventListener("submit", (event) => {
   });
 });
 
+// The runtime badge and permission matrix arrive rendered in the page, so the
+// session is the only thing left to discover: it cannot be server-rendered,
+// because the access token lives in page memory and the refresh cookie is
+// scoped to /api/auth.
 async function initialize() {
   try {
-    const runtime = await api("/api/runtime", {}, false);
-    setRuntime(runtime);
-    await loadPermissions();
-
     // A surviving HTTP-only refresh cookie may restore the session after a reload.
     const restored = await refreshAccessToken();
     show(t("labels.session"), restored ? t("session.restored") : t("session.none"));
