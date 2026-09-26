@@ -35,10 +35,21 @@ pub enum AppError {
     NotFound(&'static str),
     #[error("{0} already exists")]
     Conflict(&'static str),
+    /// An application-specific failure: the application chooses the status,
+    /// a stable snake_case `code` clients can switch on, and the message.
+    /// Build it with [`AppError::domain`].
+    #[error("{message}")]
+    Domain {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
+    #[cfg(feature = "redis")]
     #[error("cache operation failed")]
     Cache(#[from] redis::RedisError),
+    #[cfg(feature = "kafka")]
     #[error("event stream operation failed")]
     EventStream(#[from] rdkafka::error::KafkaError),
     #[error("serialization failed")]
@@ -61,6 +72,21 @@ pub struct ApiErrorBody {
 }
 
 impl AppError {
+    /// An application-specific error, answered with `status` as
+    /// `{"error":{"code":…,"message":…}}`.
+    ///
+    /// Both `code` and `message` reach the client exactly as given, so they
+    /// must say nothing the caller should not learn; an internal failure
+    /// whose details must stay private is [`AppError::Internal`]. Like any
+    /// other response, a server-error status is also logged and reported.
+    pub fn domain(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self::Domain {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
@@ -80,12 +106,14 @@ impl AppError {
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::Database(_)
-            | Self::Cache(_)
-            | Self::EventStream(_)
-            | Self::Serialization(_)
-            | Self::Authentication
-            | Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Domain { status, .. } => *status,
+            Self::Database(_) | Self::Serialization(_) | Self::Authentication | Self::Internal => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            #[cfg(feature = "redis")]
+            Self::Cache(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            #[cfg(feature = "kafka")]
+            Self::EventStream(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -103,23 +131,26 @@ impl AppError {
             Self::MethodNotAllowed => "method_not_allowed",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
-            Self::Database(_)
-            | Self::Cache(_)
-            | Self::EventStream(_)
-            | Self::Serialization(_)
-            | Self::Authentication
-            | Self::Internal => "internal_error",
+            Self::Domain { code, .. } => code,
+            Self::Database(_) | Self::Serialization(_) | Self::Authentication | Self::Internal => {
+                "internal_error"
+            }
+            #[cfg(feature = "redis")]
+            Self::Cache(_) => "internal_error",
+            #[cfg(feature = "kafka")]
+            Self::EventStream(_) => "internal_error",
         }
     }
 
     fn public_message(&self) -> String {
         match self {
-            Self::Database(_)
-            | Self::Cache(_)
-            | Self::EventStream(_)
-            | Self::Serialization(_)
-            | Self::Authentication
-            | Self::Internal => "an internal error occurred".into(),
+            Self::Database(_) | Self::Serialization(_) | Self::Authentication | Self::Internal => {
+                "an internal error occurred".into()
+            }
+            #[cfg(feature = "redis")]
+            Self::Cache(_) => "an internal error occurred".into(),
+            #[cfg(feature = "kafka")]
+            Self::EventStream(_) => "an internal error occurred".into(),
             _ => self.to_string(),
         }
     }
@@ -175,6 +206,7 @@ impl IntoResponse for AppError {
         let status = self.status_code();
         if status.is_server_error() {
             tracing::error!(error = ?self, "request failed");
+            #[cfg(feature = "sentry")]
             sentry::capture_error(&self);
         }
         let retry_after_seconds = match &self {
@@ -223,6 +255,7 @@ mod tests {
     /// Infrastructure failures answer alike and say nothing about the
     /// infrastructure: a broker address or a topic name in an error body tells
     /// a caller about the deployment's internals.
+    #[cfg(feature = "kafka")]
     #[tokio::test]
     async fn event_stream_failures_answer_as_internal_errors() {
         let response = AppError::EventStream(rdkafka::error::KafkaError::MessageProduction(
@@ -235,6 +268,42 @@ mod tests {
         assert_eq!(
             String::from_utf8(bytes.to_vec()).unwrap(),
             r#"{"error":{"code":"internal_error","message":"an internal error occurred"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_errors_carry_the_application_status_and_code() {
+        let response = AppError::domain(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "order_closed",
+            "the order is already closed",
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            String::from_utf8(bytes.to_vec()).unwrap(),
+            r#"{"error":{"code":"order_closed","message":"the order is already closed"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn infrastructure_failures_hide_their_details_but_capacity_limits_do_not() {
+        let internal = AppError::Database(sqlx::Error::PoolTimedOut).into_response();
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(internal.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            String::from_utf8(bytes.to_vec()).unwrap(),
+            r#"{"error":{"code":"internal_error","message":"an internal error occurred"}}"#
+        );
+
+        // A resource limit is not a fault to hide: the client is told to retry.
+        let capacity = AppError::AtCapacity("the realtime demo").into_response();
+        assert_eq!(capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = to_bytes(capacity.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            String::from_utf8(bytes.to_vec()).unwrap(),
+            r#"{"error":{"code":"at_capacity","message":"the realtime demo is at capacity; try again shortly"}}"#
         );
     }
 

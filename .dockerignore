@@ -4,8 +4,11 @@ target
 .vscode
 .env
 .env.*
+# Embedded development PostgreSQL data
+.luxor
 docs
 tests
+scripts
 *.log
 .DS_Store
 Dockerfile

@@ -1,9 +1,27 @@
-use crate::error::AppError;
+use crate::{config::Env, error::AppError};
 use async_trait::async_trait;
+#[cfg(feature = "redis")]
 use redis::{aio::ConnectionManager, AsyncCommands};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
+
+#[derive(Clone, Debug)]
+pub struct CacheSettings {
+    /// Prefix for every key the Redis cache writes; `<APP_NAME>:cache` unless
+    /// `CACHE_NAMESPACE` says otherwise.
+    pub namespace: String,
+}
+
+impl CacheSettings {
+    pub fn from_env(env: &Env) -> Self {
+        Self {
+            namespace: env
+                .optional("CACHE_NAMESPACE")
+                .unwrap_or_else(|| format!("{}:cache", env.app_name())),
+        }
+    }
+}
 
 #[async_trait]
 pub trait Cache: Send + Sync {
@@ -45,12 +63,14 @@ pub async fn put_typed<T: Serialize + Sync>(
         .await
 }
 
+#[cfg(feature = "redis")]
 #[derive(Clone)]
 pub struct RedisCache {
     manager: ConnectionManager,
     namespace: String,
 }
 
+#[cfg(feature = "redis")]
 impl RedisCache {
     pub fn new(manager: ConnectionManager, namespace: String) -> Self {
         Self { manager, namespace }
@@ -62,6 +82,7 @@ impl RedisCache {
     }
 }
 
+#[cfg(feature = "redis")]
 #[async_trait]
 impl Cache for RedisCache {
     async fn get_json(&self, key: &str) -> Result<Option<serde_json::Value>, AppError> {

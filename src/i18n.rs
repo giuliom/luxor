@@ -1,4 +1,4 @@
-//! Internationalisation for the embedded browser console.
+//! Internationalisation for server-rendered pages.
 //!
 //! Language-prefixed URLs (`/en`, `/it`) are the source of truth: each locale
 //! has its own stable, indexable page, statically generated at startup from
@@ -13,14 +13,17 @@
 //! the page as a non-executing JSON data block for the client-side strings,
 //! which keeps one request per page and one source of truth per language.
 //!
-//! Rendering covers more than text: facts about the deployment that are fixed
-//! for the life of the process — the permission matrix, the runtime badge,
-//! the content-addressed asset URLs — arrive in [`PageContext`] and are
-//! rendered into the page too, so its first response is complete without a
-//! script fetching the rest.
+//! [`render_page`] resolves the template's language plumbing — `lang`, `dir`,
+//! the canonical URL, hreflang alternates, the language selector, the inlined
+//! dictionary — and every dictionary key; whatever else a page shows arrives
+//! through the caller's variables, so the renderer knows nothing about any
+//! particular page.
 
-use crate::{models::Role, permissions::Permission};
-use std::collections::{BTreeMap, BTreeSet};
+use axum::{
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+};
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 /// Name of the cookie that stores an explicitly selected language. It is set
@@ -32,14 +35,14 @@ pub const PREFERENCE_COOKIE: &str = "lang";
 /// the `x-default` hreflang target.
 pub const DEFAULT_LOCALE: Locale = Locale::En;
 
-/// Every language the console is available in. Adding a language means adding
+/// Every language the site is available in. Adding a language means adding
 /// a `Locale` variant (the compiler then asks for its tag, path, endonym, and
 /// dictionary), listing it here, and writing `locales/<lang>/common.json`.
 /// Routes, hreflang alternates, the selector, and the sitemap all follow from
 /// this list, and the dictionary-parity tests enforce completeness.
 pub const SUPPORTED_LOCALES: [Locale; 2] = [Locale::En, Locale::It];
 
-/// A language the console is translated into, identified by its BCP 47 tag.
+/// A language the site is translated into, identified by its BCP 47 tag.
 /// Language is deliberately the only axis: currency, time zone, and number
 /// formatting are handled by the browser's `Intl` APIs against this tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,7 +60,7 @@ impl Locale {
         }
     }
 
-    /// The canonical path of this locale's console page.
+    /// The canonical path of this locale's page.
     pub fn path(self) -> &'static str {
         match self {
             Self::En => "/en",
@@ -67,14 +70,14 @@ impl Locale {
 
     /// Both languages are left-to-right; a future RTL locale changes only
     /// this method and the template's `dir` attribute follows.
-    fn text_direction(self) -> &'static str {
+    pub fn text_direction(self) -> &'static str {
         "ltr"
     }
 
     /// The language's name in that language, as the selector shows it on
     /// every page: a reader looks for their language by the name they know it
     /// by, so this is deliberately not translated.
-    fn endonym(self) -> &'static str {
+    pub fn endonym(self) -> &'static str {
         match self {
             Self::En => "English",
             Self::It => "Italiano",
@@ -169,80 +172,85 @@ fn accept_language_locale(header: &str) -> Option<Locale> {
     best.map(|(locale, _)| locale)
 }
 
-const INDEX_TEMPLATE: &str = include_str!("../public/index.html");
-
-/// Everything a rendered page shows beyond its language. Each value is fixed
-/// for the life of the process, which is what makes rendering the page once at
-/// startup — instead of per request, or in the browser after load — correct.
-pub struct PageContext<'a> {
-    /// Absolute public origin for the canonical, hreflang, and Open Graph URLs.
-    pub base_url: &'a str,
-    /// Whether this instance runs on the embedded development PostgreSQL
-    /// server, which the service card's runtime badge reports.
-    pub embedded_database: bool,
-    /// The grants the permissions card renders. They are fixed at compile
-    /// time (see `permissions.rs`); were they ever loaded from storage, the
-    /// matrix would have to be rendered per request instead.
-    pub grants: BTreeMap<Role, BTreeSet<Permission>>,
-    /// Content-addressed URLs of the static files the page loads.
-    pub styles_url: &'a str,
-    pub script_url: &'a str,
-    pub favicon_url: &'a str,
-    pub wasm_url: &'a str,
+/// Sends `/` to the negotiated language version: the explicit cookie
+/// preference first, then `Accept-Language`, then the default. The redirect
+/// varies on what it read and is never cached, so a shared cache can never
+/// pin every visitor to one visitor's language; the language-prefixed URLs
+/// it points at are what caches and crawlers index.
+pub async fn localized_root(headers: HeaderMap) -> Response {
+    let locale = negotiate(
+        headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|value| value.to_str().ok()),
+    );
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, HeaderValue::from_static(locale.path())),
+            (
+                header::VARY,
+                HeaderValue::from_static("Cookie, Accept-Language"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+    )
+        .into_response()
 }
 
-/// Renders the console page for one locale. Called once per locale at startup
-/// — static generation, so every response is already in the right language —
-/// and panics on an unknown or unclosed placeholder, which the tests catch
-/// long before a deployment does.
-pub fn render_page(locale: Locale, context: &PageContext<'_>) -> String {
-    let mut page = String::with_capacity(INDEX_TEMPLATE.len() * 2);
-    let mut rest = INDEX_TEMPLATE;
+/// Renders `template` for one locale. Meant to be called once per locale at
+/// startup — static generation, so every response is already in the right
+/// language.
+///
+/// A `{{name}}` placeholder resolves to, in order: one of the built-in
+/// variables (`lang`, `dir`, `canonical`, `alternate_links`, `language_links`,
+/// `i18n_json`), then whatever `variables` returns for it — already-safe
+/// markup, inserted as is — and otherwise the HTML-escaped dictionary entry of
+/// that name. An unclosed placeholder or a name the dictionary does not define
+/// panics, which rendering tests catch long before a deployment does.
+pub fn render_page(
+    template: &str,
+    locale: Locale,
+    base_url: &str,
+    variables: impl Fn(&str) -> Option<String>,
+) -> String {
+    let mut page = String::with_capacity(template.len() * 2);
+    let mut rest = template;
     while let Some(start) = rest.find("{{") {
         page.push_str(&rest[..start]);
         let after = &rest[start + 2..];
         let end = after
             .find("}}")
-            .expect("unclosed {{ placeholder in public/index.html");
-        page.push_str(&resolve_placeholder(&after[..end], locale, context));
+            .expect("unclosed {{ placeholder in a page template");
+        let key = &after[..end];
+        let value = builtin_variable(key, locale, base_url)
+            .or_else(|| variables(key))
+            .unwrap_or_else(|| escape_html(message(locale, key)));
+        page.push_str(&value);
         rest = &after[end + 2..];
     }
     page.push_str(rest);
     page
 }
 
-fn resolve_placeholder(key: &str, locale: Locale, context: &PageContext<'_>) -> String {
-    // Template variables computed by code, not translated. Everything else is
-    // a dictionary key, and its value is escaped: translations are treated as
-    // untrusted input exactly like any other content.
-    match key {
+fn builtin_variable(key: &str, locale: Locale, base_url: &str) -> Option<String> {
+    Some(match key {
         "lang" => locale.as_str().to_owned(),
         "dir" => locale.text_direction().to_owned(),
-        "canonical" => escape_html(&format!("{}{}", context.base_url, locale.path())),
-        "alternate_links" => alternate_links(context.base_url),
+        "canonical" => escape_html(&format!("{base_url}{}", locale.path())),
+        "alternate_links" => alternate_links(base_url),
         "language_links" => language_links(locale),
-        "styles_url" => escape_html(context.styles_url),
-        "script_url" => escape_html(context.script_url),
-        "favicon_url" => escape_html(context.favicon_url),
-        "wasm_url" => escape_html(context.wasm_url),
-        "runtime_badge" => escape_html(message(
-            locale,
-            if context.embedded_database {
-                "runtime.embedded"
-            } else {
-                "runtime.fullStack"
-            },
-        )),
-        "permissions_matrix" => permissions_matrix(locale, &context.grants),
         "i18n_json" => inline_dictionary(locale),
-        _ => escape_html(message(locale, key)),
-    }
+        _ => return None,
+    })
 }
 
-/// A dictionary entry the renderer needs. The template and the renderer's own
-/// lookups are exercised by the rendering tests, so a miss is a defect caught
-/// long before a deployment.
-fn message(locale: Locale, key: &str) -> &'static str {
+/// A dictionary entry a renderer needs. Templates and renderers are exercised
+/// by their rendering tests, so a miss is a defect caught long before a
+/// deployment.
+pub fn message(locale: Locale, key: &str) -> &'static str {
     locale
         .dictionary()
         .get(key)
@@ -252,9 +260,9 @@ fn message(locale: Locale, key: &str) -> &'static str {
         })
 }
 
-/// Substitutes `{name}` placeholders exactly as the script's `formatMessage`
-/// does: a name without a value is left in place, visibly.
-fn format_message(message: &str, values: &[(&str, &str)]) -> String {
+/// Substitutes `{name}` placeholders exactly as the console script's
+/// `formatMessage` does: a name without a value is left in place, visibly.
+pub fn format_message(message: &str, values: &[(&str, &str)]) -> String {
     let mut formatted = String::with_capacity(message.len());
     let mut rest = message;
     while let Some(start) = rest.find('{') {
@@ -279,81 +287,6 @@ fn format_message(message: &str, values: &[(&str, &str)]) -> String {
     }
     formatted.push_str(rest);
     formatted
-}
-
-/// The permissions card's matrix — one column per role, one row per
-/// permission — in the markup the stylesheet and script expect: `data-role`
-/// marks the cells the script highlights for the signed-in role. Rendering it
-/// here puts the whole table in the first response, for crawlers and slow
-/// connections alike, and costs no request after load.
-fn permissions_matrix(locale: Locale, grants: &BTreeMap<Role, BTreeSet<Permission>>) -> String {
-    let mut html = String::from(r#"<thead><tr><th scope="col">"#);
-    html.push_str(&escape_html(message(
-        locale,
-        "permissions.columnPermission",
-    )));
-    html.push_str("</th>");
-    for role in grants.keys() {
-        html.push_str(&format!(
-            r#"<th scope="col" class="grant" data-role="{}">{}</th>"#,
-            escape_html(role.name()),
-            escape_html(message(locale, role_label_key(*role)))
-        ));
-    }
-    html.push_str("</tr></thead><tbody>");
-
-    for permission in Permission::ALL {
-        let description = message(locale, permission_description_key(permission));
-        html.push_str(&format!(
-            r#"<tr><th scope="row"><code>{}</code><span class="permission-hint">{}</span></th>"#,
-            escape_html(permission.name()),
-            escape_html(description)
-        ));
-        for (role, granted) in grants {
-            let (class, mark, key) = if granted.contains(&permission) {
-                ("grant-mark", "✓", "permissions.may")
-            } else {
-                ("grant-mark denied", "—", "permissions.mayNot")
-            };
-            let label = format_message(
-                message(locale, key),
-                &[
-                    ("role", message(locale, role_label_key(*role))),
-                    ("description", description),
-                ],
-            );
-            html.push_str(&format!(
-                r#"<td class="grant" data-role="{}"><span class="{class}" role="img" aria-label="{}">{mark}</span></td>"#,
-                escape_html(role.name()),
-                escape_html(&label)
-            ));
-        }
-        html.push_str("</tr>");
-    }
-    html.push_str("</tbody>");
-    html
-}
-
-/// The page describes each permission in its own language; the API catalog's
-/// descriptions are English. The match is exhaustive, so a new permission does
-/// not compile until it has a key, and the parity tests then require every
-/// language to translate it.
-fn permission_description_key(permission: Permission) -> &'static str {
-    match permission {
-        Permission::ReportsView => "permissions.description.reportsView",
-        Permission::RecordsPurge => "permissions.description.recordsPurge",
-    }
-}
-
-/// Display names for the roles. Their wire names (`admin`, `user`) remain in
-/// the API and in the matrix's `data-role` attributes, which the script keys
-/// on; people read the translated name. The match is exhaustive, so a new role
-/// does not compile until it has a key.
-fn role_label_key(role: Role) -> &'static str {
-    match role {
-        Role::Admin => "roles.admin",
-        Role::User => "roles.user",
-    }
 }
 
 /// Reciprocal hreflang alternates: every language version, this page's own
@@ -444,7 +377,7 @@ pub fn render_sitemap(base_url: &str) -> String {
     sitemap
 }
 
-fn escape_html(value: &str) -> String {
+pub fn escape_html(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
@@ -462,31 +395,9 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permissions::PermissionStore;
+    use std::collections::BTreeSet;
 
-    const SCRIPT_SOURCE: &str = include_str!("../public/script.js");
     const BASE_URL: &str = "https://console.example.com";
-
-    /// This module without its tests: the renderer's own dictionary lookups
-    /// (the matrix, the runtime badge) live here rather than in the template.
-    fn renderer_source() -> &'static str {
-        const SOURCE: &str = include_str!("i18n.rs");
-        SOURCE
-            .split_once("#[cfg(test)]")
-            .map_or(SOURCE, |(code, _)| code)
-    }
-
-    fn context(embedded_database: bool) -> PageContext<'static> {
-        PageContext {
-            base_url: BASE_URL,
-            embedded_database,
-            grants: PermissionStore.grants(),
-            styles_url: "/assets/styles.0123456789abcdef.css",
-            script_url: "/assets/script.0123456789abcdef.js",
-            favicon_url: "/assets/favicon.0123456789abcdef.svg",
-            wasm_url: "/assets/demo.0123456789abcdef.wasm",
-        }
-    }
 
     /// `{name}` placeholder names inside one translated message.
     fn placeholder_names(message: &str) -> BTreeSet<&str> {
@@ -502,27 +413,6 @@ mod tests {
             rest = &after[end + 1..];
         }
         names
-    }
-
-    /// String literals passed to the client's `t("…")` / `tp("…")` helpers.
-    fn script_translation_keys(call_prefix: &str) -> BTreeSet<String> {
-        let mut keys = BTreeSet::new();
-        let mut offset = 0;
-        while let Some(position) = SCRIPT_SOURCE[offset..].find(call_prefix) {
-            let start = offset + position;
-            let preceded_by_word = SCRIPT_SOURCE[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
-            let literal = &SCRIPT_SOURCE[start + call_prefix.len()..];
-            if !preceded_by_word {
-                if let Some(end) = literal.find('"') {
-                    keys.insert(literal[..end].to_owned());
-                }
-            }
-            offset = start + call_prefix.len();
-        }
-        keys
     }
 
     #[test]
@@ -563,175 +453,35 @@ mod tests {
     }
 
     #[test]
-    fn every_dictionary_key_is_referenced() {
-        // A key is referenced directly (template placeholder, or quoted string
-        // in the script or the renderer) or through its parent, which covers
-        // plural variants (`telemetry.spans.one`) and dynamic families
-        // (`errors.code.<code>`).
-        let sources = format!("{INDEX_TEMPLATE}{SCRIPT_SOURCE}{}", renderer_source());
-        for locale in SUPPORTED_LOCALES {
-            for key in locale.dictionary().keys() {
-                let parent_referenced = key
-                    .rsplit_once('.')
-                    .is_some_and(|(parent, _)| parent.contains('.') && sources.contains(parent));
-                assert!(
-                    sources.contains(key.as_str()) || parent_referenced,
-                    "`{key}` is defined but never used by the template or script"
-                );
-            }
-        }
+    fn pages_resolve_builtins_then_variables_then_the_dictionary() {
+        let template = r#"<html lang="{{lang}}" dir="{{dir}}"><link rel="canonical" href="{{canonical}}"><title>{{meta.title}}</title>{{extra}}</html>"#;
+        let page = render_page(template, Locale::It, BASE_URL, |key| {
+            (key == "extra").then(|| "<b>markup</b>".to_owned())
+        });
+        assert_eq!(
+            page,
+            format!(
+                r#"<html lang="it" dir="ltr"><link rel="canonical" href="{BASE_URL}/it"><title>{}</title><b>markup</b></html>"#,
+                escape_html(message(Locale::It, "meta.title"))
+            )
+        );
     }
 
     #[test]
-    fn every_script_lookup_has_a_translation() {
-        let dictionary = Locale::En.dictionary();
-        for key in script_translation_keys("t(\"") {
-            assert!(
-                dictionary.contains_key(&key),
-                "script.js calls t(\"{key}\") but the dictionary does not define it"
-            );
-        }
-        // Pluralized lookups resolve `<key>.<CLDR category>`, and `other` is
-        // the category every language has.
-        for key in script_translation_keys("tp(\"") {
-            assert!(
-                dictionary.contains_key(&format!("{key}.other")),
-                "script.js calls tp(\"{key}\") but the dictionary does not define `{key}.other`"
-            );
-        }
-    }
-
-    #[test]
-    fn pages_render_with_no_unresolved_placeholders() {
-        for locale in SUPPORTED_LOCALES {
-            // Both runtime variants, so every lookup the renderer can make is
-            // exercised against every dictionary.
-            for embedded_database in [true, false] {
-                let page = render_page(locale, &context(embedded_database));
-                assert!(
-                    !page.contains("{{"),
-                    "the rendered {locale} page still contains a placeholder"
-                );
-                assert!(page.contains(&format!(r#"<html lang="{locale}" dir="ltr">"#)));
-            }
-        }
-    }
-
-    #[test]
-    fn rendered_pages_carry_reciprocal_seo_metadata() {
-        for locale in SUPPORTED_LOCALES {
-            let page = render_page(locale, &context(true));
-            assert!(page.contains(&format!(
-                r#"<link rel="canonical" href="{BASE_URL}{}">"#,
-                locale.path()
-            )));
-            // Link previews name the same URL, title, and description.
-            assert!(page.contains(&format!(
-                r#"<meta property="og:url" content="{BASE_URL}{}">"#,
-                locale.path()
-            )));
-            let title = escape_html(message(locale, "meta.title"));
-            let description = escape_html(message(locale, "meta.description"));
-            assert!(page.contains(&format!(r#"<title>{title}</title>"#)));
-            assert!(page.contains(&format!(r#"<meta property="og:title" content="{title}">"#)));
-            assert!(page.contains(&format!(
-                r#"<meta name="description" content="{description}">"#
-            )));
-            assert!(page.contains(&format!(
-                r#"<meta property="og:description" content="{description}">"#
-            )));
-            // Every page links every language version, itself included.
-            for alternate in SUPPORTED_LOCALES {
-                assert!(page.contains(&format!(
-                    r#"<link rel="alternate" hreflang="{alternate}" href="{BASE_URL}{}">"#,
-                    alternate.path()
-                )));
-            }
-            assert!(page.contains(&format!(
-                r#"<link rel="alternate" hreflang="x-default" href="{BASE_URL}/en">"#
-            )));
-        }
-    }
-
-    #[test]
-    fn pages_are_rendered_in_their_own_language() {
-        let english = render_page(Locale::En, &context(true));
-        assert!(english.contains("<title>Luxor backend console</title>"));
-
-        let italian = render_page(Locale::It, &context(true));
-        assert!(italian.contains("<title>Console backend Luxor</title>"));
-        assert!(italian.contains("Autenticazione"));
-        // The inlined dictionary matches the page language, so the client
-        // never loads a second language's resources.
-        assert!(italian.contains(r#""labels.session":"Sessione""#));
-        assert!(!italian.contains(r#""labels.session":"Session""#));
-    }
-
-    #[test]
-    fn the_permission_matrix_is_rendered_in_the_page_language() {
-        let italian = render_page(Locale::It, &context(true));
-        // One column per role, marked for the script's role highlighting.
-        assert!(italian.contains(concat!(
-            r#"<table id="permissions-matrix" class="permissions-matrix" aria-label="Matrice dei permessi per ruolo">"#,
-            r#"<thead><tr><th scope="col">Permesso</th>"#,
-            r#"<th scope="col" class="grant" data-role="admin">Amministratore</th>"#,
-            r#"<th scope="col" class="grant" data-role="user">Utente</th></tr></thead>"#,
-        )));
-        // Descriptions are translated, unlike the API catalog's English ones.
-        assert!(italian.contains(concat!(
-            r#"<th scope="row"><code>records.purge</code>"#,
-            r#"<span class="permission-hint">Eseguire l’eliminazione simulata dei record</span></th>"#,
-        )));
-        assert!(!italian.contains(Permission::RecordsPurge.description()));
-        // Each cell states its grant to assistive technology, not only visually.
-        assert!(italian.contains(concat!(
-            r#"<td class="grant" data-role="admin"><span class="grant-mark" role="img" aria-label="Amministratore può: Eseguire l’eliminazione simulata dei record">✓</span></td>"#,
-            r#"<td class="grant" data-role="user"><span class="grant-mark denied" role="img" aria-label="Utente non può: Eseguire l’eliminazione simulata dei record">—</span></td>"#,
-        )));
-
-        let english = render_page(Locale::En, &context(true));
-        assert!(english
-            .contains(r#"<span class="permission-hint">Read the operational demo report</span>"#));
-    }
-
-    /// The rendered grants are the enforced ones, cell for cell.
-    #[test]
-    fn the_permission_matrix_matches_the_enforced_grants() {
-        let matrix = permissions_matrix(Locale::En, &PermissionStore.grants());
-        for role in Role::ALL {
-            for permission in Permission::ALL {
-                let (class, verb) = if PermissionStore.allows(role, permission) {
-                    ("grant-mark", "may")
-                } else {
-                    ("grant-mark denied", "may not")
-                };
-                let description = message(Locale::En, permission_description_key(permission));
-                assert!(
-                    matrix.contains(&format!(
-                        r#"<span class="{class}" role="img" aria-label="{} {verb}: {}">"#,
-                        message(Locale::En, role_label_key(role)),
-                        escape_html(description)
-                    )),
-                    "{role:?} / {permission:?}"
-                );
-            }
-        }
-    }
-
-    /// The script looks role names up as `roles.<wire name>`, so the keys the
-    /// renderer uses must follow that shape for every role.
-    #[test]
-    fn role_label_keys_follow_the_wire_names_the_script_uses() {
-        assert!(SCRIPT_SOURCE.contains("i18n[`roles.${role}`]"));
-        for role in Role::ALL {
-            assert_eq!(role_label_key(role), format!("roles.{}", role.name()));
-        }
+    #[should_panic(expected = "does not define")]
+    fn an_unknown_placeholder_fails_loudly() {
+        render_page("{{no.such.key}}", Locale::En, BASE_URL, |_| None);
     }
 
     #[test]
     fn the_language_selector_and_alternates_cover_every_locale() {
         for page_locale in SUPPORTED_LOCALES {
-            let page = render_page(page_locale, &context(true));
+            let page = render_page(
+                "{{alternate_links}}{{language_links}}",
+                page_locale,
+                BASE_URL,
+                |_| None,
+            );
             for locale in SUPPORTED_LOCALES {
                 let current = if locale == page_locale {
                     r#" aria-current="page""#
@@ -746,6 +496,10 @@ mod tests {
                     )),
                     "the {page_locale} page's selector is missing {locale}"
                 );
+                assert!(page.contains(&format!(
+                    r#"<link rel="alternate" hreflang="{locale}" href="{BASE_URL}{}">"#,
+                    locale.path()
+                )));
             }
             assert_eq!(page.matches(r#"aria-current="page""#).count(), 1);
             // One alternate per language plus x-default, and nothing else.
@@ -753,32 +507,11 @@ mod tests {
                 page.matches(r#"<link rel="alternate""#).count(),
                 SUPPORTED_LOCALES.len() + 1
             );
+            assert!(page.contains(&format!(
+                r#"<link rel="alternate" hreflang="x-default" href="{BASE_URL}{}">"#,
+                DEFAULT_LOCALE.path()
+            )));
         }
-    }
-
-    #[test]
-    fn the_runtime_badge_names_the_database_backend() {
-        let embedded = render_page(Locale::En, &context(true));
-        assert!(embedded
-            .contains(r#"<span id="runtime-badge" class="badge ok">Embedded database</span>"#));
-
-        let external = render_page(Locale::It, &context(false));
-        assert!(
-            external.contains(r#"<span id="runtime-badge" class="badge ok">Stack completo</span>"#)
-        );
-    }
-
-    #[test]
-    fn pages_reference_their_content_addressed_assets() {
-        let page = render_page(Locale::En, &context(true));
-        assert!(page.contains(
-            r#"<link rel="icon" href="/assets/favicon.0123456789abcdef.svg" type="image/svg+xml">"#
-        ));
-        assert!(
-            page.contains(r#"<link rel="stylesheet" href="/assets/styles.0123456789abcdef.css">"#)
-        );
-        assert!(page.contains(r#"<script src="/assets/script.0123456789abcdef.js"></script>"#));
-        assert!(page.contains(r#"data-module="/assets/demo.0123456789abcdef.wasm""#));
     }
 
     #[test]

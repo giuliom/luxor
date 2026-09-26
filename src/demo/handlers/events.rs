@@ -7,9 +7,11 @@
 //! once it has genuinely travelled through the stream and come back.
 
 use crate::{
+    app::events::DomainEvent,
     auth::AuthUser,
+    demo::DemoState,
     error::{ApiJson, AppError},
-    events::{ConsumedEvent, DomainEvent, PublishReceipt},
+    events::{ConsumedEvent, PublishReceipt},
     state::AppState,
 };
 use axum::{
@@ -36,7 +38,7 @@ pub struct PublishRequest {
 pub struct PublishResponse {
     status: &'static str,
     #[serde(flatten)]
-    receipt: PublishReceipt,
+    receipt: PublishReceipt<DomainEvent>,
 }
 
 /// Publishes one note to the topic on behalf of the caller.
@@ -79,12 +81,13 @@ pub struct StreamResponse {
     /// Everything this instance has consumed since it started, which exceeds
     /// `events` once the retained window has slid.
     consumed: u64,
-    events: Vec<ConsumedEvent>,
+    events: Vec<ConsumedEvent<DomainEvent>>,
 }
 
 /// Serves the tail of the stream as this instance has consumed it.
 pub async fn stream(
     State(state): State<AppState>,
+    State(demo): State<DemoState>,
     _auth: AuthUser,
     Query(query): Query<StreamQuery>,
 ) -> Result<Json<StreamResponse>, AppError> {
@@ -94,13 +97,22 @@ pub async fn stream(
             "limit must be between 1 and {MAX_EVENT_LIMIT}"
         )));
     }
-    let kafka = state.config.kafka.as_ref();
+    #[cfg(feature = "kafka")]
+    let (topic, consumer_group) = match &state.config.kafka {
+        Some(settings) => (
+            Some(settings.topic.clone()),
+            Some(settings.consumer_group.clone()),
+        ),
+        None => (None, None),
+    };
+    #[cfg(not(feature = "kafka"))]
+    let (topic, consumer_group) = (None, None);
     Ok(Json(StreamResponse {
         backend: state.events.backend(),
-        topic: kafka.map(|settings| settings.topic.clone()),
-        consumer_group: kafka.map(|settings| settings.consumer_group.clone()),
-        consumed: state.event_log.consumed(),
-        events: state.event_log.recent(limit),
+        topic,
+        consumer_group,
+        consumed: demo.event_log.consumed(),
+        events: demo.event_log.recent(limit),
     }))
 }
 

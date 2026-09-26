@@ -1615,6 +1615,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "jsonwebtoken",
+ "luxor",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

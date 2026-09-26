@@ -1,8 +1,8 @@
 use crate::{
+    app::{events::DomainEvent, jobs::Job},
     auth::AuthUser,
     error::{ApiJson, AppError},
-    events::{self, DomainEvent},
-    queue::Job,
+    events,
     state::AppState,
     validation,
 };

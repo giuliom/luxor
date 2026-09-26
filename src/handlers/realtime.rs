@@ -1,5 +1,5 @@
-//! The realtime demo's two endpoints: the ticket exchange that authorizes one
-//! handshake, and the WebSocket upgrade that redeems it.
+//! The realtime endpoints: the ticket exchange that authorizes one handshake,
+//! and the WebSocket upgrade that redeems it.
 //!
 //! Both live under `/api`, so the per-client rate limiter meters them. It sees
 //! the handshake and nothing after it; what happens on an established socket
@@ -78,7 +78,7 @@ pub async fn connect(
     if !realtime::origin_allowed(
         header_str(&headers, header::ORIGIN),
         header_str(&headers, header::HOST),
-        &state.config.cors_origins,
+        &state.config.http.cors_origins,
     ) {
         return Err(AppError::Forbidden);
     }

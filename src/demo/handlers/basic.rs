@@ -1,3 +1,5 @@
+//! Small public endpoints the console's service and telemetry cards call.
+
 use crate::{error::AppError, observability::StoredSpan, state::AppState};
 use axum::{
     extract::{Path, Query, State},
@@ -12,19 +14,6 @@ use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Serialize)]
-pub struct HealthResponse {
-    status: &'static str,
-    service: &'static str,
-}
-
-pub async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        service: "luxor",
-    })
-}
-
-#[derive(Serialize)]
 pub struct RuntimeResponse {
     database: &'static str,
     cache: &'static str,
@@ -32,8 +21,9 @@ pub struct RuntimeResponse {
     events: &'static str,
 }
 
+/// Reports which backends this instance runs on, as the console shows them.
 pub async fn runtime(State(state): State<AppState>) -> Json<RuntimeResponse> {
-    let database = if state.config.database_url.is_some() {
+    let database = if state.config.database.url.is_some() {
         "postgresql"
     } else {
         "embedded-postgresql"
@@ -125,8 +115,8 @@ pub async fn telemetry_demo(
 
     let (trace_id, span_id, sampled) = current_trace_context();
     Json(TelemetryDemoResponse {
-        otlp_enabled: state.config.otlp_endpoint.is_some(),
-        service_name: state.config.otel_service_name.clone(),
+        otlp_enabled: state.config.telemetry.otlp_endpoint.is_some(),
+        service_name: state.config.telemetry.service_name.clone(),
         request_id: headers
             .get("x-request-id")
             .and_then(|value| value.to_str().ok())

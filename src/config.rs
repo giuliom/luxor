@@ -1,14 +1,39 @@
+//! Environment-backed configuration.
+//!
+//! [`Config`] is assembled from sections, and each section parses itself next
+//! to the module that uses it: the listener and HTTP policy in
+//! [`crate::server`], credentials in [`crate::auth`], the database in
+//! [`crate::db`], rate limiting in [`crate::rate_limit`], and so on. The
+//! application's own settings are one more section,
+//! [`crate::app::Settings`], so a project adds configuration without touching
+//! this file.
+//!
+//! Every section reads through an [`Env`], which carries the raw values along
+//! with the two facts most defaults depend on: the environment, and the
+//! application's name.
+
 use secrecy::SecretString;
-use std::{
-    collections::HashMap,
-    env, fmt,
-    net::{IpAddr, SocketAddr},
-    str::FromStr,
-};
+use std::{collections::HashMap, env, fmt, str::FromStr};
 use thiserror::Error;
 use url::Url;
 
-const DEV_JWT_SECRET: &str = "development-only-secret-change-me";
+#[cfg(feature = "kafka")]
+use crate::events::kafka::KafkaSettings;
+#[cfg(feature = "realtime")]
+use crate::realtime::RealtimeSettings;
+use crate::{
+    auth::AuthSettings, cache::CacheSettings, db::DatabaseSettings,
+    observability::TelemetrySettings, queue::QueueSettings, rate_limit::RateLimitSettings,
+    server::HttpSettings,
+};
+
+/// What the application calls itself unless `APP_NAME` says otherwise: the
+/// package name, so renaming the package renames every derived default.
+pub const DEFAULT_APP_NAME: &str = env!("CARGO_PKG_NAME");
+
+/// Longest accepted `APP_NAME`. The name is embedded in Redis keys, a cookie
+/// name, and a Kafka topic, so it stays short.
+const APP_NAME_MAX_LENGTH: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Environment {
@@ -20,6 +45,14 @@ pub enum Environment {
 impl Environment {
     pub fn is_production(&self) -> bool {
         matches!(self, Self::Production)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Test => "test",
+            Self::Production => "production",
+        }
     }
 }
 
@@ -36,291 +69,31 @@ impl FromStr for Environment {
     }
 }
 
-/// Where the client address used for per-client policies (rate limiting)
-/// comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClientIpSource {
-    /// The peer address of the TCP connection. Correct when clients connect
-    /// directly, as in local development.
-    Socket,
-    /// The rightmost `X-Forwarded-For` entry, appended by the platform proxy
-    /// in front of the app. Correct on Railway, Heroku, and similar
-    /// platforms; unsafe without a trusted proxy, because clients can send
-    /// the header themselves.
-    XForwardedFor,
-}
-
-impl FromStr for ClientIpSource {
-    type Err = ConfigError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().as_str() {
-            "socket" => Ok(Self::Socket),
-            "x-forwarded-for" => Ok(Self::XForwardedFor),
-            _ => Err(ConfigError::Invalid("CLIENT_IP_SOURCE", value.to_owned())),
-        }
-    }
-}
-
-/// A fixed-window request budget: at most `max_requests` per client per
-/// `window_seconds`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RateLimitQuota {
-    pub max_requests: u32,
-    pub window_seconds: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct RateLimitSettings {
-    /// Cannot be disabled in production.
-    pub enabled: bool,
-    pub client_ip_source: ClientIpSource,
-    /// Prefix for the Redis keys of the distributed limiter.
-    pub namespace: String,
-    /// Budget for the credential endpoints under `/api/auth`, the
-    /// brute-force surface. Applies on top of `api`.
-    pub auth: RateLimitQuota,
-    /// Budget for everything under `/api`.
-    pub api: RateLimitQuota,
-}
-
-/// Bounds on the realtime WebSocket demo. Connections are long-lived, so the
-/// count is a resource limit per instance rather than a rate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RealtimeSettings {
-    /// Sockets this instance serves at once; further handshakes are refused
-    /// with `503` until one closes.
-    pub max_connections: usize,
-    /// Lifetime of the single-use ticket that authorizes one handshake. It
-    /// only has to cover the round trip from issuing the ticket to opening the
-    /// socket, so it is deliberately short.
-    pub ticket_ttl_seconds: u64,
-}
-
-/// How a Kafka client authenticates and encrypts its connection, named exactly
-/// as librdkafka's `security.protocol` spells it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KafkaSecurityProtocol {
-    Plaintext,
-    Ssl,
-    SaslPlaintext,
-    SaslSsl,
-}
-
-impl KafkaSecurityProtocol {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Plaintext => "plaintext",
-            Self::Ssl => "ssl",
-            Self::SaslPlaintext => "sasl_plaintext",
-            Self::SaslSsl => "sasl_ssl",
-        }
-    }
-
-    fn is_sasl(self) -> bool {
-        matches!(self, Self::SaslPlaintext | Self::SaslSsl)
-    }
-}
-
-impl FromStr for KafkaSecurityProtocol {
-    type Err = ConfigError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().as_str() {
-            "plaintext" => Ok(Self::Plaintext),
-            "ssl" => Ok(Self::Ssl),
-            "sasl_plaintext" => Ok(Self::SaslPlaintext),
-            "sasl_ssl" => Ok(Self::SaslSsl),
-            _ => Err(ConfigError::Invalid(
-                "KAFKA_SECURITY_PROTOCOL",
-                value.to_owned(),
-            )),
-        }
-    }
-}
-
-/// The SASL mechanisms librdkafka implements itself. Kerberos (`GSSAPI`) is
-/// deliberately absent: it needs the Cyrus SASL library, which this build does
-/// not link.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KafkaSaslMechanism {
-    Plain,
-    ScramSha256,
-    ScramSha512,
-}
-
-impl KafkaSaslMechanism {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Plain => "PLAIN",
-            Self::ScramSha256 => "SCRAM-SHA-256",
-            Self::ScramSha512 => "SCRAM-SHA-512",
-        }
-    }
-}
-
-impl FromStr for KafkaSaslMechanism {
-    type Err = ConfigError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_uppercase().as_str() {
-            "PLAIN" => Ok(Self::Plain),
-            "SCRAM-SHA-256" => Ok(Self::ScramSha256),
-            "SCRAM-SHA-512" => Ok(Self::ScramSha512),
-            "GSSAPI" => Err(ConfigError::Invalid(
-                "KAFKA_SASL_MECHANISM",
-                "GSSAPI needs the Cyrus SASL library, which this build does not link".to_owned(),
-            )),
-            _ => Err(ConfigError::Invalid(
-                "KAFKA_SASL_MECHANISM",
-                value.to_owned(),
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct KafkaSasl {
-    pub mechanism: KafkaSaslMechanism,
-    pub username: String,
-    pub password: SecretString,
-}
-
-/// Connection and topic settings for the event stream. `None` selects the
-/// in-process event bus; a configuration that names brokers always carries a
-/// complete, validated set.
-#[derive(Clone, Debug)]
-pub struct KafkaSettings {
-    /// `host:port[,host:port…]`, as librdkafka's `bootstrap.servers` takes it,
-    /// normalized so the library never sees stray whitespace.
-    pub brokers: String,
-    pub topic: String,
-    /// The consumer group this instance joins. Instances sharing a group share
-    /// the topic's partitions between them; instances given different groups
-    /// each receive every event.
-    pub consumer_group: String,
-    /// Identifies this application to the broker, in its logs and metrics.
-    pub client_id: String,
-    pub security_protocol: KafkaSecurityProtocol,
-    /// Present exactly when `security_protocol` names a SASL one.
-    pub sasl: Option<KafkaSasl>,
-    /// How long a publish may take — including the broker acknowledging it —
-    /// before it is reported as failed. It bounds a request that publishes an
-    /// event, so it belongs well inside `REQUEST_TIMEOUT_SECONDS`.
-    pub delivery_timeout_seconds: u64,
-}
-
-/// How the app decides a request reached it over TLS. TLS is terminated by
-/// the platform proxy, never in-process, so the only available signal is what
-/// that proxy reports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HttpsEnforcement {
-    /// Accept plaintext. Correct for local development, and for a deployment
-    /// whose proxy does not set `x-forwarded-proto`.
-    Off,
-    /// Turn away requests the proxy marked as plaintext. Carries the same
-    /// trust assumption as `CLIENT_IP_SOURCE=x-forwarded-for`: safe only when
-    /// a proxy always overwrites the header, since a directly reachable app
-    /// lets clients forge it.
-    ProxyHeader,
-}
-
-impl FromStr for HttpsEnforcement {
-    type Err = ConfigError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().as_str() {
-            "off" => Ok(Self::Off),
-            "proxy-header" => Ok(Self::ProxyHeader),
-            _ => Err(ConfigError::Invalid("HTTPS_ENFORCEMENT", value.to_owned())),
-        }
-    }
-}
-
-/// `Strict-Transport-Security`: how long a browser refuses to reach this host
-/// over plaintext after a single successful HTTPS response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HstsSettings {
-    pub enabled: bool,
-    pub max_age_seconds: u64,
-    pub include_subdomains: bool,
-    pub preload: bool,
-}
-
-impl HstsSettings {
-    pub fn header_value(&self) -> String {
-        let mut value = format!("max-age={}", self.max_age_seconds);
-        if self.include_subdomains {
-            value.push_str("; includeSubDomains");
-        }
-        if self.preload {
-            value.push_str("; preload");
-        }
-        value
-    }
-}
-
-#[derive(Clone)]
-pub struct OAuthConfig {
-    pub authorization_url: Url,
-    pub token_url: Url,
-    pub client_id: String,
-    pub client_secret: SecretString,
-    pub redirect_url: Url,
-}
-
-impl fmt::Debug for OAuthConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OAuthConfig")
-            .field("authorization_url", &self.authorization_url)
-            .field("token_url", &self.token_url)
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"[REDACTED]")
-            .field("redirect_url", &self.redirect_url)
-            .finish()
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Names this deployment wherever the application identifies itself: the
+    /// health check, the JWT issuer, the refresh cookie, and the defaults for
+    /// Redis key namespaces, Kafka names, and the OpenTelemetry service name.
+    pub app_name: String,
     pub environment: Environment,
-    pub app_host: String,
-    pub app_port: u16,
-    /// `None` selects the embedded development PostgreSQL server; production
-    /// configuration always carries a URL.
-    pub database_url: Option<SecretString>,
-    /// `None` selects the in-memory cache and queue; production configuration
-    /// always carries a URL.
+    pub http: HttpSettings,
+    pub database: DatabaseSettings,
+    /// `None` selects the in-memory cache, queue, and rate limiter. Production
+    /// configuration always carries a URL when the build includes the `redis`
+    /// feature; a build without it runs the in-memory backends everywhere.
     pub redis_url: Option<SecretString>,
-    pub jwt_secret: SecretString,
-    pub access_token_ttl_seconds: i64,
-    pub refresh_token_ttl_seconds: i64,
-    /// Absolute cap on a refresh-token rotation family: rotations renew the
-    /// session, but never past this many seconds after the first login.
-    pub refresh_family_ttl_seconds: i64,
-    pub refresh_cookie_secure: bool,
-    pub hsts: HstsSettings,
-    pub https_enforcement: HttpsEnforcement,
-    pub cors_origins: Vec<String>,
-    /// Absolute public origin used in canonical URLs, hreflang alternates,
-    /// and the sitemap. `None` selects a derived value; see
-    /// [`Config::public_base_url`].
-    pub public_base_url: Option<String>,
-    pub body_limit_bytes: usize,
-    pub request_timeout_seconds: u64,
+    pub auth: AuthSettings,
+    pub cache: CacheSettings,
+    pub queue: QueueSettings,
     pub rate_limit: RateLimitSettings,
+    #[cfg(feature = "realtime")]
     pub realtime: RealtimeSettings,
     /// `None` selects the in-process event bus; see [`KafkaSettings`].
+    #[cfg(feature = "kafka")]
     pub kafka: Option<KafkaSettings>,
-    pub auto_migrate: bool,
-    pub open_browser: bool,
-    pub otlp_endpoint: Option<String>,
-    pub otel_service_name: String,
-    pub sentry_dsn: Option<SecretString>,
-    pub oauth: Option<OAuthConfig>,
-    pub cache_namespace: String,
-    pub queue_key: String,
-    bind_address: SocketAddr,
+    pub telemetry: TelemetrySettings,
+    /// The application's own section.
+    pub app: crate::app::Settings,
 }
 
 impl Config {
@@ -329,207 +102,34 @@ impl Config {
     }
 
     pub fn from_map(values: HashMap<String, String>) -> Result<Self, ConfigError> {
-        let environment = get(&values, "APP_ENV")
-            .unwrap_or("development")
-            .parse::<Environment>()?;
-        let production = environment.is_production();
+        let env = Env::new(values)?;
+        env.refuse_excluded_features()?;
 
-        // Deployed containers sit behind a platform proxy and must accept
-        // traffic on all interfaces; local development stays loopback-only.
-        let default_host = if production { "0.0.0.0" } else { "127.0.0.1" };
-        let app_host = get(&values, "APP_HOST").unwrap_or(default_host).to_owned();
-        let app_ip = app_host
-            .parse::<IpAddr>()
-            .map_err(|error| ConfigError::Invalid("APP_HOST", error.to_string()))?;
-        // Platforms such as Railway and Heroku inject PORT and route traffic
-        // to it, so it must win over the locally documented APP_PORT.
-        let app_port = parse(&values, "PORT", parse(&values, "APP_PORT", 8080_u16)?)?;
-        if app_port == 0 {
-            return Err(ConfigError::Validation(
-                "APP_PORT must be greater than zero".into(),
-            ));
-        }
-
-        let database_url = infrastructure_url(
-            &values,
-            "DATABASE_URL",
-            production,
-            &["postgres", "postgresql"],
-        )?;
-        let redis_url = infrastructure_url(&values, "REDIS_URL", production, &["redis", "rediss"])?;
-
-        let jwt_secret = required_or_dev(&values, "JWT_SECRET", production, DEV_JWT_SECRET)?;
-        if jwt_secret.len() < 32 {
-            return Err(ConfigError::Validation(
-                "JWT_SECRET must contain at least 32 characters".into(),
-            ));
-        }
-        if production && jwt_secret == DEV_JWT_SECRET {
-            return Err(ConfigError::Validation(
-                "the development JWT_SECRET cannot be used in production".into(),
-            ));
-        }
-
-        let access_token_ttl_seconds = parse(&values, "ACCESS_TOKEN_TTL_SECONDS", 900_i64)?;
-        let refresh_token_ttl_seconds = parse(&values, "REFRESH_TOKEN_TTL_SECONDS", 2_592_000_i64)?;
-        if access_token_ttl_seconds <= 0 || refresh_token_ttl_seconds <= 0 {
-            return Err(ConfigError::Validation(
-                "token lifetimes must be greater than zero".into(),
-            ));
-        }
-        if refresh_token_ttl_seconds <= access_token_ttl_seconds {
-            return Err(ConfigError::Validation(
-                "refresh token lifetime must exceed access token lifetime".into(),
-            ));
-        }
-        let refresh_family_ttl_seconds =
-            parse(&values, "REFRESH_FAMILY_TTL_SECONDS", 7_776_000_i64)?;
-        if refresh_family_ttl_seconds < refresh_token_ttl_seconds {
-            return Err(ConfigError::Validation(
-                "refresh family lifetime must be at least the refresh token lifetime".into(),
-            ));
-        }
-
-        let oauth = parse_oauth(&values)?;
-        let cors_origins = get(&values, "CORS_ORIGINS")
-            .unwrap_or("https://localhost:8080")
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        if cors_origins.is_empty() {
-            return Err(ConfigError::Validation(
-                "CORS_ORIGINS must contain at least one origin".into(),
-            ));
-        }
-        for origin in &cors_origins {
-            validate_origin("CORS_ORIGINS", origin, production)?;
-        }
-
-        // The origin baked into canonical URLs, hreflang alternates, and the
-        // sitemap. Origin-only, because the localized routes live at the root
-        // of the site; a path prefix would produce URLs the router never
-        // serves.
-        let public_base_url = match get(&values, "PUBLIC_BASE_URL") {
-            Some(value) => {
-                validate_origin("PUBLIC_BASE_URL", value, production)?;
-                Some(value.trim_end_matches('/').to_owned())
-            }
-            None => None,
-        };
-
-        let body_limit_bytes = parse(&values, "BODY_LIMIT_BYTES", 1_048_576_usize)?;
-        if body_limit_bytes == 0 {
-            return Err(ConfigError::Validation(
-                "BODY_LIMIT_BYTES must be greater than zero".into(),
-            ));
-        }
-        let request_timeout_seconds = parse(&values, "REQUEST_TIMEOUT_SECONDS", 30_u64)?;
-        if request_timeout_seconds == 0 {
-            return Err(ConfigError::Validation(
-                "REQUEST_TIMEOUT_SECONDS must be greater than zero".into(),
-            ));
-        }
-        let rate_limit = parse_rate_limit(&values, production)?;
-        let realtime = parse_realtime(&values)?;
-        let kafka = parse_kafka(&values)?;
-        let hsts = parse_hsts(&values, production)?;
-        // Production sits behind a platform proxy that terminates TLS and
-        // reports the original scheme; local development is reached directly
-        // over plaintext http, where the check would reject every request.
-        let https_enforcement = match get(&values, "HTTPS_ENFORCEMENT") {
-            Some(value) => value.parse()?,
-            None if production => HttpsEnforcement::ProxyHeader,
-            None => HttpsEnforcement::Off,
-        };
-        let refresh_cookie_secure = parse(&values, "REFRESH_COOKIE_SECURE", production)?;
-        if production && !refresh_cookie_secure {
-            return Err(ConfigError::Validation(
-                "REFRESH_COOKIE_SECURE cannot be disabled in production".into(),
-            ));
-        }
-        let auto_migrate = parse(&values, "AUTO_MIGRATE", !production)?;
-        if production && auto_migrate {
-            return Err(ConfigError::Validation(
-                "AUTO_MIGRATE cannot be enabled in production".into(),
-            ));
-        }
-        let open_browser = parse(&values, "APP_OPEN_BROWSER", false)?;
-        if production && open_browser {
-            return Err(ConfigError::Validation(
-                "APP_OPEN_BROWSER cannot be enabled in production".into(),
-            ));
-        }
-
-        let otlp_endpoint = optional(&values, "OTEL_EXPORTER_OTLP_ENDPOINT");
-        if let Some(endpoint) = &otlp_endpoint {
-            parse_url("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint, &["http", "https"])?;
-        }
-        let otel_service_name = get(&values, "OTEL_SERVICE_NAME")
-            .unwrap_or("luxor")
-            .to_owned();
-        let sentry_dsn = optional(&values, "SENTRY_DSN");
-        if let Some(dsn) = &sentry_dsn {
-            dsn.parse::<sentry::types::Dsn>()
-                .map_err(|error| ConfigError::Invalid("SENTRY_DSN", error.to_string()))?;
-        }
-
-        let cache_namespace = get(&values, "CACHE_NAMESPACE")
-            .unwrap_or("luxor:cache")
-            .to_owned();
-        let queue_key = get(&values, "QUEUE_KEY")
-            .unwrap_or("luxor:queue:jobs")
-            .to_owned();
+        let http = HttpSettings::from_env(&env)?;
+        let database = DatabaseSettings::from_env(&env)?;
+        #[cfg(feature = "redis")]
+        let redis_url = env.infrastructure_url("REDIS_URL", &["redis", "rediss"])?;
+        // Refused above when set, so a build without Redis never carries one.
+        #[cfg(not(feature = "redis"))]
+        let redis_url = None;
 
         Ok(Self {
-            environment,
-            app_host,
-            app_port,
-            database_url,
+            http,
+            database,
             redis_url,
-            jwt_secret: SecretString::from(jwt_secret),
-            access_token_ttl_seconds,
-            refresh_token_ttl_seconds,
-            refresh_family_ttl_seconds,
-            refresh_cookie_secure,
-            hsts,
-            https_enforcement,
-            cors_origins,
-            public_base_url,
-            body_limit_bytes,
-            request_timeout_seconds,
-            rate_limit,
-            realtime,
-            kafka,
-            auto_migrate,
-            open_browser,
-            otlp_endpoint,
-            otel_service_name,
-            sentry_dsn: sentry_dsn.map(SecretString::from),
-            oauth,
-            cache_namespace,
-            queue_key,
-            bind_address: SocketAddr::new(app_ip, app_port),
+            auth: AuthSettings::from_env(&env)?,
+            cache: CacheSettings::from_env(&env),
+            queue: QueueSettings::from_env(&env),
+            rate_limit: RateLimitSettings::from_env(&env)?,
+            #[cfg(feature = "realtime")]
+            realtime: RealtimeSettings::from_env(&env)?,
+            #[cfg(feature = "kafka")]
+            kafka: KafkaSettings::from_env(&env)?,
+            telemetry: TelemetrySettings::from_env(&env)?,
+            app: crate::app::Settings::from_env(&env)?,
+            app_name: env.app_name,
+            environment: env.environment,
         })
-    }
-
-    pub fn bind_address(&self) -> SocketAddr {
-        self.bind_address
-    }
-
-    /// The absolute origin used in canonical URLs, hreflang alternates, and
-    /// the sitemap. An explicit `PUBLIC_BASE_URL` wins; production falls back
-    /// to the first CORS origin, which deployments already set to the public
-    /// URL; development falls back to the local listener address.
-    pub fn public_base_url(&self) -> String {
-        if let Some(base_url) = &self.public_base_url {
-            return base_url.clone();
-        }
-        if self.environment.is_production() {
-            return self.cors_origins[0].trim_end_matches('/').to_owned();
-        }
-        format!("http://{}:{}", self.app_host, self.app_port)
     }
 }
 
@@ -543,6 +143,156 @@ pub enum ConfigError {
     Validation(String),
 }
 
+/// The raw settings a [`Config`] is parsed from, with the environment and the
+/// application name already resolved so that every section can derive its
+/// defaults from them.
+///
+/// An empty value reads as unset, which is how `.env` files and deployment
+/// platforms spell "not configured".
+pub struct Env {
+    values: HashMap<String, String>,
+    environment: Environment,
+    app_name: String,
+}
+
+impl Env {
+    pub fn new(values: HashMap<String, String>) -> Result<Self, ConfigError> {
+        let environment = get(&values, "APP_ENV")
+            .unwrap_or("development")
+            .parse::<Environment>()?;
+        let app_name = parse_app_name(get(&values, "APP_NAME").unwrap_or(DEFAULT_APP_NAME))?;
+        Ok(Self {
+            values,
+            environment,
+            app_name,
+        })
+    }
+
+    pub fn environment(&self) -> &Environment {
+        &self.environment
+    }
+
+    pub fn is_production(&self) -> bool {
+        self.environment.is_production()
+    }
+
+    pub fn app_name(&self) -> &str {
+        &self.app_name
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        get(&self.values, key)
+    }
+
+    pub fn optional(&self, key: &str) -> Option<String> {
+        self.get(key).map(ToOwned::to_owned)
+    }
+
+    /// Parses `key`, or returns `default` when it is unset.
+    pub fn parse<T>(&self, key: &'static str, default: T) -> Result<T, ConfigError>
+    where
+        T: FromStr,
+        T::Err: fmt::Display,
+    {
+        match self.get(key) {
+            Some(value) => value
+                .parse::<T>()
+                .map_err(|error| ConfigError::Invalid(key, error.to_string())),
+            None => Ok(default),
+        }
+    }
+
+    /// A value production must supply, with a fixed stand-in elsewhere.
+    pub fn required_or_dev(
+        &self,
+        key: &'static str,
+        development_default: &str,
+    ) -> Result<String, ConfigError> {
+        self.get(key)
+            .map(ToOwned::to_owned)
+            .or_else(|| (!self.is_production()).then(|| development_default.to_owned()))
+            .ok_or(ConfigError::Missing(key))
+    }
+
+    /// Production must point at real infrastructure; outside production a
+    /// missing URL selects the built-in development fallback (the embedded
+    /// PostgreSQL server, or the in-memory cache and queue).
+    pub fn infrastructure_url(
+        &self,
+        key: &'static str,
+        schemes: &[&str],
+    ) -> Result<Option<SecretString>, ConfigError> {
+        match self.get(key) {
+            Some(value) => {
+                parse_url(key, value, schemes)?;
+                Ok(Some(SecretString::from(value.to_owned())))
+            }
+            None if self.is_production() => Err(ConfigError::Missing(key)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fails on any setting that belongs to a feature this build excludes.
+    ///
+    /// A deployment that sets `REDIS_URL` on a build without Redis believes it
+    /// shares state across instances when it does not, so the value is a
+    /// mistake worth naming rather than one to quietly ignore.
+    fn refuse_excluded_features(&self) -> Result<(), ConfigError> {
+        for (feature, included, keys) in FEATURE_SETTINGS {
+            if included {
+                continue;
+            }
+            if let Some(key) = keys.iter().find(|key| self.get(key).is_some()) {
+                return Err(ConfigError::Validation(format!(
+                    "{key} is set, but this build excludes the `{feature}` feature"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Every Kafka setting. `KAFKA_BROKERS` enables the event stream; the others
+/// configure it and mean nothing without it.
+pub(crate) const KAFKA_SETTINGS: [&str; 9] = [
+    "KAFKA_BROKERS",
+    "KAFKA_TOPIC",
+    "KAFKA_CONSUMER_GROUP",
+    "KAFKA_CLIENT_ID",
+    "KAFKA_SECURITY_PROTOCOL",
+    "KAFKA_SASL_MECHANISM",
+    "KAFKA_SASL_USERNAME",
+    "KAFKA_SASL_PASSWORD",
+    "KAFKA_DELIVERY_TIMEOUT_SECONDS",
+];
+
+/// The settings owned by each optional feature, and whether this build
+/// includes it.
+const FEATURE_SETTINGS: [(&str, bool, &[&str]); 5] = [
+    (
+        "redis",
+        cfg!(feature = "redis"),
+        &[
+            "REDIS_URL",
+            "CACHE_NAMESPACE",
+            "QUEUE_KEY",
+            "RATE_LIMIT_NAMESPACE",
+        ],
+    ),
+    ("kafka", cfg!(feature = "kafka"), &KAFKA_SETTINGS),
+    (
+        "otel",
+        cfg!(feature = "otel"),
+        &["OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_SERVICE_NAME"],
+    ),
+    ("sentry", cfg!(feature = "sentry"), &["SENTRY_DSN"]),
+    (
+        "realtime",
+        cfg!(feature = "realtime"),
+        &["REALTIME_MAX_CONNECTIONS", "REALTIME_TICKET_TTL_SECONDS"],
+    ),
+];
+
 fn get<'a>(values: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
     values
         .get(key)
@@ -550,59 +300,25 @@ fn get<'a>(values: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
         .filter(|v| !v.is_empty())
 }
 
-fn optional(values: &HashMap<String, String>, key: &str) -> Option<String> {
-    get(values, key).map(ToOwned::to_owned)
+/// The name is embedded in Redis keys, a cookie name, and a Kafka topic, so it
+/// is held to the characters all three accept — which are also the characters
+/// a Cargo package name may contain, so the default always passes.
+fn parse_app_name(value: &str) -> Result<String, ConfigError> {
+    let valid = (1..=APP_NAME_MAX_LENGTH).contains(&value.len())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    valid.then(|| value.to_owned()).ok_or_else(|| {
+        ConfigError::Invalid(
+            "APP_NAME",
+            format!(
+                "expected 1-{APP_NAME_MAX_LENGTH} characters of letters, digits, hyphens, or underscores"
+            ),
+        )
+    })
 }
 
-fn required_or_dev(
-    values: &HashMap<String, String>,
-    key: &'static str,
-    production: bool,
-    development_default: &str,
-) -> Result<String, ConfigError> {
-    get(values, key)
-        .map(ToOwned::to_owned)
-        .or_else(|| (!production).then(|| development_default.to_owned()))
-        .ok_or(ConfigError::Missing(key))
-}
-
-/// Production must point at real infrastructure; outside production a missing
-/// URL selects the built-in development fallback (the embedded PostgreSQL
-/// server, or the in-memory cache and queue).
-fn infrastructure_url(
-    values: &HashMap<String, String>,
-    key: &'static str,
-    production: bool,
-    schemes: &[&str],
-) -> Result<Option<SecretString>, ConfigError> {
-    match get(values, key) {
-        Some(value) => {
-            parse_url(key, value, schemes)?;
-            Ok(Some(SecretString::from(value.to_owned())))
-        }
-        None if production => Err(ConfigError::Missing(key)),
-        None => Ok(None),
-    }
-}
-
-fn parse<T>(
-    values: &HashMap<String, String>,
-    key: &'static str,
-    default: T,
-) -> Result<T, ConfigError>
-where
-    T: FromStr,
-    T::Err: fmt::Display,
-{
-    match get(values, key) {
-        Some(value) => value
-            .parse::<T>()
-            .map_err(|error| ConfigError::Invalid(key, error.to_string())),
-        None => Ok(default),
-    }
-}
-
-fn parse_url(key: &'static str, value: &str, schemes: &[&str]) -> Result<Url, ConfigError> {
+pub fn parse_url(key: &'static str, value: &str, schemes: &[&str]) -> Result<Url, ConfigError> {
     let url = Url::parse(value).map_err(|error| ConfigError::Invalid(key, error.to_string()))?;
     if schemes.contains(&url.scheme()) {
         Ok(url)
@@ -614,7 +330,11 @@ fn parse_url(key: &'static str, value: &str, schemes: &[&str]) -> Result<Url, Co
     }
 }
 
-fn validate_origin(key: &'static str, origin: &str, production: bool) -> Result<(), ConfigError> {
+pub fn validate_origin(
+    key: &'static str,
+    origin: &str,
+    production: bool,
+) -> Result<(), ConfigError> {
     let url = parse_url(key, origin, &["http", "https"])?;
     // A plaintext origin in production means credentialed requests are
     // expected over a channel that cannot carry a `Secure` cookie, which is
@@ -641,896 +361,137 @@ fn validate_origin(key: &'static str, origin: &str, production: bool) -> Result<
     }
 }
 
-/// Requirements published by the browser preload list: a two-year max-age is
-/// the usual submission, and one year is the documented floor.
-const HSTS_PRELOAD_MIN_MAX_AGE: u64 = 31_536_000;
-
-fn parse_hsts(
-    values: &HashMap<String, String>,
-    production: bool,
-) -> Result<HstsSettings, ConfigError> {
-    // Sending HSTS from a development server would pin the developer's browser
-    // to https on localhost for a year, breaking every other local project on
-    // that port.
-    let enabled = parse(values, "HSTS_ENABLED", production)?;
-    // Zero is allowed and meaningful: it is the only way to release browsers
-    // that already cached a policy for this host.
-    let max_age_seconds = parse(values, "HSTS_MAX_AGE_SECONDS", 31_536_000_u64)?;
-    let include_subdomains = parse(values, "HSTS_INCLUDE_SUBDOMAINS", true)?;
-    let preload = parse(values, "HSTS_PRELOAD", false)?;
-
-    if preload && !enabled {
-        return Err(ConfigError::Validation(
-            "HSTS_PRELOAD requires HSTS_ENABLED".into(),
-        ));
-    }
-    // Submitting a host to the preload list is close to irreversible, so a
-    // header that claims preload while failing the list's own requirements is
-    // rejected here rather than silently ignored by the browser.
-    if preload && (!include_subdomains || max_age_seconds < HSTS_PRELOAD_MIN_MAX_AGE) {
-        return Err(ConfigError::Validation(format!(
-            "HSTS_PRELOAD requires HSTS_INCLUDE_SUBDOMAINS and an HSTS_MAX_AGE_SECONDS of at least {HSTS_PRELOAD_MIN_MAX_AGE}"
-        )));
-    }
-
-    Ok(HstsSettings {
-        enabled,
-        max_age_seconds,
-        include_subdomains,
-        preload,
-    })
-}
-
-fn parse_rate_limit(
-    values: &HashMap<String, String>,
-    production: bool,
-) -> Result<RateLimitSettings, ConfigError> {
-    let enabled = parse(values, "RATE_LIMIT_ENABLED", true)?;
-    if production && !enabled {
-        return Err(ConfigError::Validation(
-            "RATE_LIMIT_ENABLED cannot be disabled in production".into(),
-        ));
-    }
-    // Deployed containers sit behind the platform proxy, so the peer address
-    // would be the proxy itself; local development connects directly.
-    let default_source = if production {
-        ClientIpSource::XForwardedFor
-    } else {
-        ClientIpSource::Socket
-    };
-    let client_ip_source = match get(values, "CLIENT_IP_SOURCE") {
-        Some(value) => value.parse()?,
-        None => default_source,
-    };
-    let namespace = get(values, "RATE_LIMIT_NAMESPACE")
-        .unwrap_or("luxor:ratelimit")
-        .to_owned();
-    let auth = parse_quota(
-        values,
-        ("RATE_LIMIT_AUTH_MAX_REQUESTS", 10),
-        ("RATE_LIMIT_AUTH_WINDOW_SECONDS", 60),
-    )?;
-    let api = parse_quota(
-        values,
-        ("RATE_LIMIT_API_MAX_REQUESTS", 120),
-        ("RATE_LIMIT_API_WINDOW_SECONDS", 60),
-    )?;
-    Ok(RateLimitSettings {
-        enabled,
-        client_ip_source,
-        namespace,
-        auth,
-        api,
-    })
-}
-
-/// The upper bound on the ticket lifetime is a security setting, not a
-/// preference: a connection ticket is a bearer credential that travels in a
-/// URL, so it must expire long before anything could replay it from a log.
-const MAX_REALTIME_TICKET_TTL_SECONDS: u64 = 300;
-
-fn parse_realtime(values: &HashMap<String, String>) -> Result<RealtimeSettings, ConfigError> {
-    let max_connections = parse(values, "REALTIME_MAX_CONNECTIONS", 100_usize)?;
-    if max_connections == 0 {
-        return Err(ConfigError::Validation(
-            "REALTIME_MAX_CONNECTIONS must be greater than zero".into(),
-        ));
-    }
-    let ticket_ttl_seconds = parse(values, "REALTIME_TICKET_TTL_SECONDS", 30_u64)?;
-    if !(1..=MAX_REALTIME_TICKET_TTL_SECONDS).contains(&ticket_ttl_seconds) {
-        return Err(ConfigError::Validation(format!(
-            "REALTIME_TICKET_TTL_SECONDS must be between 1 and {MAX_REALTIME_TICKET_TTL_SECONDS} seconds"
-        )));
-    }
-    Ok(RealtimeSettings {
-        max_connections,
-        ticket_ttl_seconds,
-    })
-}
-
-/// Kafka's own limit on a topic name.
-const KAFKA_TOPIC_MAX_LENGTH: usize = 249;
-
-/// Every Kafka setting other than the broker list. Each has a working default,
-/// so the presence of one is not what enables Kafka — `KAFKA_BROKERS` is.
-const KAFKA_DEPENDENT_KEYS: [&str; 8] = [
-    "KAFKA_TOPIC",
-    "KAFKA_CONSUMER_GROUP",
-    "KAFKA_CLIENT_ID",
-    "KAFKA_SECURITY_PROTOCOL",
-    "KAFKA_SASL_MECHANISM",
-    "KAFKA_SASL_USERNAME",
-    "KAFKA_SASL_PASSWORD",
-    "KAFKA_DELIVERY_TIMEOUT_SECONDS",
-];
-
-fn parse_kafka(values: &HashMap<String, String>) -> Result<Option<KafkaSettings>, ConfigError> {
-    let Some(brokers) = get(values, "KAFKA_BROKERS") else {
-        // A configured broker credential that would never be sent anywhere is
-        // a mistake worth naming, not a value to quietly discard.
-        if let Some(key) = KAFKA_DEPENDENT_KEYS
-            .iter()
-            .find(|key| get(values, key).is_some())
-        {
-            return Err(ConfigError::Validation(format!(
-                "{key} has no effect unless KAFKA_BROKERS is set"
-            )));
-        }
-        return Ok(None);
-    };
-
-    let security_protocol = match get(values, "KAFKA_SECURITY_PROTOCOL") {
-        Some(value) => value.parse()?,
-        None => KafkaSecurityProtocol::Plaintext,
-    };
-    let credentials = [
-        get(values, "KAFKA_SASL_MECHANISM"),
-        get(values, "KAFKA_SASL_USERNAME"),
-        get(values, "KAFKA_SASL_PASSWORD"),
-    ];
-    let sasl = match (security_protocol.is_sasl(), credentials) {
-        (true, [Some(mechanism), Some(username), Some(password)]) => Some(KafkaSasl {
-            mechanism: mechanism.parse()?,
-            username: username.to_owned(),
-            password: SecretString::from(password.to_owned()),
-        }),
-        (true, _) => {
-            return Err(ConfigError::Validation(format!(
-                "KAFKA_SECURITY_PROTOCOL={} requires KAFKA_SASL_MECHANISM, KAFKA_SASL_USERNAME, and KAFKA_SASL_PASSWORD",
-                security_protocol.as_str()
-            )))
-        }
-        // Credentials under a non-SASL protocol would never be sent, so the
-        // deployment believes it is authenticating when it is not.
-        (false, [None, None, None]) => None,
-        (false, _) => {
-            return Err(ConfigError::Validation(format!(
-                "the KAFKA_SASL_* settings need a SASL KAFKA_SECURITY_PROTOCOL, not {}",
-                security_protocol.as_str()
-            )))
-        }
-    };
-
-    let delivery_timeout_seconds = parse(values, "KAFKA_DELIVERY_TIMEOUT_SECONDS", 10_u64)?;
-    if !(1..=300).contains(&delivery_timeout_seconds) {
-        return Err(ConfigError::Validation(
-            "KAFKA_DELIVERY_TIMEOUT_SECONDS must be between 1 and 300 seconds".into(),
-        ));
-    }
-
-    Ok(Some(KafkaSettings {
-        brokers: parse_broker_list(brokers)?,
-        topic: parse_topic(get(values, "KAFKA_TOPIC").unwrap_or("luxor.events"))?,
-        consumer_group: parse_kafka_identifier(
-            "KAFKA_CONSUMER_GROUP",
-            get(values, "KAFKA_CONSUMER_GROUP").unwrap_or("luxor-console"),
-        )?,
-        client_id: parse_kafka_identifier(
-            "KAFKA_CLIENT_ID",
-            get(values, "KAFKA_CLIENT_ID").unwrap_or("luxor"),
-        )?,
-        security_protocol,
-        sasl,
-        delivery_timeout_seconds,
-    }))
-}
-
-/// Normalizes `host:port[,host:port…]`. librdkafka reports an unusable entry
-/// only once a connection is attempted, in a background thread, so the shape is
-/// checked here instead — a typo should fail startup, not surface as events
-/// that silently never arrive.
-fn parse_broker_list(brokers: &str) -> Result<String, ConfigError> {
-    let mut normalized = Vec::new();
-    for entry in brokers.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        // rsplit keeps a bracketed IPv6 literal (`[::1]:9092`) intact.
-        let valid = entry.rsplit_once(':').is_some_and(|(host, port)| {
-            !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port > 0)
-        });
-        if !valid {
-            return Err(ConfigError::Invalid(
-                "KAFKA_BROKERS",
-                format!("{entry} is not a host:port address"),
-            ));
-        }
-        normalized.push(entry);
-    }
-    if normalized.is_empty() {
-        return Err(ConfigError::Invalid(
-            "KAFKA_BROKERS",
-            "expected at least one host:port address".to_owned(),
-        ));
-    }
-    Ok(normalized.join(","))
-}
-
-/// Applies Kafka's own topic-name rule. A name the broker would refuse is
-/// better refused here, where the message says which setting is wrong.
-fn parse_topic(topic: &str) -> Result<String, ConfigError> {
-    let named = (1..=KAFKA_TOPIC_MAX_LENGTH).contains(&topic.len())
-        && topic != "."
-        && topic != ".."
-        && topic.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
-        });
-    named.then(|| topic.to_owned()).ok_or_else(|| {
-        ConfigError::Invalid(
-            "KAFKA_TOPIC",
-            format!(
-                "expected 1-{KAFKA_TOPIC_MAX_LENGTH} characters of letters, digits, dots, underscores, or hyphens"
-            ),
-        )
-    })
-}
-
-/// A group or client identifier. Both are echoed into broker logs and metric
-/// names, so they stay printable ASCII without whitespace.
-fn parse_kafka_identifier(key: &'static str, value: &str) -> Result<String, ConfigError> {
-    let named = (1..=255).contains(&value.len())
-        && value
-            .chars()
-            .all(|character| character.is_ascii_graphic() && character != ',');
-    named.then(|| value.to_owned()).ok_or_else(|| {
-        ConfigError::Invalid(
-            key,
-            "expected 1-255 printable ASCII characters without whitespace or commas".to_owned(),
-        )
-    })
-}
-
-fn parse_quota(
-    values: &HashMap<String, String>,
-    (max_key, default_max): (&'static str, u32),
-    (window_key, default_window): (&'static str, u64),
-) -> Result<RateLimitQuota, ConfigError> {
-    let max_requests = parse(values, max_key, default_max)?;
-    if max_requests == 0 {
-        return Err(ConfigError::Validation(format!(
-            "{max_key} must be greater than zero"
-        )));
-    }
-    let window_seconds = parse(values, window_key, default_window)?;
-    if !(1..=86_400).contains(&window_seconds) {
-        return Err(ConfigError::Validation(format!(
-            "{window_key} must be between 1 and 86400 seconds"
-        )));
-    }
-    Ok(RateLimitQuota {
-        max_requests,
-        window_seconds,
-    })
-}
-
-fn parse_oauth(values: &HashMap<String, String>) -> Result<Option<OAuthConfig>, ConfigError> {
-    const KEYS: [&str; 5] = [
-        "OAUTH_AUTHORIZATION_URL",
-        "OAUTH_TOKEN_URL",
-        "OAUTH_CLIENT_ID",
-        "OAUTH_CLIENT_SECRET",
-        "OAUTH_REDIRECT_URL",
-    ];
-    let present = KEYS.iter().filter(|key| get(values, key).is_some()).count();
-    if present == 0 {
-        return Ok(None);
-    }
-    if present != KEYS.len() {
-        return Err(ConfigError::Validation(format!(
-            "OAuth configuration is all-or-nothing; set {}",
-            KEYS.join(", ")
-        )));
-    }
-
-    Ok(Some(OAuthConfig {
-        authorization_url: parse_url(
-            "OAUTH_AUTHORIZATION_URL",
-            get(values, KEYS[0]).unwrap(),
-            &["http", "https"],
-        )?,
-        token_url: parse_url(
-            "OAUTH_TOKEN_URL",
-            get(values, KEYS[1]).unwrap(),
-            &["http", "https"],
-        )?,
-        client_id: get(values, KEYS[2]).unwrap().to_owned(),
-        client_secret: SecretString::from(get(values, KEYS[3]).unwrap().to_owned()),
-        redirect_url: parse_url(
-            "OAUTH_REDIRECT_URL",
-            get(values, KEYS[4]).unwrap(),
-            &["http", "https"],
-        )?,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const TEST_DATABASE_URL: &str = "postgres://luxor:luxor@localhost:5432/luxor";
-    const TEST_REDIS_URL: &str = "redis://127.0.0.1:6379/";
+    const TEST_DATABASE_URL: &str = "postgres://test@localhost:5432/test";
+
+    fn values(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
 
     #[test]
     fn development_defaults_are_valid() {
         let config = Config::from_map(HashMap::new()).unwrap();
         assert_eq!(config.environment, Environment::Development);
-        assert_eq!(config.app_port, 8080);
-        assert_eq!(config.cors_origins, vec!["https://localhost:8080"]);
-        assert!(config.auto_migrate);
-        assert!(config.database_url.is_none());
+        assert_eq!(config.app_name, DEFAULT_APP_NAME);
         assert!(config.redis_url.is_none());
-        assert!(!config.open_browser);
-        assert!(!config.refresh_cookie_secure);
-        assert_eq!(config.otel_service_name, "luxor");
-        assert_eq!(config.refresh_family_ttl_seconds, 7_776_000);
-        assert_eq!(config.request_timeout_seconds, 30);
-        assert!(config.rate_limit.enabled);
-        assert_eq!(config.rate_limit.client_ip_source, ClientIpSource::Socket);
-        assert_eq!(config.rate_limit.namespace, "luxor:ratelimit");
-        assert_eq!(
-            config.rate_limit.auth,
-            RateLimitQuota {
-                max_requests: 10,
-                window_seconds: 60
-            }
-        );
-        assert_eq!(
-            config.rate_limit.api,
-            RateLimitQuota {
-                max_requests: 120,
-                window_seconds: 60
-            }
-        );
-    }
-
-    fn production_base() -> HashMap<String, String> {
-        HashMap::from([
-            ("APP_ENV".into(), "production".into()),
-            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
-            ("REDIS_URL".into(), TEST_REDIS_URL.into()),
-            (
-                "JWT_SECRET".into(),
-                "production-test-secret-at-least-32-characters".into(),
-            ),
-            // Production rejects plaintext origins, so a valid production
-            // fixture has to carry an https one.
-            ("CORS_ORIGINS".into(), "https://app.example.com".into()),
-        ])
     }
 
     #[test]
-    fn rate_limiting_cannot_be_disabled_in_production() {
-        let mut values = production_base();
-        values.insert("RATE_LIMIT_ENABLED".into(), "false".into());
-        assert!(matches!(
-            Config::from_map(values),
-            Err(ConfigError::Validation(message)) if message.contains("RATE_LIMIT_ENABLED")
-        ));
-
-        let development = Config::from_map(HashMap::from([(
-            "RATE_LIMIT_ENABLED".into(),
-            "false".into(),
-        )]))
-        .unwrap();
-        assert!(!development.rate_limit.enabled);
-    }
-
-    #[test]
-    fn client_ip_source_follows_the_deployment_shape() {
-        let production = Config::from_map(production_base()).unwrap();
+    fn the_app_name_defaults_to_the_package_and_names_derived_settings() {
+        let default = Config::from_map(HashMap::new()).unwrap();
+        assert_eq!(default.app_name, env!("CARGO_PKG_NAME"));
         assert_eq!(
-            production.rate_limit.client_ip_source,
-            ClientIpSource::XForwardedFor
+            default.cache.namespace,
+            format!("{}:cache", env!("CARGO_PKG_NAME"))
         );
 
-        let mut direct_production = production_base();
-        direct_production.insert("CLIENT_IP_SOURCE".into(), "socket".into());
-        assert_eq!(
-            Config::from_map(direct_production)
-                .unwrap()
-                .rate_limit
-                .client_ip_source,
-            ClientIpSource::Socket
-        );
-
-        let invalid = HashMap::from([("CLIENT_IP_SOURCE".into(), "guess".into())]);
-        assert!(matches!(
-            Config::from_map(invalid),
-            Err(ConfigError::Invalid("CLIENT_IP_SOURCE", _))
-        ));
+        let named = Config::from_map(values(&[("APP_NAME", "orders-api")])).unwrap();
+        assert_eq!(named.app_name, "orders-api");
+        assert_eq!(named.auth.jwt_issuer, "orders-api");
+        assert_eq!(named.auth.refresh_cookie_name, "orders-api_refresh");
+        assert_eq!(named.cache.namespace, "orders-api:cache");
+        assert_eq!(named.queue.key, "orders-api:queue:jobs");
+        assert_eq!(named.rate_limit.namespace, "orders-api:ratelimit");
     }
 
     #[test]
-    fn rate_limit_quotas_are_validated() {
-        let zero_budget = HashMap::from([("RATE_LIMIT_AUTH_MAX_REQUESTS".into(), "0".into())]);
-        assert!(matches!(
-            Config::from_map(zero_budget),
-            Err(ConfigError::Validation(message))
-                if message.contains("RATE_LIMIT_AUTH_MAX_REQUESTS")
-        ));
-
-        let oversized_window =
-            HashMap::from([("RATE_LIMIT_API_WINDOW_SECONDS".into(), "86401".into())]);
-        assert!(matches!(
-            Config::from_map(oversized_window),
-            Err(ConfigError::Validation(message))
-                if message.contains("RATE_LIMIT_API_WINDOW_SECONDS")
-        ));
-    }
-
-    #[test]
-    fn realtime_limits_are_validated() {
-        let defaults = Config::from_map(HashMap::new()).unwrap().realtime;
-        assert_eq!(defaults.max_connections, 100);
-        assert_eq!(defaults.ticket_ttl_seconds, 30);
-
-        let configured = Config::from_map(HashMap::from([
-            ("REALTIME_MAX_CONNECTIONS".into(), "2500".into()),
-            ("REALTIME_TICKET_TTL_SECONDS".into(), "10".into()),
-        ]))
-        .unwrap()
-        .realtime;
-        assert_eq!(configured.max_connections, 2_500);
-        assert_eq!(configured.ticket_ttl_seconds, 10);
-
-        // Zero connections would advertise an endpoint that always answers 503.
-        let no_connections = HashMap::from([("REALTIME_MAX_CONNECTIONS".into(), "0".into())]);
-        assert!(matches!(
-            Config::from_map(no_connections),
-            Err(ConfigError::Validation(message))
-                if message.contains("REALTIME_MAX_CONNECTIONS")
-        ));
-
-        // A connection ticket travels in a URL, so a long-lived one is a
-        // configuration mistake rather than a preference.
-        let long_lived_ticket =
-            HashMap::from([("REALTIME_TICKET_TTL_SECONDS".into(), "3600".into())]);
-        assert!(matches!(
-            Config::from_map(long_lived_ticket),
-            Err(ConfigError::Validation(message))
-                if message.contains("REALTIME_TICKET_TTL_SECONDS")
-        ));
-    }
-
-    #[test]
-    fn kafka_is_off_until_brokers_are_named() {
-        assert!(Config::from_map(HashMap::new()).unwrap().kafka.is_none());
-
-        // Settings that would silently never be used are reported rather than
-        // discarded: this is the deployment that believes it configured Kafka.
-        let orphaned = HashMap::from([("KAFKA_TOPIC".into(), "orders.events".into())]);
-        assert!(matches!(
-            Config::from_map(orphaned),
-            Err(ConfigError::Validation(message)) if message.contains("KAFKA_BROKERS")
-        ));
-    }
-
-    #[test]
-    fn kafka_defaults_apply_once_brokers_are_named() {
-        let kafka = Config::from_map(HashMap::from([(
-            "KAFKA_BROKERS".into(),
-            " localhost:9092 , [::1]:9093 ".into(),
-        )]))
-        .unwrap()
-        .kafka
-        .expect("naming brokers enables Kafka");
-
-        // The normalized list is what librdkafka receives, whitespace included
-        // in neither entry.
-        assert_eq!(kafka.brokers, "localhost:9092,[::1]:9093");
-        assert_eq!(kafka.topic, "luxor.events");
-        assert_eq!(kafka.consumer_group, "luxor-console");
-        assert_eq!(kafka.client_id, "luxor");
-        assert_eq!(kafka.security_protocol, KafkaSecurityProtocol::Plaintext);
-        assert!(kafka.sasl.is_none());
-        assert_eq!(kafka.delivery_timeout_seconds, 10);
-    }
-
-    #[test]
-    fn kafka_broker_addresses_and_topics_are_validated() {
-        for brokers in ["localhost", "localhost:0", "localhost:not-a-port", ":9092"] {
-            let values = HashMap::from([("KAFKA_BROKERS".into(), brokers.to_string())]);
+    fn the_app_name_is_held_to_identifier_characters() {
+        for invalid in ["orders api", "orders/api", "orders:api", &"a".repeat(65)] {
             assert!(
                 matches!(
-                    Config::from_map(values),
-                    Err(ConfigError::Invalid("KAFKA_BROKERS", _))
+                    Config::from_map(values(&[("APP_NAME", invalid)])),
+                    Err(ConfigError::Invalid("APP_NAME", _))
                 ),
-                "{brokers:?} should be refused"
+                "{invalid:?} should be refused"
             );
         }
-
-        for topic in ["", "..", "orders events", "orders/events", &"a".repeat(250)] {
-            let values = HashMap::from([
-                ("KAFKA_BROKERS".into(), "localhost:9092".into()),
-                ("KAFKA_TOPIC".into(), topic.to_string()),
-            ]);
-            // An empty value reads as unset, which leaves the default in place.
-            let outcome = Config::from_map(values);
-            if topic.is_empty() {
-                assert_eq!(outcome.unwrap().kafka.unwrap().topic, "luxor.events");
-            } else {
-                assert!(
-                    matches!(outcome, Err(ConfigError::Invalid("KAFKA_TOPIC", _))),
-                    "{topic:?} should be refused"
-                );
-            }
-        }
+        assert!(Config::from_map(values(&[("APP_NAME", "Orders_API-2")])).is_ok());
     }
 
     #[test]
-    fn kafka_sasl_credentials_and_protocol_must_agree() {
-        let mut values = HashMap::from([
-            ("KAFKA_BROKERS".into(), "broker.example.com:9093".into()),
-            ("KAFKA_SECURITY_PROTOCOL".into(), "sasl_ssl".into()),
-        ]);
-        // A SASL protocol without credentials authenticates with nothing.
+    fn the_environment_is_validated() {
         assert!(matches!(
-            Config::from_map(values.clone()),
-            Err(ConfigError::Validation(message)) if message.contains("KAFKA_SASL_MECHANISM")
+            Config::from_map(values(&[("APP_ENV", "staging")])),
+            Err(ConfigError::Invalid("APP_ENV", _))
         ));
-
-        values.insert("KAFKA_SASL_MECHANISM".into(), "scram-sha-512".into());
-        values.insert("KAFKA_SASL_USERNAME".into(), "luxor".into());
-        values.insert("KAFKA_SASL_PASSWORD".into(), "streaming-secret".into());
-        let sasl = Config::from_map(values.clone())
-            .unwrap()
-            .kafka
-            .unwrap()
-            .sasl
-            .expect("a SASL protocol carries credentials");
-        assert_eq!(sasl.mechanism.as_str(), "SCRAM-SHA-512");
-        assert_eq!(sasl.username, "luxor");
-
-        // The mirror image: credentials that would never leave the process,
-        // because the protocol does not authenticate at all.
-        values.insert("KAFKA_SECURITY_PROTOCOL".into(), "ssl".into());
-        assert!(matches!(
-            Config::from_map(values.clone()),
-            Err(ConfigError::Validation(message)) if message.contains("SASL")
-        ));
-
-        // Kerberos needs a library this build does not link, so it is refused
-        // with the reason rather than passed to librdkafka to fail on.
-        values.insert("KAFKA_SECURITY_PROTOCOL".into(), "sasl_ssl".into());
-        values.insert("KAFKA_SASL_MECHANISM".into(), "GSSAPI".into());
-        assert!(matches!(
-            Config::from_map(values),
-            Err(ConfigError::Invalid("KAFKA_SASL_MECHANISM", message))
-                if message.contains("Cyrus SASL")
-        ));
-    }
-
-    /// A publish happens inside a request, so its deadline has to stay well
-    /// inside the request timeout rather than outlive it.
-    #[test]
-    fn kafka_delivery_timeout_is_bounded() {
-        let values = HashMap::from([
-            ("KAFKA_BROKERS".into(), "localhost:9092".into()),
-            ("KAFKA_DELIVERY_TIMEOUT_SECONDS".into(), "600".into()),
-        ]);
-        assert!(matches!(
-            Config::from_map(values),
-            Err(ConfigError::Validation(message))
-                if message.contains("KAFKA_DELIVERY_TIMEOUT_SECONDS")
-        ));
-    }
-
-    #[test]
-    fn refresh_family_lifetime_covers_the_token_lifetime() {
-        let too_short = HashMap::from([("REFRESH_FAMILY_TTL_SECONDS".into(), "3600".into())]);
-        assert!(matches!(
-            Config::from_map(too_short),
-            Err(ConfigError::Validation(message)) if message.contains("family")
-        ));
-
-        let equal = HashMap::from([
-            ("REFRESH_TOKEN_TTL_SECONDS".into(), "86400".into()),
-            ("REFRESH_FAMILY_TTL_SECONDS".into(), "86400".into()),
-        ]);
         assert_eq!(
-            Config::from_map(equal).unwrap().refresh_family_ttl_seconds,
-            86_400
+            Config::from_map(values(&[("APP_ENV", "test")]))
+                .unwrap()
+                .environment,
+            Environment::Test
         );
     }
 
     #[test]
-    fn request_timeout_must_be_positive() {
-        let values = HashMap::from([("REQUEST_TIMEOUT_SECONDS".into(), "0".into())]);
-        assert!(matches!(
-            Config::from_map(values),
-            Err(ConfigError::Validation(message)) if message.contains("REQUEST_TIMEOUT_SECONDS")
-        ));
-    }
-
-    #[test]
-    fn accepts_standard_opentelemetry_service_name() {
-        let values = HashMap::from([("OTEL_SERVICE_NAME".into(), "checkout-api".into())]);
-        let config = Config::from_map(values).unwrap();
-        assert_eq!(config.otel_service_name, "checkout-api");
-    }
-
-    #[test]
-    fn explicit_infrastructure_urls_are_kept() {
-        let values = HashMap::from([
-            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
-            ("REDIS_URL".into(), TEST_REDIS_URL.into()),
-        ]);
-        let config = Config::from_map(values).unwrap();
-        assert!(config.database_url.is_some());
-        assert!(config.redis_url.is_some());
-
-        let invalid = HashMap::from([("DATABASE_URL".into(), "mysql://nope".into())]);
-        assert!(matches!(
-            Config::from_map(invalid),
-            Err(ConfigError::Invalid("DATABASE_URL", _))
-        ));
-    }
-
-    #[test]
-    fn browser_launch_is_development_only() {
-        let development =
-            Config::from_map(HashMap::from([("APP_OPEN_BROWSER".into(), "true".into())])).unwrap();
-        assert!(development.open_browser);
-
-        let mut production = production_base();
-        production.insert("APP_OPEN_BROWSER".into(), "true".into());
-        assert!(matches!(
-            Config::from_map(production),
-            Err(ConfigError::Validation(message)) if message.contains("APP_OPEN_BROWSER")
-        ));
-    }
-
-    #[test]
-    fn injected_platform_port_wins_over_app_port() {
-        let values = HashMap::from([
-            ("APP_PORT".into(), "3000".into()),
-            ("PORT".into(), "8080".into()),
-        ]);
-        let config = Config::from_map(values).unwrap();
-        assert_eq!(config.app_port, 8080);
-        assert_eq!(config.bind_address().port(), 8080);
-    }
-
-    #[test]
-    fn production_binds_all_interfaces_by_default() {
-        let config = Config::from_map(production_base()).unwrap();
-        assert_eq!(config.app_host, "0.0.0.0");
-
-        let development = Config::from_map(HashMap::new()).unwrap();
-        assert_eq!(development.app_host, "127.0.0.1");
-    }
-
-    #[test]
-    fn production_requires_secrets() {
-        let values = HashMap::from([("APP_ENV".into(), "production".into())]);
+    fn production_requires_infrastructure_and_secrets() {
         assert_eq!(
-            Config::from_map(values).unwrap_err(),
+            Config::from_map(values(&[("APP_ENV", "production")])).unwrap_err(),
             ConfigError::Missing("DATABASE_URL")
         );
 
-        let values = HashMap::from([
-            ("APP_ENV".into(), "production".into()),
-            ("DATABASE_URL".into(), TEST_DATABASE_URL.into()),
+        let with_database = values(&[
+            ("APP_ENV", "production"),
+            ("DATABASE_URL", TEST_DATABASE_URL),
         ]);
-        assert_eq!(
-            Config::from_map(values).unwrap_err(),
+        // Redis is required exactly when the build can use it.
+        let expected = if cfg!(feature = "redis") {
             ConfigError::Missing("REDIS_URL")
-        );
+        } else {
+            ConfigError::Missing("JWT_SECRET")
+        };
+        assert_eq!(Config::from_map(with_database).unwrap_err(), expected);
     }
 
+    #[cfg(feature = "redis")]
     #[test]
-    fn partial_oauth_configuration_is_rejected() {
-        let values = HashMap::from([(
-            "OAUTH_CLIENT_ID".into(),
-            "configured-without-other-fields".into(),
-        )]);
-        assert!(matches!(
-            Config::from_map(values),
-            Err(ConfigError::Validation(message)) if message.contains("all-or-nothing")
-        ));
-    }
+    fn explicit_redis_urls_are_kept_and_validated() {
+        let config = Config::from_map(values(&[("REDIS_URL", "redis://127.0.0.1:6379/")])).unwrap();
+        assert!(config.redis_url.is_some());
 
-    #[test]
-    fn invalid_listener_and_cors_values_are_rejected() {
-        let bad_host = HashMap::from([("APP_HOST".into(), "localhost".into())]);
         assert!(matches!(
-            Config::from_map(bad_host),
-            Err(ConfigError::Invalid("APP_HOST", _))
-        ));
-
-        let bad_origin =
-            HashMap::from([("CORS_ORIGINS".into(), "https://example.com/a-path".into())]);
-        assert!(matches!(
-            Config::from_map(bad_origin),
-            Err(ConfigError::Invalid("CORS_ORIGINS", _))
+            Config::from_map(values(&[("REDIS_URL", "http://127.0.0.1:6379/")])),
+            Err(ConfigError::Invalid("REDIS_URL", _))
         ));
     }
 
+    /// Each setting of an excluded feature is refused with the feature's name;
+    /// in a build that includes the feature, the same setting is accepted.
     #[test]
-    fn public_base_url_is_explicit_or_derived() {
-        // Development derives the listener address; production derives the
-        // deployment's public URL, already configured as the CORS origin.
-        let development = Config::from_map(HashMap::new()).unwrap();
-        assert_eq!(development.public_base_url(), "http://127.0.0.1:8080");
-
-        let production = Config::from_map(production_base()).unwrap();
-        assert_eq!(production.public_base_url(), "https://app.example.com");
-
-        let explicit = Config::from_map(HashMap::from([(
-            "PUBLIC_BASE_URL".into(),
-            "https://console.example.com/".into(),
-        )]))
-        .unwrap();
-        assert_eq!(explicit.public_base_url(), "https://console.example.com");
-
-        // The localized routes live at the site root, so a path prefix would
-        // produce canonical URLs the router never serves.
-        let with_path = HashMap::from([(
-            "PUBLIC_BASE_URL".into(),
-            "https://example.com/console".into(),
-        )]);
-        assert!(matches!(
-            Config::from_map(with_path),
-            Err(ConfigError::Invalid("PUBLIC_BASE_URL", _))
-        ));
-
-        // Canonical URLs advertise where credentials will be sent; plaintext
-        // in production is the same mistake as a plaintext CORS origin.
-        let mut plaintext = production_base();
-        plaintext.insert("PUBLIC_BASE_URL".into(), "http://app.example.com".into());
-        assert!(matches!(
-            Config::from_map(plaintext),
-            Err(ConfigError::Invalid("PUBLIC_BASE_URL", _))
-        ));
+    fn settings_of_excluded_features_are_refused() {
+        for (feature, included, keys) in FEATURE_SETTINGS {
+            for key in keys {
+                let outcome = Config::from_map(values(&[(key, "configured")]));
+                if included {
+                    assert!(
+                        !matches!(
+                            &outcome,
+                            Err(ConfigError::Validation(message)) if message.contains("this build excludes")
+                        ),
+                        "{key} is refused although `{feature}` is included"
+                    );
+                } else {
+                    assert_eq!(
+                        outcome.unwrap_err(),
+                        ConfigError::Validation(format!(
+                            "{key} is set, but this build excludes the `{feature}` feature"
+                        ))
+                    );
+                }
+            }
+        }
     }
 
     #[test]
-    fn hsts_defaults_follow_the_environment() {
-        let development = Config::from_map(HashMap::new()).unwrap();
-        assert!(!development.hsts.enabled);
-        assert_eq!(development.https_enforcement, HttpsEnforcement::Off);
-
-        let production = Config::from_map(production_base()).unwrap();
-        assert!(production.hsts.enabled);
-        assert!(production.hsts.include_subdomains);
-        assert!(!production.hsts.preload);
-        assert_eq!(
-            production.hsts.header_value(),
-            "max-age=31536000; includeSubDomains"
-        );
-        assert_eq!(production.https_enforcement, HttpsEnforcement::ProxyHeader);
-    }
-
-    #[test]
-    fn hsts_preload_requires_the_preload_list_rules() {
-        let mut without_subdomains = production_base();
-        without_subdomains.insert("HSTS_PRELOAD".into(), "true".into());
-        without_subdomains.insert("HSTS_INCLUDE_SUBDOMAINS".into(), "false".into());
-        assert!(matches!(
-            Config::from_map(without_subdomains),
-            Err(ConfigError::Validation(message)) if message.contains("HSTS_PRELOAD")
-        ));
-
-        let mut short_max_age = production_base();
-        short_max_age.insert("HSTS_PRELOAD".into(), "true".into());
-        short_max_age.insert("HSTS_MAX_AGE_SECONDS".into(), "3600".into());
-        assert!(matches!(
-            Config::from_map(short_max_age),
-            Err(ConfigError::Validation(message)) if message.contains("HSTS_PRELOAD")
-        ));
-
-        let mut disabled = production_base();
-        disabled.insert("HSTS_PRELOAD".into(), "true".into());
-        disabled.insert("HSTS_ENABLED".into(), "false".into());
-        assert!(matches!(
-            Config::from_map(disabled),
-            Err(ConfigError::Validation(message)) if message.contains("HSTS_ENABLED")
-        ));
-
-        let mut valid = production_base();
-        valid.insert("HSTS_PRELOAD".into(), "true".into());
-        valid.insert("HSTS_MAX_AGE_SECONDS".into(), "63072000".into());
-        let config = Config::from_map(valid).unwrap();
-        assert_eq!(
-            config.hsts.header_value(),
-            "max-age=63072000; includeSubDomains; preload"
-        );
-    }
-
-    // max-age=0 is the only way to release browsers that already cached a
-    // policy, so it must stay expressible.
-    #[test]
-    fn hsts_max_age_can_be_zeroed_to_release_browsers() {
-        let mut values = production_base();
-        values.insert("HSTS_MAX_AGE_SECONDS".into(), "0".into());
-        let config = Config::from_map(values).unwrap();
-        assert_eq!(config.hsts.header_value(), "max-age=0; includeSubDomains");
-    }
-
-    #[test]
-    fn production_rejects_plaintext_cors_origins() {
-        let mut values = production_base();
-        values.insert("CORS_ORIGINS".into(), "http://app.example.com".into());
-        assert!(matches!(
-            Config::from_map(values),
-            Err(ConfigError::Invalid("CORS_ORIGINS", message)) if message.contains("https")
-        ));
-
-        // Mixed lists are rejected on the offending entry, not silently
-        // accepted because a valid origin appears first.
-        let mut mixed = production_base();
-        mixed.insert(
-            "CORS_ORIGINS".into(),
-            "https://app.example.com,http://staging.example.com".into(),
-        );
-        assert!(matches!(
-            Config::from_map(mixed),
-            Err(ConfigError::Invalid("CORS_ORIGINS", _))
-        ));
-
-        // Outside production a plaintext origin is how local development runs.
-        let development = Config::from_map(HashMap::from([(
-            "CORS_ORIGINS".into(),
-            "http://localhost:5173".into(),
-        )]))
-        .unwrap();
-        assert_eq!(development.cors_origins, vec!["http://localhost:5173"]);
-    }
-
-    #[test]
-    fn https_enforcement_rejects_unknown_modes() {
-        let mut values = production_base();
-        values.insert("HTTPS_ENFORCEMENT".into(), "maybe".into());
-        assert!(matches!(
-            Config::from_map(values),
-            Err(ConfigError::Invalid("HTTPS_ENFORCEMENT", _))
-        ));
-
-        let mut off = production_base();
-        off.insert("HTTPS_ENFORCEMENT".into(), "off".into());
-        assert_eq!(
-            Config::from_map(off).unwrap().https_enforcement,
-            HttpsEnforcement::Off
-        );
-    }
-
-    #[test]
-    fn production_security_controls_cannot_be_disabled() {
-        let base = production_base();
-
-        let mut insecure_cookie = base.clone();
-        insecure_cookie.insert("REFRESH_COOKIE_SECURE".into(), "false".into());
-        assert!(matches!(
-            Config::from_map(insecure_cookie),
-            Err(ConfigError::Validation(message)) if message.contains("REFRESH_COOKIE_SECURE")
-        ));
-
-        let mut automatic_migrations = base;
-        automatic_migrations.insert("AUTO_MIGRATE".into(), "true".into());
-        assert!(matches!(
-            Config::from_map(automatic_migrations),
-            Err(ConfigError::Validation(message)) if message.contains("AUTO_MIGRATE")
-        ));
+    fn empty_values_read_as_unset() {
+        let env = Env::new(values(&[("APP_NAME", ""), ("APP_PORT", "")])).unwrap();
+        assert_eq!(env.app_name(), DEFAULT_APP_NAME);
+        assert_eq!(env.get("APP_PORT"), None);
+        assert_eq!(env.parse("APP_PORT", 8080_u16).unwrap(), 8080);
     }
 }

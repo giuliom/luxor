@@ -1,10 +1,11 @@
 //! Embedded development PostgreSQL server.
 //!
-//! When `DATABASE_URL` is not set outside production, Luxor runs a real,
-//! app-managed PostgreSQL server so that authentication and persistence work
-//! without Docker or any locally installed database. Binaries are downloaded
-//! once into `~/.theseus/postgresql` and the cluster data lives in `.luxor/`
-//! inside the working directory, so accounts and sessions survive restarts.
+//! When `DATABASE_URL` is not set outside production, the application runs a
+//! real, app-managed PostgreSQL server so that authentication and persistence
+//! work without Docker or any locally installed database. Binaries are
+//! downloaded once into `~/.theseus/postgresql` and the cluster data lives in
+//! `.<package name>/` inside the working directory, so accounts and sessions
+//! survive restarts.
 //!
 //! Production images are built without the `embedded-postgres` feature; their
 //! configuration requires an explicit `DATABASE_URL`, so this fallback can
@@ -23,13 +24,16 @@ mod imp {
         time::Duration,
     };
 
-    const DATABASE_NAME: &str = "luxor";
-    const DATA_ROOT: &str = ".luxor/postgres";
+    // Named after the crate (underscored, so the name needs no quoting in
+    // SQL), and kept under a directory named after the package, which
+    // .gitignore excludes.
+    const DATABASE_NAME: &str = env!("CARGO_CRATE_NAME");
+    const DATA_ROOT: &str = concat!(".", env!("CARGO_PKG_NAME"), "/postgres");
     // The credentials guard a loopback-only development database; they must
     // be fixed so restarts and attached instances can reuse the initialized
     // cluster.
     const USERNAME: &str = "postgres";
-    const PASSWORD: &str = "luxor";
+    const PASSWORD: &str = env!("CARGO_CRATE_NAME");
 
     pub struct DevPostgres {
         mode: Mode,
@@ -38,8 +42,8 @@ mod imp {
     enum Mode {
         /// This instance started the server and stops it on shutdown.
         Owned(Box<PostgreSQL>),
-        /// Another Luxor instance owns the server; reuse it and leave its
-        /// lifecycle alone.
+        /// Another instance of this application owns the server; reuse it
+        /// and leave its lifecycle alone.
         Attached { port: u16 },
     }
 
@@ -57,7 +61,7 @@ mod imp {
             if let Some(port) = live_server_port(&data_dir) {
                 tracing::info!(
                     port,
-                    "reusing the embedded PostgreSQL server another Luxor instance is running"
+                    "reusing the embedded PostgreSQL server another instance is running"
                 );
                 return Ok(Self {
                     mode: Mode::Attached { port },

@@ -1,8 +1,8 @@
+//! The foundation's endpoints. [`crate::routes`] groups them into routers an
+//! application mounts.
+
 pub mod auth;
-pub mod basic;
-pub mod cache;
-pub mod demo;
-pub mod events;
-pub mod jobs;
+pub mod health;
 pub mod permissions;
+#[cfg(feature = "realtime")]
 pub mod realtime;

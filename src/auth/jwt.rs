@@ -1,6 +1,6 @@
-use crate::{config::Config, error::AppError, models::Role, state::AppState};
+use crate::{access::Role, config::Config, error::AppError, state::AppState};
 use axum::{
-    extract::FromRequestParts,
+    extract::{FromRef, FromRequestParts},
     http::{header, request::Parts},
 };
 use chrono::Utc;
@@ -13,6 +13,7 @@ use uuid::Uuid;
 pub struct JwtService {
     secret: SecretString,
     lifetime_seconds: i64,
+    issuer: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -26,16 +27,18 @@ pub struct Claims {
 
 impl JwtService {
     pub fn from_config(config: &Config) -> Self {
-        Self {
-            secret: config.jwt_secret.clone(),
-            lifetime_seconds: config.access_token_ttl_seconds,
-        }
+        Self::new(
+            config.auth.jwt_secret.clone(),
+            config.auth.access_token_ttl_seconds,
+            config.auth.jwt_issuer.clone(),
+        )
     }
 
-    pub fn new(secret: SecretString, lifetime_seconds: i64) -> Self {
+    pub fn new(secret: SecretString, lifetime_seconds: i64, issuer: String) -> Self {
         Self {
             secret,
             lifetime_seconds,
+            issuer,
         }
     }
 
@@ -46,7 +49,7 @@ impl JwtService {
             role,
             iat: now,
             exp: now + self.lifetime_seconds,
-            iss: "luxor".into(),
+            iss: self.issuer.clone(),
         };
         encode(
             &Header::new(Algorithm::HS256),
@@ -58,7 +61,7 @@ impl JwtService {
 
     pub fn verify(&self, token: &str) -> Result<Claims, AppError> {
         let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_issuer(&["luxor"]);
+        validation.set_issuer(&[&self.issuer]);
         validation.leeway = 0;
         decode::<Claims>(
             token,
@@ -76,13 +79,16 @@ pub struct AuthUser {
     pub role: Role,
 }
 
-impl FromRequestParts<AppState> for AuthUser {
+/// Authenticates a request by its bearer access token. Works with any router
+/// state that exposes the foundation's [`AppState`].
+impl<S> FromRequestParts<S> for AuthUser
+where
+    S: Send + Sync,
+    AppState: FromRef<S>,
+{
     type Rejection = AppError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let value = parts
             .headers
             .get(header::AUTHORIZATION)
@@ -95,7 +101,7 @@ impl FromRequestParts<AppState> for AuthUser {
             .map(|(_, token)| token.trim())
             .filter(|token| !token.is_empty())
             .ok_or(AppError::Unauthorized)?;
-        let claims = state.jwt.verify(token)?;
+        let claims = AppState::from_ref(state).jwt.verify(token)?;
         Ok(Self {
             id: claims.sub,
             role: claims.role,
@@ -108,10 +114,13 @@ mod tests {
     use super::*;
     use std::{thread, time::Duration};
 
+    const ISSUER: &str = "test-issuer";
+
     fn service(lifetime_seconds: i64) -> JwtService {
         JwtService::new(
             SecretString::from("a-test-secret-with-at-least-32-characters".to_owned()),
             lifetime_seconds,
+            ISSUER.to_owned(),
         )
     }
 
@@ -151,7 +160,7 @@ mod tests {
             sub: Uuid::new_v4(),
             iat: now,
             exp: now + 60,
-            iss: "luxor".into(),
+            iss: ISSUER.into(),
         };
         let token = encode(
             &Header::new(Algorithm::HS256),
@@ -159,6 +168,22 @@ mod tests {
             &EncodingKey::from_secret(b"a-test-secret-with-at-least-32-characters"),
         )
         .unwrap();
+        assert!(matches!(
+            service(60).verify(&token),
+            Err(AppError::Unauthorized)
+        ));
+    }
+
+    /// Two applications sharing a signing secret must still not accept each
+    /// other's tokens.
+    #[test]
+    fn rejects_tokens_issued_by_another_application() {
+        let other = JwtService::new(
+            SecretString::from("a-test-secret-with-at-least-32-characters".to_owned()),
+            60,
+            "another-application".to_owned(),
+        );
+        let token = other.issue(Uuid::new_v4(), Role::User).unwrap();
         assert!(matches!(
             service(60).verify(&token),
             Err(AppError::Unauthorized)

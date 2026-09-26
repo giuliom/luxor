@@ -24,9 +24,10 @@
 //! lifecycle, not a distributed message broker.
 
 use crate::{
+    access::Role,
     cache::{self, Cache},
+    config::{ConfigError, Env},
     error::AppError,
-    models::Role,
 };
 use axum::{
     body::Bytes,
@@ -45,6 +46,45 @@ use std::{
 };
 use tokio::{sync::broadcast, time::Instant};
 use uuid::Uuid;
+
+/// Bounds on realtime connections. Connections are long-lived, so the count is
+/// a resource limit per instance rather than a rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RealtimeSettings {
+    /// Sockets this instance serves at once; further handshakes are refused
+    /// with `503` until one closes.
+    pub max_connections: usize,
+    /// Lifetime of the single-use ticket that authorizes one handshake. It
+    /// only has to cover the round trip from issuing the ticket to opening the
+    /// socket, so it is deliberately short.
+    pub ticket_ttl_seconds: u64,
+}
+
+/// The upper bound on the ticket lifetime is a security setting, not a
+/// preference: a connection ticket is a bearer credential that travels in a
+/// URL, so it must expire long before anything could replay it from a log.
+const MAX_TICKET_TTL_SECONDS: u64 = 300;
+
+impl RealtimeSettings {
+    pub fn from_env(env: &Env) -> Result<Self, ConfigError> {
+        let max_connections = env.parse("REALTIME_MAX_CONNECTIONS", 100_usize)?;
+        if max_connections == 0 {
+            return Err(ConfigError::Validation(
+                "REALTIME_MAX_CONNECTIONS must be greater than zero".into(),
+            ));
+        }
+        let ticket_ttl_seconds = env.parse("REALTIME_TICKET_TTL_SECONDS", 30_u64)?;
+        if !(1..=MAX_TICKET_TTL_SECONDS).contains(&ticket_ttl_seconds) {
+            return Err(ConfigError::Validation(format!(
+                "REALTIME_TICKET_TTL_SECONDS must be between 1 and {MAX_TICKET_TTL_SECONDS} seconds"
+            )));
+        }
+        Ok(Self {
+            max_connections,
+            ticket_ttl_seconds,
+        })
+    }
+}
 
 /// Largest WebSocket message the server will assemble. Well above any valid
 /// command, and small enough that a hostile client cannot make the server
@@ -639,6 +679,38 @@ fn origin_authority(origin: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::cache::MemoryCache;
+
+    fn settings(pairs: &[(&str, &str)]) -> Result<RealtimeSettings, ConfigError> {
+        RealtimeSettings::from_env(&Env::new(crate::testing::values(pairs))?)
+    }
+
+    #[test]
+    fn realtime_limits_are_validated() {
+        let defaults = settings(&[]).unwrap();
+        assert_eq!(defaults.max_connections, 100);
+        assert_eq!(defaults.ticket_ttl_seconds, 30);
+
+        let configured = settings(&[
+            ("REALTIME_MAX_CONNECTIONS", "2500"),
+            ("REALTIME_TICKET_TTL_SECONDS", "10"),
+        ])
+        .unwrap();
+        assert_eq!(configured.max_connections, 2_500);
+        assert_eq!(configured.ticket_ttl_seconds, 10);
+
+        // Zero connections would advertise an endpoint that always answers 503.
+        assert!(matches!(
+            settings(&[("REALTIME_MAX_CONNECTIONS", "0")]),
+            Err(ConfigError::Validation(message)) if message.contains("REALTIME_MAX_CONNECTIONS")
+        ));
+
+        // A connection ticket travels in a URL, so a long-lived one is a
+        // configuration mistake rather than a preference.
+        assert!(matches!(
+            settings(&[("REALTIME_TICKET_TTL_SECONDS", "3600")]),
+            Err(ConfigError::Validation(message)) if message.contains("REALTIME_TICKET_TTL_SECONDS")
+        ));
+    }
 
     fn participant() -> Participant {
         Participant {

@@ -3,7 +3,10 @@
 //! role-permission matrix changes.
 
 use crate::{
-    auth::AuthUser, error::AppError, models::Role, permissions::Permission, state::AppState,
+    access::{AccessPermission, Permission, Role},
+    auth::AuthUser,
+    error::AppError,
+    state::AppState,
 };
 use axum::{extract::State, Json};
 use chrono::{DateTime, Utc};

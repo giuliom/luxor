@@ -4,6 +4,8 @@
 
 Luxor is a runnable production-oriented Rust backend template built with Axum. It includes PostgreSQL persistence and migrations, Redis cache and queue boundaries, Kafka domain events with an in-process consumer, JWT access tokens with rotating refresh sessions, role-based permissions with a fixed grant matrix, per-client rate limiting, ticket-authenticated realtime WebSockets, provider-neutral OAuth extension points, structured errors and tracing, service-backed tests, and a small same-origin browser console — server-rendered at startup in English and Italian at language-prefixed URLs, and served cached and precompressed — with live, in-page trace and Rust-to-WebAssembly demos. Local development runs against a real, app-managed embedded PostgreSQL server, so no Docker is required.
 
+The foundation is kept apart from the application built on it. A new project renames the template with one script, writes its own code in [`src/app/`](src/app/), extends the server through a small set of hooks instead of editing the foundation, and chooses its backends with cargo features; the reference console and its demo endpoints are a feature of their own that a real project drops. See [Starting a new project](#starting-a-new-project).
+
 ## Quick start
 
 Prerequisites: a current stable Rust toolchain. No Docker is required.
@@ -12,7 +14,7 @@ Prerequisites: a current stable Rust toolchain. No Docker is required.
 cargo run
 ```
 
-Open <http://localhost:8080>. When `DATABASE_URL` is not set outside production, Luxor starts an embedded development PostgreSQL server: the first run downloads the server binaries once into `~/.theseus/postgresql`, and cluster data persists in the gitignored `.luxor/` directory, so accounts and sessions survive restarts. When `REDIS_URL` is not set, the cache and queue use in-memory backends, and when `KAFKA_BROKERS` is not set, domain events run over an in-process bus. The embedded database always applies the checked-in migrations at startup; an external `DATABASE_URL` migrates when `AUTO_MIGRATE=true`. Production requires both URLs, and should set `AUTO_MIGRATE=false` and run `luxor migrate` (or `cargo sqlx migrate run`) as a separate, controlled deployment step.
+Open <http://localhost:8080>. When `DATABASE_URL` is not set outside production, Luxor starts an embedded development PostgreSQL server: the first run downloads the server binaries once into `~/.theseus/postgresql`, and cluster data persists in the gitignored `.luxor/` directory, so accounts and sessions survive restarts. When `REDIS_URL` is not set, the cache and queue use in-memory backends, and when `KAFKA_BROKERS` is not set, domain events run over an in-process bus. The embedded database always applies the checked-in migrations at startup; an external `DATABASE_URL` migrates when `AUTO_MIGRATE=true`. Production requires `DATABASE_URL`, and `REDIS_URL` too in a build with the `redis` feature, and should set `AUTO_MIGRATE=false` and run `luxor migrate` (or `cargo sqlx migrate run`) as a separate, controlled deployment step.
 
 ### Running against Docker PostgreSQL, Redis, and Kafka
 
@@ -36,9 +38,87 @@ With the CodeLLDB extension installed, choose **Debug luxor** and press F5. This
 
 Choose **Debug luxor (Docker PostgreSQL + Redis + Kafka)** to run against real Redis, a real Kafka broker, and an external PostgreSQL. Its pre-launch task requires Docker Desktop, starts all three, and waits for their health checks before launching Luxor. Both configurations set `APP_OPEN_BROWSER=true`, so Luxor opens <http://127.0.0.1:8080/> in the system-default browser immediately after binding its listener. An external browser is intentional because Luxor's security headers prevent the frontend from being embedded in VS Code's Simple Browser.
 
+## Starting a new project
+
+```sh
+git clone https://github.com/giuliom/luxor.git orders-api
+cd orders-api
+scripts/new-project.sh orders-api --without kafka
+cargo test
+```
+
+[`scripts/new-project.sh`](scripts/new-project.sh) renames the template everywhere it is named: the package, crate, and binary; the database, users, and volumes in Compose and CI; the Dockerfile, `railway.json`, and VS Code configurations; the `.orders-api/` directory the embedded database keeps its data in; and the display name the console and this README use (`--title`, by default the name in title case). Everything the running application calls itself follows from `APP_NAME`, which defaults to the package name: the health check's service name, the JWT issuer, the refresh cookie, the Redis key namespaces, the Kafka topic, consumer group, and client id, and the OpenTelemetry service name. `--without` drops [cargo features](#cargo-features) from the default build; their code stays, compiled out, until you delete it.
+
+The script runs once, on a fresh copy, and refuses a copy it has already renamed. Review what it changed with `git diff`, rewrite this README for the new project, and delete the script. A clone keeps the template's history; start a new one with `rm -rf .git && git init` if you prefer. The template is renamed by a script rather than by placeholder syntax (as `cargo generate` would use) so that this repository stays an application that builds, runs, and passes CI as it is.
+
+## Where the code goes
+
+| Path | What it holds |
+| --- | --- |
+| [`src/app/`](src/app/) | **The application — yours to change.** [`mod.rs`](src/app/mod.rs) tells the server what to serve (state, routes, event handler, background tasks); [`access.rs`](src/app/access.rs) defines the roles and permissions, [`events.rs`](src/app/events.rs) the domain events, [`jobs.rs`](src/app/jobs.rs) the queued jobs, and [`settings.rs`](src/app/settings.rs) the application's own configuration. |
+| [`src/demo/`](src/demo/), `public/`, `locales/`, `wasm/` | The reference console and the demo endpoints it exercises (the `demo` feature). See [Removing the demo](#removing-the-demo). |
+| Everything else in `src/` | The foundation: configuration (`config.rs`, with each section next to its module), the server and its middleware (`server/`), the foundation's routes (`routes.rs`, `handlers/`), authentication and access control (`auth/`, `access.rs`), persistence (`db.rs`, with the migrations in `migrations/` at the root), the cache, queue, event stream, and rate limiter, realtime WebSockets, observability, startup and shutdown (`bootstrap.rs`, `tasks.rs`), and the test helpers (`testing.rs`). An application extends it through the hooks below rather than by editing it. |
+
+## Extending the application
+
+`main.rs` hands [`bootstrap::run`](src/bootstrap.rs) the application, [`app::App`](src/app/mod.rs), which implements the `Application` trait. Its hooks are the extension points:
+
+- **State.** `App::state` wraps the foundation's services, [`AppState`](src/state.rs), in the router state, [`app::State`](src/app/mod.rs). Add your own services as fields there with a `FromRef` impl each; a handler then extracts `State<AppState>` or `State<YourService>`. The foundation's routes and the `AuthUser` bearer-token extractor work with any state that exposes `AppState` through `FromRef`.
+- **Routes.** `App::routes` returns a [`server::Routes`](src/server/mod.rs): `.api(router)` mounts routes under `/api`, where they share the API-wide rate limit, the JSON 404 and 405 fallbacks, and `Cache-Control: no-store`; `.site(router)` mounts pages and files outside it; `.content_security_policy(...)` replaces the default policy. [`routes::api`](src/routes.rs) is the foundation's endpoints; mount its groups one by one (`routes::health`, `routes::auth`, `routes::permissions`, `routes::realtime`) to leave one out. `server::app` wraps the result in the middleware stack, which is also available on its own as `server::middleware`.
+
+  ```rust
+  fn routes(&self, state: &State) -> Routes<State> {
+      Routes::new()
+          .api(routes::api(&state.core))
+          .api(Router::new().route("/orders", post(orders::create)))
+  }
+  ```
+
+- **Roles and permissions.** [`app/access.rs`](src/app/access.rs) defines `Role` and `Permission` and which role holds which, through the `AccessRole` and `AccessPermission` traits. Handlers enforce them with `state.permissions.require(user.role, Permission::…)?`. Roles are stored by name, so renaming or removing one needs a migration for the accounts that hold it.
+- **Domain events.** [`app/events.rs`](src/app/events.rs) defines `DomainEvent`, which implements `events::Event` (its name on the stream and its partition key) and carries the foundation's own `UserRegistered` through a `From` impl. Publish with `state.events.publish(…)`, or `events::publish_or_log` when losing the announcement must not fail the request. To read the stream, `App::event_handler` returns an `EventHandler`; the consumer commits each event after the handler returns, so delivery is at-least-once and a handler must tolerate a replay. Without a handler no consumer starts, and a Kafka deployment joins no consumer group.
+- **Persistence.** The application's tables are new migrations in `migrations/` (`cargo sqlx migrate add -r <name>`), applied with the foundation's own; its queries use the `PgPool` at `state.db`.
+- **Jobs.** [`app/jobs.rs`](src/app/jobs.rs) defines `Job`, which implements `queue::JobPayload`; enqueue with `state.queue.enqueue(Job::…)`. Validate everything a job carries before it is queued: the worker reads it back as trusted input.
+- **Background tasks.** `App::tasks` starts long-running work with `tasks.spawn("name", |mut shutdown| async move { … })`. Each task watches `shutdown.requested()`, and is awaited for up to five seconds once the server has stopped taking requests.
+- **Errors.** Return `AppError::domain(StatusCode::CONFLICT, "order_closed", "the order is already closed")` for an application-specific failure: the client receives that status, code, and message exactly as given. Anything whose details must stay private is `AppError::Internal`.
+- **Configuration.** [`app/settings.rs`](src/app/settings.rs) is the application's own configuration section, parsed with the rest through the same `Env` helpers and available as `state.config.app`. Each foundation section is parsed next to the module that uses it: `server::HttpSettings`, `auth::AuthSettings`, `db::DatabaseSettings`, `rate_limit::RateLimitSettings`, `realtime::RealtimeSettings`, `events::kafka::KafkaSettings`, `observability::TelemetrySettings`, `cache::CacheSettings`, and `queue::QueueSettings`.
+- **Tests.** [`luxor::testing::TestApp`](src/testing.rs) builds the same router the binary serves on the in-memory cache, queue, event bus, and rate limiter, with a database pool that is never touched unless a test provides a real one (`.database(pool)`). It is part of the `test-util` feature, which this package's own tests enable automatically.
+
+  ```rust
+  #[tokio::test]
+  async fn creates_an_order() {
+      let app = TestApp::new().env("RATE_LIMIT_API_MAX_REQUESTS", "1000");
+      let user = app.bearer(Role::User);
+      let response = send(&app.router(), "POST", "/api/orders", Some(&user), Some(r#"{"sku":"A-1"}"#)).await;
+      assert_eq!(response.status(), StatusCode::CREATED);
+  }
+  ```
+
+## Cargo features
+
+| Feature | What it adds | Without it |
+| --- | --- | --- |
+| `embedded-postgres` | The app-managed development PostgreSQL server used when `DATABASE_URL` is unset | `DATABASE_URL` is required everywhere |
+| `redis` | Redis-backed cache, queue, and rate limiter, shared across instances | In-memory backends everywhere, so counts and cached values are per instance: suitable for a single instance, and startup says so in production, where `REDIS_URL` is then not required |
+| `kafka` | Domain events on a Kafka topic (librdkafka and OpenSSL, compiled from vendored sources) | The in-process event bus; no C++ toolchain needed to build |
+| `otel` | OpenTelemetry trace propagation, OTLP export, and the in-process span store | Logs only |
+| `sentry` | Sentry error reporting | Errors are logged only |
+| `realtime` | The ticket-authenticated WebSocket endpoints | No realtime endpoints |
+| `demo` | The reference console and its demo endpoints; enables `otel` and `realtime` | Only the foundation's routes |
+| `test-util` | [`luxor::testing`](src/testing.rs) | — |
+
+`default` is `embedded-postgres` plus `app`, and `app` lists everything the deployed binary is built with — the Dockerfile builds `--no-default-features --features app` — so trimming the application is an edit to that one list. A setting that belongs to a feature the build excludes (`REDIS_URL` and the three Redis namespaces, `KAFKA_*`, `OTEL_*`, `SENTRY_DSN`, `REALTIME_*`) fails startup rather than being ignored. CI lints and tests the build with each feature on its own as well as with all of them.
+
+## Removing the demo
+
+1. Drop `demo` from the `app` feature list in `Cargo.toml`, or run the new-project script with `--without demo`. The build no longer includes the demo.
+2. Delete `src/demo/`, `public/`, and `wasm/`.
+3. Delete what `grep -rn 'feature = "demo"' src tests` finds: in `src/app/`, the `demo` state field and its `FromRef` impl, the demo routes, the event handler, the two example permissions, and the `Note` event; the module line in `src/lib.rs`; and the demo half of the PostgreSQL integration test.
+4. Delete the `demo` feature from `Cargo.toml`. Doing this last keeps every build in between compiling: `cfg(feature = "demo")` naming an undeclared feature is a warning, and CI denies warnings.
+5. `locales/` holds the dictionaries [`src/i18n.rs`](src/i18n.rs) loads for localized pages. Keep both and replace the dictionaries' contents if the project serves pages of its own; otherwise delete `locales/`, `src/i18n.rs`, and its module line in `src/lib.rs`.
+
 ## HTTP API
 
-All application endpoints are under `/api` and JSON errors use this shape:
+All endpoints are under `/api` and JSON errors use this shape:
 
 ```json
 {"error":{"code":"bad_request","message":"a valid email is required"}}
@@ -48,30 +128,37 @@ Every response carries `x-request-id`; an incoming value is preserved, otherwise
 
 Every `/api` route is rate limited per client IP inside a fixed window, and the `/api/auth` endpoints carry an additional, much stricter budget because they are the brute-force surface. Exceeding a budget answers `429` with a `rate_limited` error plus `Retry-After`, `RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` headers. Counters live in Redis when `REDIS_URL` is set (shared across instances) and in memory otherwise; see the `RATE_LIMIT_*` and `CLIENT_IP_SOURCE` settings.
 
+The foundation's endpoints:
+
 | Method | Route | Authentication | Purpose |
 | --- | --- | --- | --- |
-| `GET` | `/api/health` | No | Liveness response |
-| `GET` | `/api/runtime` | No | Report the active database, cache, and queue backends |
-| `GET` | `/api/hello?name=Ada` | No | Lightweight query demo |
-| `GET` | `/api/time` | No | UTC server clock |
-| `GET` | `/api/telemetry/demo` | No | Emit nested spans and return trace correlation IDs |
-| `GET` | `/api/telemetry/traces/{trace_id}` | No | Return the in-process captured spans for one trace |
+| `GET` | `/api/health` | No | Liveness response naming the service (`APP_NAME`) |
 | `POST` | `/api/auth/register` | No | Create a password user and session |
 | `POST` | `/api/auth/login` | No | Verify credentials and create a session |
 | `POST` | `/api/auth/refresh` | Refresh cookie | Rotate the refresh token and issue access JWT |
 | `POST` | `/api/auth/logout` | Refresh cookie optional | Revoke the presented session and clear the cookie |
 | `GET` | `/api/me` | Bearer JWT | Return the current user |
 | `GET` | `/api/permissions` | No | Read the role-permission matrix and permission catalog |
+| `POST` | `/api/realtime/ticket` | Bearer JWT | Mint a single-use ticket for one WebSocket handshake (`realtime` feature) |
+| `GET` | `/api/realtime/ws` | Ticket query parameter | Upgrade to the realtime event stream (`realtime` feature) |
+
+The demo's endpoints, which the console calls (`demo` feature):
+
+| Method | Route | Authentication | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/api/runtime` | No | Report the active database, cache, and queue backends |
+| `GET` | `/api/hello?name=Ada` | No | Lightweight query demo |
+| `GET` | `/api/time` | No | UTC server clock |
+| `GET` | `/api/telemetry/demo` | No | Emit nested spans and return trace correlation IDs |
+| `GET` | `/api/telemetry/traces/{trace_id}` | No | Return the in-process captured spans for one trace |
 | `GET` | `/api/demo/reports` | Bearer JWT + `reports.view` | Permission-gated sample report |
 | `DELETE` | `/api/demo/records` | Bearer JWT + `records.purge` | Permission-gated simulated purge |
 | `GET/PUT/DELETE` | `/api/cache/demo` | Bearer JWT | Read, cache, or invalidate a JSON value |
 | `POST` | `/api/jobs` | Bearer JWT | Enqueue an audit or email-contract job |
 | `POST` | `/api/events` | Bearer JWT | Publish a note to the event topic and return its partition and offset |
 | `GET` | `/api/events?limit=20` | Bearer JWT | Read the events this instance has consumed back off the topic |
-| `POST` | `/api/realtime/ticket` | Bearer JWT | Mint a single-use ticket for one WebSocket handshake |
-| `GET` | `/api/realtime/ws` | Ticket query parameter | Upgrade to the realtime event stream |
 
-Registration and login accept `{"email":"...","password":"..."}`; registration additionally accepts an optional `"role"` of `"admin"` or `"user"` (the default). They return a short-lived access token in JSON and set an opaque refresh token as an HTTP-only, `SameSite=Strict` cookie. Production cookies are `Secure`. The browser demo keeps the access token in a JavaScript variable only—never local or session storage—and sends the refresh cookie only to `/api/auth`.
+Registration and login accept `{"email":"...","password":"..."}`; registration additionally accepts an optional `"role"` of `"admin"` or `"user"` (the default). They return a short-lived access token in JSON and set an opaque refresh token as an HTTP-only, `SameSite=Strict` cookie named `<APP_NAME>_refresh`. Production cookies are `Secure`. The browser demo keeps the access token in a JavaScript variable only—never local or session storage—and sends the refresh cookie only to `/api/auth`.
 
 Passwords travel as plaintext inside the TLS-protected request body — hashing in the browser would only make the hash the password — and are held server-side in a `SecretString` that zeroizes on drop. Neither credential request type derives `Debug`, so there is no way to format a password into a log line, a span field, or a Sentry event. Registration requires 12 to 1024 characters *and* a zxcvbn score of at least 3, with the account's own email supplied as context: `mike@northwind.com` cannot choose `Northwind2026!`, which scores full marks on shape alone because "northwind" is in no dictionary. Only the first 128 bytes are scored, since zxcvbn's matchers are superlinear and the input is attacker-controlled. Login deliberately does not re-check strength, so tightening the policy never locks an existing account out.
 
@@ -81,22 +168,23 @@ Refresh tokens are SHA-256 hashed in PostgreSQL and rotate on every use. Reusing
 
 ## Roles and permissions
 
-Every account carries one of two fixed roles, chosen once at registration and stored in PostgreSQL: `admin` or `user`. The role is immutable afterwards — there is deliberately no endpoint that changes it. It travels as a claim in the access JWT, so permission checks never re-query the database (tokens issued before this feature carry no role claim and fail verification, which pushes clients through the refresh flow for a new token).
+The roles and permissions are the application's, defined in [`src/app/access.rs`](src/app/access.rs); the template ships two roles and the demo's two permissions. Every account carries one role, chosen once at registration and stored in PostgreSQL: `admin` or `user`. The role is immutable afterwards — there is deliberately no endpoint that changes it. It travels as a claim in the access JWT, so permission checks never re-query the database (tokens issued before this feature carry no role claim and fail verification, which pushes clients through the refresh flow for a new token).
 
-What a role may do is defined by a fixed role-permission matrix that is part of the application's authorization contract: `admin` holds both `reports.view` and `records.purge`, `user` holds only `reports.view`. The grants live in code, are identical across restarts and instances, and change only through a code change and deployment; there is no endpoint that edits them. The two `/api/demo` endpoints enforce the grants server-side and answer `403` with a `forbidden` error naming the missing permission.
+What a role may do is defined by a fixed role-permission matrix that is part of the application's authorization contract: `admin` holds both `reports.view` and `records.purge`, `user` holds only `reports.view` (without the `demo` feature both permissions, and so both grants, are gone). The grants live in code, are identical across restarts and instances, and change only through a code change and deployment; there is no endpoint that edits them. The two `/api/demo` endpoints enforce the grants server-side and answer `403` with a `forbidden` error naming the missing permission.
 
 `GET /api/permissions` serves a public, read-only view of the matrix together with the permission catalog. The browser console shows the same matrix — rendered into the page by the server from the grants the endpoints enforce, with each role and permission named in the page's language — and highlights the signed-in role, so you can register one account per role and watch the same request succeed or fail against the enforced grants.
 
 ## Configuration
 
-`.env.example` documents every setting. `.env` and environment-specific variants are ignored by Git.
+`.env.example` documents every setting; a commented one shows its default. `.env` and environment-specific variants are ignored by Git. The `REDIS_URL`, `CACHE_NAMESPACE`, `QUEUE_KEY`, `RATE_LIMIT_NAMESPACE`, `KAFKA_*`, `OTEL_*`, `SENTRY_DSN`, and `REALTIME_*` settings belong to [cargo features](#cargo-features), and a build without the feature refuses them at startup.
 
 | Variable | Required/default | Notes |
 | --- | --- | --- |
 | `APP_ENV` | `development` | `development`, `test`, or `production`; production switches logs to JSON |
+| `APP_NAME` | The package name | What the application calls itself: the health check's service name, the JWT issuer, the refresh cookie (`<APP_NAME>_refresh`), and the `<APP_NAME>` defaults below. Letters, digits, hyphens, and underscores |
 | `APP_HOST`, `APP_PORT` | `127.0.0.1`, `8080` | Listener address; production defaults to `0.0.0.0`, and a platform-injected `PORT` overrides `APP_PORT` |
 | `DATABASE_URL` | Embedded PostgreSQL outside production | PostgreSQL URL; required in production. Unset or empty selects the app-managed embedded development server |
-| `REDIS_URL` | In-memory backends outside production | `redis://` or `rediss://`; required in production. Unset or empty selects the in-memory cache and queue |
+| `REDIS_URL` | In-memory backends outside production | `redis://` or `rediss://`; required in production when the build includes the `redis` feature. Unset or empty selects the in-memory cache, queue, and rate limiter |
 | `JWT_SECRET` | Unsafe local default outside production | Required in production; unique and at least 32 characters |
 | `ACCESS_TOKEN_TTL_SECONDS` | `900` | JWT lifetime |
 | `REFRESH_TOKEN_TTL_SECONDS` | `2592000` | Must exceed the access lifetime |
@@ -114,12 +202,12 @@ What a role may do is defined by a fixed role-permission matrix that is part of 
 | `RATE_LIMIT_ENABLED` | `true` | Cannot be disabled in production |
 | `RATE_LIMIT_AUTH_MAX_REQUESTS`, `RATE_LIMIT_AUTH_WINDOW_SECONDS` | `10` per `60` | Per-IP budget for `/api/auth` endpoints |
 | `RATE_LIMIT_API_MAX_REQUESTS`, `RATE_LIMIT_API_WINDOW_SECONDS` | `120` per `60` | Per-IP budget for all `/api` routes |
-| `RATE_LIMIT_NAMESPACE` | `luxor:ratelimit` | Redis key prefix for the distributed limiter |
+| `RATE_LIMIT_NAMESPACE` | `<APP_NAME>:ratelimit` | Redis key prefix for the distributed limiter |
 | `CLIENT_IP_SOURCE` | `socket`; `x-forwarded-for` in production | How clients are identified for rate limiting; only use `x-forwarded-for` behind a trusted proxy |
 | `KAFKA_BROKERS` | In-process event bus | `host:port` list; unset or empty selects the in-process bus. Every other `KAFKA_*` setting requires it, and startup fails rather than ignoring one |
-| `KAFKA_TOPIC` | `luxor.events` | Topic domain events are published to and consumed from |
-| `KAFKA_CONSUMER_GROUP` | `luxor-console` | Instances sharing a group split the partitions; different groups each get every event |
-| `KAFKA_CLIENT_ID` | `luxor` | Identifies the application in broker logs and metrics |
+| `KAFKA_TOPIC` | `<APP_NAME>.events` | Topic domain events are published to and consumed from |
+| `KAFKA_CONSUMER_GROUP` | `<APP_NAME>` | Instances sharing a group split the partitions; different groups each get every event |
+| `KAFKA_CLIENT_ID` | `<APP_NAME>` | Identifies the application in broker logs and metrics |
 | `KAFKA_SECURITY_PROTOCOL` | `plaintext` | `plaintext`, `ssl`, `sasl_plaintext`, or `sasl_ssl` |
 | `KAFKA_SASL_MECHANISM`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD` | Empty | Required together by the SASL protocols and refused by the others; `PLAIN`, `SCRAM-SHA-256`, or `SCRAM-SHA-512` |
 | `KAFKA_DELIVERY_TIMEOUT_SECONDS` | `10` | Deadline for one publish including acknowledgement; keep it inside the request timeout |
@@ -127,10 +215,10 @@ What a role may do is defined by a fixed role-permission matrix that is part of 
 | `REALTIME_TICKET_TTL_SECONDS` | `30` | Lifetime of a single-use connection ticket; capped at 300 |
 | `AUTO_MIGRATE` | true outside production | Must normally be false in production; the embedded development database always migrates itself |
 | `APP_OPEN_BROWSER` | `false` | Development-only opt-in that opens the frontend in the system-default browser after startup |
-| `CACHE_NAMESPACE`, `QUEUE_KEY` | `luxor:cache`, `luxor:queue:jobs` | Redis namespacing |
+| `CACHE_NAMESPACE`, `QUEUE_KEY` | `<APP_NAME>:cache`, `<APP_NAME>:queue:jobs` | Redis namespacing |
 | `RUST_LOG` | Sensible service defaults | Standard tracing filter syntax |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Empty/disabled | Enables batched OTLP tracing when set |
-| `OTEL_SERVICE_NAME` | `luxor` | OpenTelemetry `service.name` resource attribute |
+| `OTEL_SERVICE_NAME` | `APP_NAME` | OpenTelemetry `service.name` resource attribute |
 | `SENTRY_DSN` | Empty/disabled | Enables Sentry error capture when set |
 
 Do not commit real secrets or put them in image layers. Inject them at runtime through the deployment platform’s secret manager, use a long random JWT secret, terminate TLS before accepting secure cookies, restrict database/Redis network access, and rotate credentials through a controlled rollout.
@@ -155,11 +243,11 @@ The checked-in migrations create normalized unique users, hashed refresh session
 
 Cache keys are validated, namespaced, JSON encoded, and always written with a positive TTL. A missing or expired key is a normal cache miss. Cache failures are surfaced as server errors rather than changing authoritative PostgreSQL data. Alongside the usual read, write, and invalidate, the cache exposes an atomic take (`GETDEL` on Redis 6.2+, the write lock held across read and removal in memory) so that single-use credentials such as the realtime connection ticket can be redeemed exactly once even when two callers race.
 
-The queue is enqueue-only. Producers `LPUSH` a version-stable JSON `JobEnvelope` to `QUEUE_KEY`; a separate future worker should use blocking `BRPOP`, which preserves FIFO order. The envelope contains an ID, explicit kind, tagged payload, enqueue time, `attempt`, and `max_attempts`. The worker owns acknowledgement semantics, retry backoff, idempotency, and dead-letter movement. `SendEmail` is only a provider-neutral job contract—this repository deliberately sends no email.
+The queue is enqueue-only, and its jobs are the application's `Job` type ([`src/app/jobs.rs`](src/app/jobs.rs)). Producers `LPUSH` a version-stable JSON `JobEnvelope` to `QUEUE_KEY`; a separate future worker should use blocking `BRPOP`, which preserves FIFO order. The envelope contains an ID, explicit kind, tagged payload, enqueue time, `attempt`, and `max_attempts`. The worker owns acknowledgement semantics, retry backoff, idempotency, and dead-letter movement. `SendEmail` is only a provider-neutral job contract—this repository deliberately sends no email.
 
 ## Kafka event stream
 
-One topic carries what the application announces about itself. Registering an account publishes `user.registered`, enqueueing a job publishes `job.enqueued`, and the console's **Event stream** card publishes `note.published` on demand. A consumer in the same process reads the topic back into a bounded in-memory window that `GET /api/events` serves, so the feed the console renders has genuinely been through the broker — each entry shows the partition and offset the record was written at, which is what distinguishes it from an echo of the publish response.
+One topic carries what the application announces about itself, as the application's `DomainEvent` type ([`src/app/events.rs`](src/app/events.rs)). Registering an account publishes `user.registered`, enqueueing a job publishes `job.enqueued`, and the console's **Event stream** card publishes `note.published` on demand. A consumer in the same process reads the topic back and hands each event to the application's event handler — for the template, the demo's bounded in-memory window that `GET /api/events` serves — so the feed the console renders has genuinely been through the broker — each entry shows the partition and offset the record was written at, which is what distinguishes it from an echo of the publish response.
 
 Records are JSON, keyed, and versioned:
 
@@ -269,11 +357,10 @@ When `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the same spans are additionally expor
 ```sh
 docker compose --profile observability up -d
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
-OTEL_SERVICE_NAME=luxor \
 cargo run
 ```
 
-In Jaeger at <http://localhost:16686>, select the `luxor` service or paste the trace ID shown in the console into its trace lookup; batched export may take a few seconds.
+In Jaeger at <http://localhost:16686>, select the `luxor` service (the `APP_NAME`) or paste the trace ID shown in the console into its trace lookup; batched export may take a few seconds.
 
 For production, send OTLP to an OpenTelemetry Collector or managed backend, use a deliberate sampling policy, and configure durable retention outside this repository. The local Jaeger profile keeps traces only in memory.
 
@@ -295,7 +382,7 @@ KAFKA_BROKERS=localhost:9092 \
 cargo test --all-targets --all-features
 ```
 
-Integration tests use random users, Redis namespaces, and Kafka topics and consumer groups, run migrations idempotently, and clean up their records. The Kafka test publishes through a real producer and waits for the record to come back through a real consumer group, so it exercises the round trip rather than the client's API surface. CI starts ephemeral PostgreSQL, Redis, and Kafka services and runs:
+Router tests build the application with [`TestApp`](src/testing.rs) on the in-memory backends (see [Extending the application](#extending-the-application)). Integration tests use random users, Redis namespaces, and Kafka topics and consumer groups, run migrations idempotently, and clean up their records; an unset or empty service address skips its test. The Kafka test publishes through a real producer and waits for the record to come back through a real consumer group, so it exercises the round trip rather than the client's API surface. CI starts ephemeral PostgreSQL, Redis, and Kafka services and runs:
 
 ```sh
 cargo fmt --all -- --check
@@ -305,11 +392,20 @@ cargo audit --ignore RUSTSEC-2023-0071
 cargo test --all-targets --all-features
 ```
 
+A second job lints and tests the build with each [cargo feature](#cargo-features) on its own, so any of them can be dropped:
+
+```sh
+for features in "" embedded-postgres redis kafka otel sentry realtime demo; do
+  cargo clippy --all-targets --no-default-features --features "$features" -- -D warnings
+  cargo test --all-targets --no-default-features --features "$features"
+done
+```
+
 The scoped RustSec exception is for RSA timing advisory `RUSTSEC-2023-0071`, which enters `Cargo.lock` through SQLx macros' optional MySQL support. CI first fails if `rsa` ever appears in the active dependency graph; the exception is valid only while PostgreSQL remains the sole compiled SQLx driver.
 
 ## Deploying to Railway
 
-The repository ships with a multi-stage `Dockerfile` and a `railway.json` that configure the build, the `/api/health` health check, and a pre-deploy `luxor migrate` step, so migrations run as an explicit release step while `AUTO_MIGRATE` stays disabled in production. The image builds with `--no-default-features`, which keeps the embedded development PostgreSQL server (the `embedded-postgres` cargo feature) out of production binaries.
+The repository ships with a multi-stage `Dockerfile` and a `railway.json` that configure the build, the `/api/health` health check, and a pre-deploy `luxor migrate` step, so migrations run as an explicit release step while `AUTO_MIGRATE` stays disabled in production. The image builds `--no-default-features --features app`: every feature the application uses, and not the embedded development PostgreSQL server (the `embedded-postgres` cargo feature).
 
 1. Create a Railway project and add **PostgreSQL** and **Redis** database services.
 2. Add a service from this GitHub repository. Railway detects the `Dockerfile` and `railway.json` automatically.

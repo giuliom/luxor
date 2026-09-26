@@ -104,3 +104,32 @@ jobs:
         run: cargo sqlx migrate run
       - name: Test
         run: cargo test --all-targets --all-features
+
+  # Every optional feature must build, lint cleanly, and pass its tests on its
+  # own, so a project built from this template can drop any of them. The
+  # quality job above covers the full set against real services; this one runs
+  # none, so the service addresses are blanked and the integration tests skip.
+  features:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: ""
+      REDIS_URL: ""
+      KAFKA_BROKERS: ""
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # Rust 1.97.0, 2026-07-10
+        with:
+          toolchain: 1.97.0
+          components: clippy
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Lint and test each feature on its own
+        shell: bash
+        run: |
+          set -euo pipefail
+          for features in "" embedded-postgres redis kafka otel sentry realtime demo; do
+            echo "::group::features: [${features}]"
+            cargo clippy --all-targets --no-default-features --features "$features" -- -D warnings
+            cargo test --all-targets --no-default-features --features "$features"
+            echo "::endgroup::"
+          done

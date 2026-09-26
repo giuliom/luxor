@@ -1,4 +1,4 @@
-//! End-to-end tests for the realtime WebSocket demo.
+//! End-to-end tests for realtime WebSockets.
 //!
 //! These run a real listener and a real WebSocket client, because the parts
 //! worth testing here — the handshake, the fan-out between two connections,
@@ -6,19 +6,17 @@
 //! Nothing external is required: the cache, queue, and rate limiter are the
 //! in-memory backends, and the database handle is never used.
 
+#![cfg(feature = "realtime")]
+
 use axum::{
     body::{to_bytes, Body},
     http::{header, Request, StatusCode},
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use luxor::{
-    auth::JwtService, cache::MemoryCache, config::Config, db, events::MemoryEventBus, models::Role,
-    observability::TraceStore, queue::MemoryQueue, rate_limit::MemoryRateLimiter, server,
-    state::AppState,
-};
+use luxor::{access::Role, config::Config, testing::TestApp};
 use serde_json::Value;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, Error as WsError, Message},
@@ -39,26 +37,16 @@ struct TestServer {
     /// The same router the listener serves, kept for the plain HTTP calls
     /// (minting a ticket) so the tests need no HTTP client.
     app: Router,
-    config: Arc<Config>,
+    config: Config,
 }
 
 impl TestServer {
     async fn start(overrides: &[(&str, &str)]) -> Self {
-        let values = overrides
+        let test_app = overrides
             .iter()
-            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-            .collect::<HashMap<_, _>>();
-        let config = Arc::new(Config::from_map(values).unwrap());
-        let state = AppState::new(
-            config.clone(),
-            db::connect_lazy("postgres://luxor:luxor@localhost/luxor").unwrap(),
-            Arc::new(MemoryCache::default()),
-            Arc::new(MemoryQueue::default()),
-            Arc::new(MemoryEventBus::default()),
-            Arc::new(MemoryRateLimiter::default()),
-            TraceStore::default(),
-        );
-        let app = server::app(state);
+            .fold(TestApp::new(), |app, (key, value)| app.env(key, value));
+        let config = test_app.config();
+        let app = test_app.router();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -82,10 +70,7 @@ impl TestServer {
     /// Signs an access token for a user that does not need to exist: the
     /// realtime endpoints authorize from the token's claims alone.
     fn bearer(&self, user_id: Uuid) -> String {
-        let token = JwtService::from_config(&self.config)
-            .issue(user_id, Role::User)
-            .unwrap();
-        format!("Bearer {token}")
+        luxor::testing::bearer(&self.config, user_id, Role::User)
     }
 
     async fn mint_ticket(&self, user_id: Uuid) -> String {

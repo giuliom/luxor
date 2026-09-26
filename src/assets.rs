@@ -1,6 +1,6 @@
 //! Prebuilt HTTP representations for everything the server sends that is not
-//! an API response: the rendered console pages, the sitemap and robots.txt,
-//! and the static files compiled into the binary.
+//! an API response: rendered pages, the sitemap and robots.txt, and the static
+//! files compiled into the binary.
 //!
 //! Every one of these bodies is fixed for the life of the process, so the work
 //! a response needs is done once, when the router is built: each body is
@@ -26,13 +26,11 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, MethodRouter},
+    Router,
 };
 use flate2::{write::GzEncoder, Compression};
 use sha2::{Digest, Sha256};
-use std::{
-    io::Write,
-    sync::{Arc, LazyLock},
-};
+use std::{io::Write, sync::Arc};
 
 /// How long a browser or shared cache may reuse a response without asking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,13 +219,14 @@ pub struct StaticFile {
     /// revalidated on every use, since a deployment may change its content.
     pub path: &'static str,
     /// `/assets/<stem>.<fingerprint>.<extension>`, which changes whenever the
-    /// content does. The rendered pages reference only this form.
+    /// content does. Rendered pages reference only this form.
     pub fingerprinted_path: String,
     pub asset: Arc<Asset>,
 }
 
 impl StaticFile {
-    fn new(path: &'static str, content_type: &'static str, body: &'static [u8]) -> Self {
+    /// `path` is the stable name, starting with `/` and carrying an extension.
+    pub fn new(path: &'static str, content_type: &'static str, body: &'static [u8]) -> Self {
         let asset = Asset::new(content_type, Bytes::from_static(body));
         let (stem, extension) = path
             .trim_start_matches('/')
@@ -242,50 +241,57 @@ impl StaticFile {
     }
 }
 
-/// The static files the console pages load.
+/// A set of files compiled into the binary, typically built once per process
+/// from `include_bytes!` entries, since their content is fixed at compile time.
 pub struct StaticFiles {
-    pub styles: StaticFile,
-    pub script: StaticFile,
-    pub favicon: StaticFile,
-    /// Fetched on demand by the WebAssembly card, from the URL the page hands
-    /// the script.
-    pub wasm: StaticFile,
+    files: Vec<StaticFile>,
 }
 
 impl StaticFiles {
-    pub fn all(&self) -> [&StaticFile; 4] {
-        [&self.styles, &self.script, &self.favicon, &self.wasm]
+    pub fn new(files: impl IntoIterator<Item = StaticFile>) -> Self {
+        Self {
+            files: files.into_iter().collect(),
+        }
     }
-}
 
-/// The embedded static files, fingerprinted and compressed once per process:
-/// their content is fixed at compile time, so every router shares one copy.
-pub fn embedded() -> &'static StaticFiles {
-    static FILES: LazyLock<StaticFiles> = LazyLock::new(|| StaticFiles {
-        styles: StaticFile::new(
-            "/styles.css",
-            "text/css; charset=utf-8",
-            include_bytes!("../public/styles.css"),
-        ),
-        script: StaticFile::new(
-            "/script.js",
-            "text/javascript; charset=utf-8",
-            include_bytes!("../public/script.js"),
-        ),
-        favicon: StaticFile::new(
-            "/favicon.svg",
-            "image/svg+xml; charset=utf-8",
-            include_bytes!("../public/favicon.svg"),
-        ),
-        // WebAssembly.instantiateStreaming requires exactly this content
-        // type, with no parameters.
-        wasm: StaticFile::new(
-            "/demo.wasm",
-            "application/wasm",
-            include_bytes!("../public/demo.wasm"),
-        ),
-    });
-    &FILES
+    /// The file whose stable name is `path`.
+    pub fn get(&self, path: &str) -> Option<&StaticFile> {
+        self.files.iter().find(|file| file.path == path)
+    }
+
+    /// The content-addressed URL of the file whose stable name is `path`: what
+    /// a rendered page references. Panics on a name that is not in the set,
+    /// which is a build defect the page-rendering tests catch.
+    pub fn url(&self, path: &str) -> &str {
+        &self
+            .get(path)
+            .unwrap_or_else(|| panic!("{path} is not an embedded static file"))
+            .fingerprinted_path
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &StaticFile> {
+        self.files.iter()
+    }
+
+    /// Routes every file at its content-addressed URL, cached for a year, and
+    /// at its stable name, revalidated. An outdated fingerprint is a 404
+    /// rather than today's bytes under yesterday's immutable URL.
+    pub fn routes<S>(&self) -> Router<S>
+    where
+        S: Clone + Send + Sync + 'static,
+    {
+        self.files.iter().fold(Router::new(), |router, file| {
+            router
+                .route(
+                    &file.fingerprinted_path,
+                    serve(file.asset.clone(), CachePolicy::Immutable),
+                )
+                .route(
+                    file.path,
+                    serve(file.asset.clone(), CachePolicy::Revalidate),
+                )
+        })
+    }
 }
 
 #[cfg(test)]
@@ -301,7 +307,7 @@ mod tests {
 
     /// Large and repetitive enough that gzip always pays for itself.
     fn compressible_asset() -> Asset {
-        Asset::new("text/plain; charset=utf-8", "luxor ".repeat(200))
+        Asset::new("text/plain; charset=utf-8", "compressible ".repeat(200))
     }
 
     #[test]
@@ -479,19 +485,56 @@ mod tests {
     }
 
     #[test]
-    fn embedded_files_have_distinct_content_addressed_paths() {
-        let files = embedded();
-        for (file, stem, extension) in [
-            (&files.styles, "styles", "css"),
-            (&files.script, "script", "js"),
-            (&files.favicon, "favicon", "svg"),
-            (&files.wasm, "demo", "wasm"),
+    fn static_files_get_content_addressed_paths() {
+        let files = StaticFiles::new([
+            StaticFile::new("/styles.css", "text/css; charset=utf-8", b"body{}"),
+            StaticFile::new("/app.js", "text/javascript; charset=utf-8", b"run()"),
+        ]);
+        let styles = files.get("/styles.css").unwrap();
+        assert_eq!(
+            styles.fingerprinted_path,
+            format!("/assets/styles.{}.css", styles.asset.fingerprint())
+        );
+        assert_eq!(
+            files.url("/app.js"),
+            files.get("/app.js").unwrap().fingerprinted_path
+        );
+        assert!(files.get("/missing.css").is_none());
+        assert_eq!(files.iter().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn static_files_answer_at_both_urls_with_their_cache_policies() {
+        use tower::ServiceExt;
+
+        let files = StaticFiles::new([StaticFile::new(
+            "/styles.css",
+            "text/css; charset=utf-8",
+            b"body{}",
+        )]);
+        let router: Router = files.routes();
+        for (path, cache_control) in [
+            (
+                files.url("/styles.css").to_owned(),
+                "public, max-age=31536000, immutable",
+            ),
+            ("/styles.css".to_owned(), "no-cache"),
         ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(&path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
             assert_eq!(
-                file.fingerprinted_path,
-                format!("/assets/{stem}.{}.{extension}", file.asset.fingerprint())
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                cache_control
             );
-            assert_eq!(file.path, format!("/{stem}.{extension}"));
         }
     }
 }

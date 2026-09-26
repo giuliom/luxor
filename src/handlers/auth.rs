@@ -1,9 +1,10 @@
 use crate::{
+    access::Role,
     auth::{hash_refresh_token, rotate_refresh_token, AuthUser, RefreshGrant, RefreshPolicy},
     db,
     error::{ApiJson, AppError},
-    events::{self, DomainEvent},
-    models::{PublicUser, Role},
+    events::{self, UserRegistered},
+    models::PublicUser,
     services,
     state::AppState,
 };
@@ -14,7 +15,8 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use time::Duration;
 
-const REFRESH_COOKIE: &str = "luxor_refresh";
+/// The refresh cookie is sent only to the credential endpoints; its name
+/// comes from configuration (`<APP_NAME>_refresh`).
 const REFRESH_COOKIE_PATH: &str = "/api/auth";
 
 // Neither request derives `Debug`: without it there is no way to format a
@@ -67,10 +69,11 @@ pub async fn register(
     // topic is read by more consumers than the account holder.
     events::publish_or_log(
         state.events.as_ref(),
-        DomainEvent::UserRegistered {
+        UserRegistered {
             user_id: user.id,
             role: user.role,
-        },
+        }
+        .into(),
     )
     .await;
     Ok((
@@ -102,7 +105,7 @@ pub async fn refresh(
     jar: CookieJar,
 ) -> Result<(CookieJar, Json<AuthResponse>), AppError> {
     let presented_token = jar
-        .get(REFRESH_COOKIE)
+        .get(&state.config.auth.refresh_cookie_name)
         .map(Cookie::value)
         .ok_or(AppError::Unauthorized)?;
     let grant = rotate_refresh_token(
@@ -123,7 +126,7 @@ pub async fn logout(
     State(state): State<AppState>,
     jar: CookieJar,
 ) -> Result<(StatusCode, CookieJar), AppError> {
-    if let Some(cookie) = jar.get(REFRESH_COOKIE) {
+    if let Some(cookie) = jar.get(&state.config.auth.refresh_cookie_name) {
         db::revoke_session(&state.db, &hash_refresh_token(cookie.value())).await?;
     }
     Ok((
@@ -147,7 +150,7 @@ fn auth_response(state: &AppState, access_token: String, user: PublicUser) -> Au
     AuthResponse {
         access_token,
         token_type: "Bearer",
-        expires_in: state.config.access_token_ttl_seconds,
+        expires_in: state.config.auth.access_token_ttl_seconds,
         user,
     }
 }
@@ -156,20 +159,23 @@ fn refresh_cookie(state: &AppState, grant: &RefreshGrant) -> Cookie<'static> {
     // The cookie tracks the token's real validity, which near the end of a
     // rotation family is shorter than the configured token lifetime.
     let max_age_seconds = (grant.expires_at - Utc::now()).num_seconds().max(0);
-    Cookie::build((REFRESH_COOKIE, grant.token.clone()))
-        .path(REFRESH_COOKIE_PATH)
-        .http_only(true)
-        .secure(state.config.refresh_cookie_secure)
-        .same_site(SameSite::Strict)
-        .max_age(Duration::seconds(max_age_seconds))
-        .build()
+    Cookie::build((
+        state.config.auth.refresh_cookie_name.clone(),
+        grant.token.clone(),
+    ))
+    .path(REFRESH_COOKIE_PATH)
+    .http_only(true)
+    .secure(state.config.auth.refresh_cookie_secure)
+    .same_site(SameSite::Strict)
+    .max_age(Duration::seconds(max_age_seconds))
+    .build()
 }
 
 fn expired_refresh_cookie(state: &AppState) -> Cookie<'static> {
-    Cookie::build((REFRESH_COOKIE, ""))
+    Cookie::build((state.config.auth.refresh_cookie_name.clone(), ""))
         .path(REFRESH_COOKIE_PATH)
         .http_only(true)
-        .secure(state.config.refresh_cookie_secure)
+        .secure(state.config.auth.refresh_cookie_secure)
         .same_site(SameSite::Strict)
         .max_age(Duration::ZERO)
         .build()

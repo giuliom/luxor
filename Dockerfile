@@ -13,10 +13,12 @@ RUN apt-get update \
 
 # Static assets and migrations are embedded into the binary at compile time
 # (include_str! and sqlx::migrate!), so the build needs the full source tree.
-# Default features are disabled to exclude the embedded development
-# PostgreSQL server; production always connects to an external DATABASE_URL.
+# The image builds the `app` feature set: the default features minus the
+# embedded development PostgreSQL server, since production always connects to
+# an external DATABASE_URL. Trimming the application is an edit to that
+# feature in Cargo.toml, not to this file.
 COPY . .
-RUN cargo build --release --locked --no-default-features
+RUN cargo build --release --locked --no-default-features --features app
 
 # Runtime stage: a minimal image containing only the binary and TLS roots.
 FROM debian:bookworm-slim AS runtime

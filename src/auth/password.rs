@@ -31,7 +31,7 @@ static HASHER: LazyLock<Argon2<'static>> = LazyLock::new(|| {
 static TIMING_EQUALIZER_HASH: LazyLock<String> = LazyLock::new(|| {
     let salt = SaltString::generate(&mut OsRng);
     HASHER
-        .hash_password(b"luxor-timing-equalizer", &salt)
+        .hash_password(b"timing-equalizer", &salt)
         .expect("hashing a fixed password with the pinned parameters cannot fail")
         .to_string()
 });
@@ -257,7 +257,7 @@ mod tests {
         equalize_login_timing(secret("any password at all"))
             .await
             .unwrap();
-        equalize_login_timing(secret("luxor-timing-equalizer"))
+        equalize_login_timing(secret("timing-equalizer"))
             .await
             .unwrap();
     }

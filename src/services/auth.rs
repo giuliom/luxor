@@ -1,11 +1,12 @@
 use crate::{
+    access::Role,
     auth::{
         equalize_login_timing, hash_password, issue_refresh_token, verify_password, RefreshGrant,
         RefreshPolicy,
     },
     db,
     error::AppError,
-    models::{Role, UserRecord},
+    models::UserRecord,
     validation,
 };
 use secrecy::{ExposeSecret, SecretString};

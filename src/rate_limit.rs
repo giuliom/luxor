@@ -4,15 +4,16 @@
 //! window, so one backend can meter clients by IP today and by account, API
 //! key, or route tomorrow. The HTTP middleware ([`enforce`]) applies a named
 //! [`RateLimitPolicy`] per router group, keyed by client IP; the policies and
-//! their quotas come from [`crate::config::RateLimitSettings`].
+//! their quotas come from [`RateLimitSettings`].
 //!
 //! Two backends mirror the cache and queue pattern: an in-memory limiter for
 //! single-process development runs, and a Redis-backed one that keeps counts
-//! consistent across instances. Production configuration always carries a
-//! `REDIS_URL`, so deployed instances always share the Redis backend.
+//! consistent across instances. Production configuration carries a
+//! `REDIS_URL` whenever the build includes the `redis` feature, so deployed
+//! instances of such a build always share the Redis backend.
 
 use crate::{
-    config::{ClientIpSource, RateLimitQuota},
+    config::{ConfigError, Env},
     error::AppError,
     state::AppState,
 };
@@ -23,14 +24,131 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+#[cfg(feature = "redis")]
 use redis::{aio::ConnectionManager, Script};
 use std::{
     collections::{hash_map::Entry, HashMap},
     net::{IpAddr, SocketAddr},
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
 use tokio::sync::RwLock;
+
+/// Where the client address used for per-client policies (rate limiting)
+/// comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientIpSource {
+    /// The peer address of the TCP connection. Correct when clients connect
+    /// directly, as in local development.
+    Socket,
+    /// The rightmost `X-Forwarded-For` entry, appended by the platform proxy
+    /// in front of the app. Correct on Railway, Heroku, and similar
+    /// platforms; unsafe without a trusted proxy, because clients can send
+    /// the header themselves.
+    XForwardedFor,
+}
+
+impl FromStr for ClientIpSource {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "socket" => Ok(Self::Socket),
+            "x-forwarded-for" => Ok(Self::XForwardedFor),
+            _ => Err(ConfigError::Invalid("CLIENT_IP_SOURCE", value.to_owned())),
+        }
+    }
+}
+
+/// A fixed-window request budget: at most `max_requests` per client per
+/// `window_seconds`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateLimitQuota {
+    pub max_requests: u32,
+    pub window_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RateLimitSettings {
+    /// Cannot be disabled in production.
+    pub enabled: bool,
+    pub client_ip_source: ClientIpSource,
+    /// Prefix for the Redis keys of the distributed limiter;
+    /// `<APP_NAME>:ratelimit` unless `RATE_LIMIT_NAMESPACE` says otherwise.
+    pub namespace: String,
+    /// Budget for the credential endpoints under `/api/auth`, the
+    /// brute-force surface. Applies on top of `api`.
+    pub auth: RateLimitQuota,
+    /// Budget for everything under `/api`.
+    pub api: RateLimitQuota,
+}
+
+impl RateLimitSettings {
+    pub fn from_env(env: &Env) -> Result<Self, ConfigError> {
+        let production = env.is_production();
+        let enabled = env.parse("RATE_LIMIT_ENABLED", true)?;
+        if production && !enabled {
+            return Err(ConfigError::Validation(
+                "RATE_LIMIT_ENABLED cannot be disabled in production".into(),
+            ));
+        }
+        // Deployed containers sit behind the platform proxy, so the peer address
+        // would be the proxy itself; local development connects directly.
+        let default_source = if production {
+            ClientIpSource::XForwardedFor
+        } else {
+            ClientIpSource::Socket
+        };
+        let client_ip_source = match env.get("CLIENT_IP_SOURCE") {
+            Some(value) => value.parse()?,
+            None => default_source,
+        };
+        let namespace = env
+            .optional("RATE_LIMIT_NAMESPACE")
+            .unwrap_or_else(|| format!("{}:ratelimit", env.app_name()));
+        let auth = parse_quota(
+            env,
+            ("RATE_LIMIT_AUTH_MAX_REQUESTS", 10),
+            ("RATE_LIMIT_AUTH_WINDOW_SECONDS", 60),
+        )?;
+        let api = parse_quota(
+            env,
+            ("RATE_LIMIT_API_MAX_REQUESTS", 120),
+            ("RATE_LIMIT_API_WINDOW_SECONDS", 60),
+        )?;
+        Ok(Self {
+            enabled,
+            client_ip_source,
+            namespace,
+            auth,
+            api,
+        })
+    }
+}
+
+fn parse_quota(
+    env: &Env,
+    (max_key, default_max): (&'static str, u32),
+    (window_key, default_window): (&'static str, u64),
+) -> Result<RateLimitQuota, ConfigError> {
+    let max_requests = env.parse(max_key, default_max)?;
+    if max_requests == 0 {
+        return Err(ConfigError::Validation(format!(
+            "{max_key} must be greater than zero"
+        )));
+    }
+    let window_seconds = env.parse(window_key, default_window)?;
+    if !(1..=86_400).contains(&window_seconds) {
+        return Err(ConfigError::Validation(format!(
+            "{window_key} must be between 1 and 86400 seconds"
+        )));
+    }
+    Ok(RateLimitQuota {
+        max_requests,
+        window_seconds,
+    })
+}
 
 /// The verdict for one recorded hit.
 #[derive(Clone, Copy, Debug)]
@@ -77,8 +195,8 @@ struct MemoryWindow {
     resets_at: tokio::time::Instant,
 }
 
-/// Fixed-window limiter for development runs; production always uses
-/// [`RedisRateLimiter`], because its configuration requires Redis.
+/// Fixed-window limiter for development runs, and for deployments built
+/// without the `redis` feature, whose counts are then per instance.
 #[derive(Clone, Default)]
 pub struct MemoryRateLimiter {
     windows: Arc<RwLock<HashMap<String, MemoryWindow>>>,
@@ -133,6 +251,7 @@ impl RateLimiter for MemoryRateLimiter {
 /// Counts a hit and returns `{count, remaining window in milliseconds}` in
 /// one atomic step. The second PEXPIRE is defensive: it re-arms the expiry if
 /// a pre-existing key somehow lacks one, so no counter can persist forever.
+#[cfg(feature = "redis")]
 const FIXED_WINDOW_SCRIPT: &str = r#"
 local count = redis.call('INCR', KEYS[1])
 if count == 1 then
@@ -148,6 +267,7 @@ return {count, ttl}
 
 /// Fixed-window limiter with counters shared by every instance pointed at
 /// the same Redis and namespace.
+#[cfg(feature = "redis")]
 #[derive(Clone)]
 pub struct RedisRateLimiter {
     manager: ConnectionManager,
@@ -155,6 +275,7 @@ pub struct RedisRateLimiter {
     script: Script,
 }
 
+#[cfg(feature = "redis")]
 impl RedisRateLimiter {
     pub fn new(manager: ConnectionManager, namespace: String) -> Self {
         Self {
@@ -165,6 +286,7 @@ impl RedisRateLimiter {
     }
 }
 
+#[cfg(feature = "redis")]
 #[async_trait]
 impl RateLimiter for RedisRateLimiter {
     async fn hit(&self, key: &str, quota: RateLimitQuota) -> Result<RateLimitDecision, AppError> {
@@ -337,6 +459,82 @@ mod tests {
                 .unwrap()
                 .allowed
         );
+    }
+
+    fn settings(pairs: &[(&str, &str)]) -> Result<RateLimitSettings, ConfigError> {
+        RateLimitSettings::from_env(&Env::new(crate::testing::values(pairs))?)
+    }
+
+    #[test]
+    fn development_defaults_are_valid() {
+        let settings = settings(&[]).unwrap();
+        assert!(settings.enabled);
+        assert_eq!(settings.client_ip_source, ClientIpSource::Socket);
+        assert_eq!(
+            settings.namespace,
+            format!("{}:ratelimit", env!("CARGO_PKG_NAME"))
+        );
+        assert_eq!(
+            settings.auth,
+            RateLimitQuota {
+                max_requests: 10,
+                window_seconds: 60
+            }
+        );
+        assert_eq!(
+            settings.api,
+            RateLimitQuota {
+                max_requests: 120,
+                window_seconds: 60
+            }
+        );
+    }
+
+    #[test]
+    fn rate_limiting_cannot_be_disabled_in_production() {
+        assert!(matches!(
+            settings(&[("APP_ENV", "production"), ("RATE_LIMIT_ENABLED", "false")]),
+            Err(ConfigError::Validation(message)) if message.contains("RATE_LIMIT_ENABLED")
+        ));
+        assert!(
+            !settings(&[("RATE_LIMIT_ENABLED", "false")])
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
+    fn client_ip_source_follows_the_deployment_shape() {
+        assert_eq!(
+            settings(&[("APP_ENV", "production")])
+                .unwrap()
+                .client_ip_source,
+            ClientIpSource::XForwardedFor
+        );
+        assert_eq!(
+            settings(&[("APP_ENV", "production"), ("CLIENT_IP_SOURCE", "socket")])
+                .unwrap()
+                .client_ip_source,
+            ClientIpSource::Socket
+        );
+        assert!(matches!(
+            settings(&[("CLIENT_IP_SOURCE", "guess")]),
+            Err(ConfigError::Invalid("CLIENT_IP_SOURCE", _))
+        ));
+    }
+
+    #[test]
+    fn rate_limit_quotas_are_validated() {
+        assert!(matches!(
+            settings(&[("RATE_LIMIT_AUTH_MAX_REQUESTS", "0")]),
+            Err(ConfigError::Validation(message))
+                if message.contains("RATE_LIMIT_AUTH_MAX_REQUESTS")
+        ));
+        assert!(matches!(
+            settings(&[("RATE_LIMIT_API_WINDOW_SECONDS", "86401")]),
+            Err(ConfigError::Validation(message))
+                if message.contains("RATE_LIMIT_API_WINDOW_SECONDS")
+        ));
     }
 
     fn request_with_forwarded_for(values: &[&str]) -> Request {

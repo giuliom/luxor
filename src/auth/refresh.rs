@@ -19,8 +19,8 @@ pub struct RefreshPolicy {
 impl RefreshPolicy {
     pub fn from_config(config: &Config) -> Self {
         Self {
-            token_ttl_seconds: config.refresh_token_ttl_seconds,
-            family_ttl_seconds: config.refresh_family_ttl_seconds,
+            token_ttl_seconds: config.auth.refresh_token_ttl_seconds,
+            family_ttl_seconds: config.auth.refresh_family_ttl_seconds,
         }
     }
 }

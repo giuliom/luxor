@@ -7,10 +7,7 @@
       "request": "launch",
       "cargo": {
         "args": ["build", "--bin", "luxor"],
-        "filter": {
-          "name": "luxor",
-          "kind": "bin"
-        }
+        "filter": { "name": "luxor", "kind": "bin" }
       },
       "args": [],
       "cwd": "${workspaceFolder}",
@@ -39,10 +36,7 @@
       "request": "launch",
       "cargo": {
         "args": ["build", "--bin", "luxor"],
-        "filter": {
-          "name": "luxor",
-          "kind": "bin"
-        }
+        "filter": { "name": "luxor", "kind": "bin" }
       },
       "args": [],
       "cwd": "${workspaceFolder}",
@@ -69,10 +63,7 @@
       "request": "launch",
       "cargo": {
         "args": ["test", "--no-run", "--lib", "--all-features"],
-        "filter": {
-          "name": "luxor",
-          "kind": "lib"
-        }
+        "filter": { "name": "luxor", "kind": "lib" }
       },
       "args": ["--nocapture"],
       "cwd": "${workspaceFolder}",
@@ -87,10 +78,7 @@
       "request": "launch",
       "cargo": {
         "args": ["test", "--no-run", "--test", "infrastructure", "--all-features"],
-        "filter": {
-          "name": "infrastructure",
-          "kind": "test"
-        }
+        "filter": { "name": "infrastructure", "kind": "test" }
       },
       "args": ["--nocapture"],
       "cwd": "${workspaceFolder}",
