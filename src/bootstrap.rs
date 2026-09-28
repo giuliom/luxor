@@ -24,7 +24,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use axum::extract::FromRef;
 use secrecy::SecretString;
 use sqlx::PgPool;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, process::ExitCode, sync::Arc, time::Duration};
 
 /// What an application contributes to the server. Only [`state`] and
 /// [`routes`] are required; see [`crate::app::App`] for the template's own.
@@ -59,8 +59,23 @@ pub trait Application: Send + Sync + 'static {
 }
 
 /// Runs the process: the `migrate` command when it is given, the server
-/// otherwise.
-pub async fn run<A>(app: A) -> Result<()>
+/// otherwise. A failure is logged as one event, not left to `main`'s report,
+/// which spreads its causes over several lines of stderr.
+pub async fn run<A>(app: A) -> ExitCode
+where
+    A: Application,
+    AppState: FromRef<A::State>,
+{
+    match execute(app).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            observability::log_fatal(&error);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn execute<A>(app: A) -> Result<()>
 where
     A: Application,
     AppState: FromRef<A::State>,

@@ -1,6 +1,7 @@
 //! Logging, tracing, and error reporting.
 //!
-//! Logs are always on: compact in development and test, JSON in production.
+//! Logs are always on: compact in development and test, JSON in production,
+//! where panics and the error that stops the process are logged as events too.
 //! With the `otel` feature the tracer is on too — finished spans feed a bounded
 //! in-process `TraceStore` and, when an OTLP endpoint is configured, are
 //! batch-exported over OTLP/gRPC. With the `sentry` feature, server errors are
@@ -8,7 +9,10 @@
 
 use crate::config::{Config, ConfigError, Env, Environment};
 use anyhow::{Context, Result};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{
+    fmt::MakeWriter, layer::SubscriberExt, registry::LookupSpan, util::SubscriberInitExt,
+    EnvFilter, Layer,
+};
 
 #[cfg(feature = "otel")]
 pub use trace_store::{StoredSpan, TraceStore};
@@ -89,8 +93,6 @@ impl Observability {
 }
 
 pub fn init(config: &Config) -> Result<Observability> {
-    #[cfg(feature = "sentry")]
-    let sentry = init_sentry(config);
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
 
@@ -102,16 +104,18 @@ pub fn init(config: &Config) -> Result<Observability> {
         tracing_opentelemetry::layer().with_tracer(tracer::build(&config.telemetry, &trace_store)?),
     );
 
-    match &config.environment {
-        Environment::Production => registry
-            .with(tracing_subscriber::fmt::layer().json())
-            .try_init()
-            .context("global tracing subscriber was already initialized")?,
-        _ => registry
-            .with(tracing_subscriber::fmt::layer().compact())
-            .try_init()
-            .context("global tracing subscriber was already initialized")?,
+    registry
+        .with(log_layer(&config.environment, std::io::stdout))
+        .try_init()
+        .context("global tracing subscriber was already initialized")?;
+
+    // Ahead of Sentry, whose panic hook hands each panic on to the one it
+    // replaces.
+    if config.environment.is_production() {
+        log_panics();
     }
+    #[cfg(feature = "sentry")]
+    let sentry = init_sentry(config);
 
     Ok(Observability {
         #[cfg(feature = "otel")]
@@ -119,6 +123,63 @@ pub fn init(config: &Config) -> Result<Observability> {
         #[cfg(feature = "sentry")]
         sentry,
     })
+}
+
+/// Logs the error that stopped the process, with its causes, as one event.
+///
+/// It goes through the subscriber [`init`] installed when there is one;
+/// otherwise — the configuration did not load, or the command never sets up
+/// logging, as `migrate` does not — through a stand-in formatted for `APP_ENV`.
+pub fn log_fatal(error: &anyhow::Error) {
+    let log = || tracing::error!("{error:#}");
+    if tracing::dispatcher::has_been_set() {
+        log();
+    } else {
+        let environment = std::env::var("APP_ENV")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(Environment::Development);
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(log_layer(&environment, std::io::stdout)),
+            log,
+        );
+    }
+}
+
+/// Compact lines for a terminal in development and test. In production, one
+/// JSON object per line with the event's fields at the top level, beside
+/// `level`: the shape log aggregators such as Railway's parse, taking
+/// `message` as the line's text and every other field as a searchable
+/// attribute.
+fn log_layer<S, W>(environment: &Environment, writer: W) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let layer = tracing_subscriber::fmt::layer().with_writer(writer);
+    match environment {
+        Environment::Production => layer.json().flatten_event(true).boxed(),
+        _ => layer.compact().boxed(),
+    }
+}
+
+/// Logs each panic as one event, in the panicking span's context, instead of
+/// the default hook's lines on stderr, which an aggregator would record as
+/// separate, unrelated errors.
+fn log_panics() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload_as_str().unwrap_or("Box<dyn Any>");
+        let location = info
+            .location()
+            .map_or_else(|| "an unknown location".to_owned(), ToString::to_string);
+        let backtrace = std::backtrace::Backtrace::capture();
+        tracing::error!(
+            thread = std::thread::current().name().unwrap_or("<unnamed>"),
+            backtrace = (backtrace.status() == std::backtrace::BacktraceStatus::Captured)
+                .then(|| tracing::field::display(&backtrace)),
+            "panicked at {location}: {payload}"
+        );
+    }));
 }
 
 #[cfg(feature = "sentry")]
@@ -315,6 +376,41 @@ mod tests {
     fn the_default_log_filter_names_this_crate() {
         assert!(DEFAULT_LOG_FILTER.starts_with(concat!(env!("CARGO_CRATE_NAME"), "=info,")));
         assert!(EnvFilter::try_new(DEFAULT_LOG_FILTER).is_ok());
+    }
+
+    #[test]
+    fn production_logs_are_one_json_object_per_event_with_the_fields_at_the_top_level() {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(log_layer(&Environment::Production, move || writer.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let _request = tracing::info_span!("http_request", request_id = "r-1").entered();
+            tracing::warn!(attempt = 2, "first line\nsecond line");
+        });
+
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1, "{output}");
+        let line = serde_json::from_str::<serde_json::Value>(lines[0]).unwrap();
+        assert_eq!(line["message"], "first line\nsecond line");
+        assert_eq!(line["level"], "WARN");
+        assert_eq!(line["attempt"], 2);
+        assert_eq!(line["span"]["request_id"], "r-1");
     }
 
     #[cfg(feature = "otel")]
